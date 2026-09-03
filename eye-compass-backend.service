@@ -1,0 +1,25 @@
+[Unit]
+Description=Eye Compass FastAPI Backend
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+User=nvidia
+WorkingDirectory=/home/nvidia/eye_compass_be
+
+# Load environment variables (API keys, DB URLs, etc.) from the .env file
+EnvironmentFile=/home/nvidia/eye_compass_be/.env
+Environment="EYE_COMPASS_SRC=/home/nvidia/eye_compass"
+Environment="USE_MOCK_CAMERA=false"
+
+# Use the system Python or a virtual environment (recommended)
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=eye-compass-backend
+
+[Install]
+WantedBy=multi-user.target

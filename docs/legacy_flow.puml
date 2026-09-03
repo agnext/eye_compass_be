@@ -1,0 +1,89 @@
+@startuml legacy_flow
+!theme plain
+skinparam BackgroundColor #ffffff
+skinparam componentStyle uml2
+
+title Eye Compass - Legacy Application Architecture Flow
+
+actor Operator
+
+package "Legacy Eye Compass (Monolithic PyQt5 App - main.py)" {
+
+    node "User Interface (eye_compass_ui.py)" {
+        [Login Screen]
+        [New Batch / Data Collection Form]
+        [Main Dashboard (Camera Feed, Start/Stop)]
+        [Results & History]
+    }
+
+    node "Authentication & Sync" {
+        [Auth Manager]
+        [Qualix Sync Service]
+    }
+
+    node "Hardware Control (Serial / GPIO)" {
+        [SerialReaderThread]
+        [SerialWriterThread]
+    }
+
+    node "Vision & Machine Learning" {
+        [Camera Frame Grabber\n(OpenCV / GStreamer)]
+        [YOLOv7 Inference Engine\n(TensorRT / ONNX)]
+        [Object Tracker\n(DeepSORT)]
+    }
+
+    node "Data Storage & Upload" {
+        [Local SQLite DB\n(EyeCompass.db)]
+        [Local Excel / CSV Exporter]
+        [Video Compressor\n(compress_video.py)]
+        [Cloud Uploader\n(upload_videos_pool_id.py)]
+    }
+}
+
+cloud "External Services" {
+    [Qualix API (agnext.in)]
+    [AWS S3 / Cloud Storage]
+}
+
+node "Physical Hardware" {
+    [Industrial Camera (Basler)]
+    [Conveyor & Reject Mechanisms\n(PLC / Microcontroller)]
+}
+
+' Flow Connections
+
+Operator --> [Login Screen] : Inputs Credentials
+[Login Screen] --> [Auth Manager] : Validates
+[Auth Manager] --> [Qualix API (agnext.in)] : POST /portal/login (Cookie Auth)
+[Auth Manager] --> [Qualix Sync Service] : Trigger fetch configuration
+[Qualix Sync Service] --> [Qualix API (agnext.in)] : GET /api/v1/quality/dropdowns...
+[Qualix Sync Service] --> [New Batch / Data Collection Form] : Populates Commodity, Variety, FM types
+
+Operator --> [New Batch / Data Collection Form] : Selects Batch details
+[New Batch / Data Collection Form] --> [Main Dashboard (Camera Feed, Start/Stop)] : Navigates to dashboard
+
+Operator --> [Main Dashboard (Camera Feed, Start/Stop)] : Clicks Start
+[Main Dashboard (Camera Feed, Start/Stop)] --> [SerialWriterThread] : Sends "machine_start" command
+[SerialWriterThread] --> [Conveyor & Reject Mechanisms\n(PLC / Microcontroller)] : Serial TX
+
+[Industrial Camera (Basler)] --> [Camera Frame Grabber\n(OpenCV / GStreamer)] : Sends video frames
+[Camera Frame Grabber\n(OpenCV / GStreamer)] --> [YOLOv7 Inference Engine\n(TensorRT / ONNX)] : Dispatches frames for inference
+[YOLOv7 Inference Engine\n(TensorRT / ONNX)] --> [Object Tracker\n(DeepSORT)] : Bounding boxes & classifications
+[Object Tracker\n(DeepSORT)] --> [Main Dashboard (Camera Feed, Start/Stop)] : Updates UI with counts/FPS
+
+[Conveyor & Reject Mechanisms\n(PLC / Microcontroller)] --> [SerialReaderThread] : Serial RX (Sensors, errors)
+[SerialReaderThread] --> [Main Dashboard (Camera Feed, Start/Stop)] : Updates UI status
+
+' Data Persistence Flow
+[Object Tracker\n(DeepSORT)] --> [Local SQLite DB\n(EyeCompass.db)] : Saves foreign matter counts
+[Object Tracker\n(DeepSORT)] --> [Local Excel / CSV Exporter] : Updates local spreadsheet logs
+
+' End of Batch Flow
+Operator --> [Main Dashboard (Camera Feed, Start/Stop)] : Clicks Stop
+[Main Dashboard (Camera Feed, Start/Stop)] --> [SerialWriterThread] : Sends "all_stop" command
+[Main Dashboard (Camera Feed, Start/Stop)] --> [Video Compressor\n(compress_video.py)] : Triggers video saving
+[Video Compressor\n(compress_video.py)] --> [Cloud Uploader\n(upload_videos_pool_id.py)] : Queues for upload
+[Cloud Uploader\n(upload_videos_pool_id.py)] --> [AWS S3 / Cloud Storage] : Uploads video and images
+[Cloud Uploader\n(upload_videos_pool_id.py)] --> [Qualix API (agnext.in)] : Uploads metadata/bounding boxes
+
+@enduml
