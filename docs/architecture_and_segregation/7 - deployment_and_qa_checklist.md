@@ -1,8 +1,8 @@
 # 7. Deployment & QA Checklist
 
-Since 100% of the legacy application's UI and architecture have been successfully migrated to the new web-based Full-Stack architecture (React + FastAPI + PostgreSQL), the next phase of the project transitions from *Development* to *Quality Assurance (QA) and Deployment*.
+The UI and architecture have been migrated to React + FastAPI + PostgreSQL, and the gaps found in the September 2026 audit have been closed in software (see `8 - remediation_log.md`). What has *not* happened is verification on the physical machine: nothing below has been exercised against a real camera, conveyor or TensorRT engine.
 
-Below is the checklist of required next steps to validate the system on physical hardware.
+Below is the checklist of required next steps to validate the system on physical hardware. Every item is still open.
 
 ## 1. Physical Hardware QA
 Currently, development and testing have occurred in a standard desktop environment. To finalize the migration, the Docker containers must be deployed onto the actual edge device (e.g., Jetson Nano, IPC).

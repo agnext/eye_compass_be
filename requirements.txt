@@ -1,15 +1,42 @@
+# Web stack
 fastapi==0.110.0
-uvicorn==0.28.0
-sqlalchemy>=2.0.35
-boto3==1.34.0
-python-dotenv==1.0.1
-opencv-python-headless==4.10.0.84
+uvicorn[standard]==0.28.0
 websockets==12.0
 pydantic>=2.6
+python-multipart
+python-dotenv==1.0.1
+
+# Database
+sqlalchemy>=2.0.35
 psycopg2-binary>=2.9
-gspread>=5.10
-google-auth>=2.20
+
+# Vision / numerics
+# opencv-python-headless is the right choice off-device. On the Jetson, OpenCV
+# ships with JetPack and is already present in the deployment venv — installing
+# the wheel there can shadow the CUDA-enabled build, so skip it on the device.
+numpy>=1.23,<2
+opencv-python-headless==4.10.0.84; platform_machine != "aarch64"
+
+# Hardware
+pyserial>=3.5
+
+# Cloud integrations
+boto3==1.34.0
 requests>=2.31
 requests-toolbelt>=1.0
-python-multipart
-pyserial>=0.0.9
+gspread>=5.10
+google-auth>=2.20
+
+# ---------------------------------------------------------------------------
+# NOT installed by pip on the Jetson: tensorrt, pycuda, torch, torchvision.
+# These come from JetPack / NVIDIA's aarch64 wheels and must already exist in
+# the interpreter this service runs under. They are imported by the legacy
+# run_inference.py that the inference service loads.
+#
+# Verify with:
+#   python -c "import tensorrt, pycuda.driver, torch, cv2, numpy"
+#
+# The deployment venv is /home/nvidia/.virtualenvs/eye_compass, which carries
+# both the ML stack and the web stack above. The system python3 has neither
+# fastapi nor pycuda, so it cannot run this service.
+# ---------------------------------------------------------------------------

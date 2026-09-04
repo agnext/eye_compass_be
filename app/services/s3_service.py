@@ -1,70 +1,92 @@
-import os
-import boto3
+"""
+On-demand S3 uploads for a single file.
+
+The periodic sweep of the output tree lives in s3_worker.py; this is for
+one-off uploads. Credentials are created lazily on first use — the previous
+version ran a blocking Cognito network call at module import, which delayed
+startup on an offline-first device for a client nothing actually called.
+"""
+
 import logging
-from boto3.s3.transfer import TransferConfig
-from botocore.config import Config as BotoConfig
+import os
+import threading
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
 class S3Service:
     def __init__(self):
-        self.region = os.getenv("S3_REGION", "us-east-2")
-        self.identity_pool_id = os.getenv("COGNITO_IDENTITY_POOL", "<REDACTED>")
-        self.bucket_name = os.getenv("S3_BUCKET", "agnext-cognito")
-        self.boto_cfg = BotoConfig(connect_timeout=15, read_timeout=60, retries={'max_attempts': 3})
-        
-        self.s3_resource = None
-        self._init_client()
+        self._resource = None
+        self._lock = threading.Lock()
 
-    def _init_client(self):
-        """Initializes the S3 resource using Cognito Identity Pool."""
-        try:
-            client = boto3.client('cognito-identity', region_name=self.region, config=self.boto_cfg)
-            resp = client.get_id(IdentityPoolId=self.identity_pool_id)
-            creds = client.get_credentials_for_identity(IdentityId=resp['IdentityId'])
-            
-            self.s3_resource = boto3.resource(
-                's3',
-                aws_access_key_id=creds['Credentials']['AccessKeyId'],
-                aws_secret_access_key=creds['Credentials']['SecretKey'],
-                aws_session_token=creds['Credentials']['SessionToken'],
-                region_name=self.region,
-                config=self.boto_cfg
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize S3 Cognito credentials: {e}")
-            self.s3_resource = None
+    def _ensure_client(self) -> bool:
+        if self._resource is not None:
+            return True
+        if not settings.S3_IDENTITY_POOL:
+            logger.warning("S3 identity pool is not configured; uploads disabled.")
+            return False
 
-    def upload_file(self, local_file_path: str, s3_key: str):
-        """
-        Uploads a file to S3 using multipart transfer configuration.
-        Designed to be called from a FastAPI BackgroundTask.
-        """
-        if not self.s3_resource:
-            self._init_client()
-            if not self.s3_resource:
-                logger.error("S3 resource not available. Cannot upload.")
+        with self._lock:
+            if self._resource is not None:
+                return True
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+
+                cfg = BotoConfig(
+                    connect_timeout=15, read_timeout=60, retries={"max_attempts": 3}
+                )
+                client = boto3.client(
+                    "cognito-identity", region_name=settings.S3_REGION, config=cfg
+                )
+                identity = client.get_id(IdentityPoolId=settings.S3_IDENTITY_POOL)
+                creds = client.get_credentials_for_identity(
+                    IdentityId=identity["IdentityId"]
+                )["Credentials"]
+
+                self._resource = boto3.resource(
+                    "s3",
+                    aws_access_key_id=creds["AccessKeyId"],
+                    aws_secret_access_key=creds["SecretKey"],
+                    aws_session_token=creds["SessionToken"],
+                    region_name=settings.S3_REGION,
+                    config=cfg,
+                )
+                return True
+            except Exception as exc:
+                logger.error("Failed to initialise S3 Cognito credentials: %s", exc)
+                self._resource = None
                 return False
 
+    def upload_file(self, local_file_path: str, s3_key: str) -> bool:
+        if not self._ensure_client():
+            return False
         if not os.path.exists(local_file_path):
-            logger.error(f"File {local_file_path} not found.")
+            logger.error("File not found: %s", local_file_path)
             return False
 
-        config = TransferConfig(
-            multipart_threshold=64*1024*1024, # 64MB
-            max_concurrency=10,
-            multipart_chunksize=64*1024*1024,
-            use_threads=True
+        from boto3.s3.transfer import TransferConfig
+
+        transfer = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,
+            multipart_chunksize=8 * 1024 * 1024,
+            max_concurrency=4,
+            use_threads=True,
         )
-        
         try:
-            self.s3_resource.Bucket(self.bucket_name).upload_file(
-                local_file_path, 
-                s3_key,
-                Config=config
+            self._resource.Bucket(settings.S3_BUCKET).upload_file(
+                local_file_path, s3_key, Config=transfer
             )
-            logger.info(f"Successfully uploaded {local_file_path} to {s3_key}")
+            logger.info("Uploaded %s -> %s", local_file_path, s3_key)
             return True
-        except Exception as e:
-            logger.error(f"Failed to upload {local_file_path} to S3: {e}")
+        except Exception as exc:
+            # Cognito credentials expire; drop them so the next call re-issues.
+            if "ExpiredToken" in str(exc) or "InvalidAccessKeyId" in str(exc):
+                self._resource = None
+            logger.error("Failed to upload %s: %s", local_file_path, exc)
             return False
+
+
+s3_service = S3Service()

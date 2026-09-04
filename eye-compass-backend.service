@@ -1,24 +1,33 @@
 [Unit]
 Description=Eye Compass FastAPI Backend
-After=network.target docker.service
-Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
 
 [Service]
 User=nvidia
-WorkingDirectory=/home/nvidia/eye_compass_be
+WorkingDirectory=/home/nvidia/eye_compass_new/eye_compass_be
 
-# Load environment variables (API keys, DB URLs, etc.) from the .env file
-EnvironmentFile=/home/nvidia/eye_compass_be/.env
-Environment="EYE_COMPASS_SRC=/home/nvidia/eye_compass"
+# Optional: the service starts even if .env is absent, using the defaults in
+# app/core/config.py and the legacy config.INI fallback.
+EnvironmentFile=-/home/nvidia/eye_compass_new/eye_compass_be/.env
+
+# Environment= wins over .env (config.py loads it with override=False), so a
+# stale USE_MOCK_CAMERA=true in a developer's .env cannot put the real device
+# into mock mode.
 Environment="USE_MOCK_CAMERA=false"
+Environment="EYE_COMPASS_SRC=/home/nvidia/eye_compass"
+Environment="MVCAM_COMMON_RUNENV=/opt/MVS/lib"
+Environment="PYTHONPATH=/opt/MVS/Samples/aarch64/Python/MvImport"
 
-# Use the system Python or a virtual environment (recommended)
-ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# This venv is the only interpreter on the device with BOTH the ML stack
+# (tensorrt, pycuda, torch, cv2) and the web stack (fastapi, uvicorn,
+# sqlalchemy). /usr/bin/python3 has neither half complete.
+ExecStart=/home/nvidia/.virtualenvs/eye_compass/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 Restart=always
 RestartSec=5
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=eye-compass-backend
 
 [Install]

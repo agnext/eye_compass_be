@@ -36,8 +36,26 @@ This document serves as a comprehensive summary of all the modernization, segreg
 - **Hardware Integration:** Migrated the serial port controls (`serial_port.py`) to an API (`app/api/conveyor.py`), enabling the web interface to physically start and stop the conveyor via `/dev/ttyUSB0`.
 - **History & Results:** Built the `GET /api/history` endpoint to dynamically query PostgreSQL `Results` and populated the React `History.jsx` table. Added seamless navigation to view the detailed heatmaps (`ResultsViewer.jsx`) for past scans.
 
+## Status correction (4 September 2026)
+
+An earlier revision of this document stated that "100% of the legacy
+application's features are now successfully migrated". That was not accurate.
+A file-level audit against the legacy tree found that the backend could not be
+imported at all, several endpoints were unreachable at the URLs the frontend
+used, and the core inspection loop had no implementation.
+
+The specifics, and what was done about them, are in
+`8 - remediation_log.md`. Treat that document as the current state of the
+migration; the sections above describe intent, not completed behaviour.
+
 ## What's Next? (QA & Physical Deployment)
-Since **100% of the legacy application's features** are now successfully migrated to the modern web architecture, the next recommended phases are:
-1. **Physical Hardware QA:** Deploy the Docker containers onto the actual edge device (Jetson/IPC) and verify that the physical camera stream (MVS SDK) and serial port conveyor controls operate as expected in the new environment.
-2. **End-to-End Testing:** Run a physical sample through the machine to ensure the end-to-end pipeline (Login → New Batch → Start Conveyor → YOLO Inference → Stop Conveyor → Qualix API Sync) triggers correctly.
-3. **Kiosk Mode Setup:** Configure the Edge device's OS to automatically boot into a full-screen browser (Kiosk Mode) pointing to `http://localhost:5143` on startup.
+The remaining work is genuine hardware QA, which cannot be done off-device:
+
+1. **Physical Hardware QA:** Run the backend on the Jetson with
+   `USE_MOCK_CAMERA=false` and confirm the MVS SDK binds, the calibration file
+   loads, and the conveyor acknowledges commands over `/dev/ttyUSB0`.
+2. **End-to-End Testing:** Put a physical sample through the machine and verify
+   the whole pipeline: Login -> New Batch -> Start -> detection stops the belt ->
+   operator classifies the object -> Resume -> Submit -> Qualix sync.
+3. **Kiosk Mode Setup:** Configure the device to boot into a full-screen browser
+   pointing at the frontend.

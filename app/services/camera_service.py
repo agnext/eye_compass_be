@@ -108,9 +108,8 @@ class MockCameraService(BaseCameraService):
             pass  # cv2 not available — plain colour bars are fine
 
         self._frame_count += 1
-
-        # Throttle to ~20 FPS
-        time.sleep(1.0 / settings.STREAM_FPS)
+        # No sleep here: the stream loop in api/camera.py already paces to
+        # STREAM_FPS, and throttling in both places halves the effective rate.
         return frame
 
     def stop_grabbing(self) -> None:
@@ -186,16 +185,36 @@ class RealCameraService(BaseCameraService):
 
         self.cam = None
         self.nPayloadSize = 0
+        self._is_gige = False
+        self._consecutive_errors = 0
 
     # ---- helpers ----
-    @staticmethod
-    def _convert_frame(frame) -> np.ndarray:
-        """Convert a raw Bayer frame to BGR numpy array (mirrors GrabImage.py)."""
+    # BayerRG8. Legacy guards on this exact value (GrabImage.py:50) and raises
+    # for anything else rather than demosaicing a format it does not understand.
+    PIXEL_TYPE_BAYER_RG8 = 0x1080009
+
+    @classmethod
+    def _convert_frame(cls, frame) -> np.ndarray:
+        """Convert a raw Bayer frame to a numpy image.
+
+        Exact port of convert_frame_to_image (GrabImage.py:42-68), including the
+        pixel-format guard. Note there is deliberately NO cv2.flip here: both
+        flip calls are commented out in the legacy source, and applying them
+        rotates the image 180deg, which reverses the belt's direction of travel
+        in image space and breaks ObjectTracker's x/y assumptions.
+        """
         import cv2
         from ctypes import cast, POINTER, c_ubyte
 
         width = frame.stFrameInfo.nWidth
         height = frame.stFrameInfo.nHeight
+        pixel_type = frame.stFrameInfo.enPixelType
+
+        if pixel_type != cls.PIXEL_TYPE_BAYER_RG8:
+            raise ValueError(
+                f"Unsupported pixel type 0x{pixel_type:x}; expected BayerRG8 "
+                f"(0x{cls.PIXEL_TYPE_BAYER_RG8:x}). Check the camera's PixelFormat setting."
+            )
 
         buffer = cast(
             frame.pBufAddr,
@@ -208,10 +227,7 @@ class RealCameraService(BaseCameraService):
             raise ValueError(f"Buffer size {raw.size} != expected {expected}")
 
         raw = raw.reshape((height, width))
-        image = cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB)
-        image = cv2.flip(image, 0)
-        image = cv2.flip(image, 1)
-        return image.copy()
+        return cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB).copy()
 
     # ---- interface ----
     def initialize(self) -> bool:
@@ -230,14 +246,36 @@ class RealCameraService(BaseCameraService):
             device_list.pDeviceInfo[settings.CAMERA_INDEX],
             POINTER(self._MV_CC_DEVICE_INFO),
         ).contents
+        self._is_gige = dev_info.nTLayerType == self._MV_GIGE_DEVICE
 
         if self.cam.MV_CC_CreateHandle(dev_info) != 0:
             logger.error("Failed to create camera handle")
+            self._release_handle()
             return False
 
-        if self.cam.MV_CC_OpenDevice(self._MV_ACCESS_Exclusive, 0) != 0:
-            logger.error("Failed to open camera device")
+        ret = self.cam.MV_CC_OpenDevice(self._MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            logger.error("Failed to open camera device: ret[0x%x]", ret)
+            # Without this the handle leaks and the device can stay locked
+            # until the Jetson is rebooted.
+            self._release_handle()
             return False
+
+        # GigE: negotiate the optimal packet size before streaming, or frames
+        # arrive partial/dropped under load (GrabImage.py:662-665).
+        if self._is_gige:
+            packet_size = self.cam.MV_CC_GetOptimalPacketSize()
+            if packet_size > 0:
+                ret = self.cam.MV_CC_SetIntValue("GevSCPSPacketSize", packet_size)
+                if ret != 0:
+                    logger.warning("Could not set GevSCPSPacketSize: ret[0x%x]", ret)
+                else:
+                    logger.info("GevSCPSPacketSize set to %s", packet_size)
+            else:
+                logger.warning(
+                    "MV_CC_GetOptimalPacketSize returned %s; leaving packet size at default",
+                    packet_size,
+                )
 
         self.cam.MV_CC_SetEnumValue("TriggerMode", self._MV_TRIGGER_MODE_OFF)
         self.cam.MV_CC_SetEnumValue("BalanceWhiteAuto", self._MV_BALANCEWHITE_AUTO_OFF)
@@ -249,11 +287,56 @@ class RealCameraService(BaseCameraService):
         self.cam.MV_CC_GetIntValue("PayloadSize", stParam)
         self.nPayloadSize = stParam.nCurValue
 
+        # Legacy values (GrabImage.py:677-678). The [CAMERA] runtime_* keys in
+        # config.INI are not read by any legacy code path, so they are not the
+        # source of truth here.
         self.cam.MV_CC_SetFloatValue("ExposureTime", settings.CAMERA_EXPOSURE_TIME)
         self.cam.MV_CC_SetFloatValue("Gain", settings.CAMERA_GAIN)
 
-        logger.info("Camera initialized successfully")
+        # Calibration: white balance ratios, gamma and acquisition frame rate.
+        # Without this the camera runs on factory defaults and the colour
+        # profile the models were trained against is lost (GrabImage.py:679).
+        self._load_feature_file()
+
+        logger.info(
+            "Camera initialized (exposure=%.1f gain=%.2f gige=%s)",
+            settings.CAMERA_EXPOSURE_TIME,
+            settings.CAMERA_GAIN,
+            self._is_gige,
+        )
         return True
+
+    def _load_feature_file(self) -> None:
+        import os
+
+        path = settings.CAMERA_FEATURE_FILE
+        if not path or not os.path.exists(path):
+            logger.warning(
+                "Camera feature file not found at %s — running on factory white "
+                "balance and frame rate. Detection results will differ from the "
+                "legacy system.",
+                path,
+            )
+            return
+        ret = self.cam.MV_CC_FeatureLoad(path)
+        if ret != 0:
+            logger.error("MV_CC_FeatureLoad(%s) failed: ret[0x%x]", path, ret)
+        else:
+            logger.info("Camera calibration loaded from %s", path)
+
+    def _release_handle(self) -> None:
+        """Destroy a partially-opened handle so the device is not left locked."""
+        if self.cam is None:
+            return
+        try:
+            self.cam.MV_CC_CloseDevice()
+        except Exception:
+            pass
+        try:
+            self.cam.MV_CC_DestroyHandle()
+        except Exception:
+            pass
+        self.cam = None
 
     def start_grabbing(self) -> bool:
         if self.cam is None:
@@ -277,7 +360,17 @@ class RealCameraService(BaseCameraService):
 
         ret = self.cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
         if ret != self._MV_OK:
+            # A hung or unplugged camera must not look like an idle one
+            # (legacy logs every non-OK return, GrabImage.py:135-152).
+            self._consecutive_errors += 1
+            if self._consecutive_errors in (1, 10) or self._consecutive_errors % 100 == 0:
+                logger.error(
+                    "MV_CC_GetImageBuffer returned 0x%x (%s consecutive)",
+                    ret & 0xFFFFFFFF,
+                    self._consecutive_errors,
+                )
             return None
+        self._consecutive_errors = 0
 
         try:
             frame = self._convert_frame(stOutFrame)
@@ -296,9 +389,7 @@ class RealCameraService(BaseCameraService):
 
     def close(self) -> None:
         if self.cam:
-            self.cam.MV_CC_CloseDevice()
-            self.cam.MV_CC_DestroyHandle()
-            self.cam = None
+            self._release_handle()
             logger.info("Camera closed")
 
 
