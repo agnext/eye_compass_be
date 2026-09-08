@@ -68,16 +68,13 @@ def unlock_machine_start():
 def jog_forward(seconds: float = 2.0):
     """Jog the belt forward briefly, then stop.
 
-    Port of move_conveyor_forward (main.py:851-887): unlock, start, wait, stop.
+    Port of forward_dc (main.py:1994-2002), the Data Collection page's Forward
+    button — its only caller. start_conveyor()/stop_conveyor() there are called
+    without checking or unlocking anything, so neither happens here either.
     """
     import time
 
-    conveyor_service.unlock_machine_start(reason="forward jog")
-    if not conveyor_service.send("machine_start"):
-        raise HTTPException(
-            status_code=502,
-            detail=conveyor_service.status()["last_error"] or "Could not start conveyor",
-        )
+    conveyor_service.send("machine_start")
     time.sleep(max(0.0, min(seconds, 10.0)))
     conveyor_service.send("all_stop")
     return {"success": True, "jogged_seconds": seconds}

@@ -29,6 +29,7 @@ per-FM breakdown by listing saved crop files. Both are reproduced here.
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections import Counter
@@ -228,17 +229,43 @@ class ScanSession:
             track_ids = list(self.tracker.get_tracked_objects().keys())
             new_ids = set(track_ids) - self.existing_track_ids
 
+            # Deliberate deviation from legacy: a new physical object can only
+            # appear under the camera if the belt is actually advancing, so
+            # nothing "new" should be countable while machine_start is locked
+            # (an FM stop already in effect, awaiting Resume/Forward/Submit).
+            # Neither legacy's nor this port's inference loop is otherwise
+            # gated on belt motion at all, so a stationary object sitting
+            # under the camera during that stop can still generate fresh
+            # tracker ids from ordinary frame-to-frame detection jitter (see
+            # enhancements.md) — this closes that off at the source, not just
+            # for the subset that happens to collide with something already
+            # pending.
+            if new_ids and conveyor_service.machine_start_locked:
+                logger.info(
+                    "FM detected but not counted or queued (belt already "
+                    "locked/stopped): %s", new_ids
+                )
+                return self._snapshot(fm_detected=False)
+
             fm_detected = False
             if new_ids and not self._has_similar_x_axis(boxes, x_threshold=10):
                 fm_detected = True
                 self._on_foreign_matter(frame, boxes)
+                # Deliberate deviation from legacy (main.py:2597-2622): only
+                # count ids we actually surface for operator review. Legacy
+                # adds every new id to existing_track_ids unconditionally,
+                # even ones has_similar_x_axis suppressed from the pending
+                # queue, so total_fo_detected silently inflates from tracker
+                # jitter on a stationary object (see enhancements.md). An id
+                # suppressed here stays out of existing_track_ids, so it's
+                # still "new" on a later frame and gets a fair chance to be
+                # counted once whatever it collided with in `pending` clears.
+                self.existing_track_ids.update(new_ids)
             elif new_ids:
                 logger.info(
-                    "FM detected but skipped (similar x-axis already pending): %s", new_ids
+                    "FM detected but not counted or queued (similar x-axis "
+                    "already pending): %s", new_ids
                 )
-
-            # Accumulate unique ids regardless — this is the run total.
-            self.existing_track_ids.update(track_ids)
 
             return self._snapshot(fm_detected=fm_detected)
 
@@ -345,6 +372,31 @@ class ScanSession:
         ok = conveyor_service.send("machine_start")
         return {"resumed": ok, **self.status()}
 
+    def cancel(self) -> Dict:
+        """Discard the run — archive its crops, don't delete them.
+
+        Port of cancel_result (main.py:2033-2052): every file already saved to
+        output_folder is moved into <OUTPUT_DIR>/rejected/<commodity>/<variety>/
+        <folder_name>/ for later review, not deleted. commodity/variety are
+        used here exactly as legacy did — NOT slugified, unlike output_folder's
+        own path (main.py:2039 uses currentText() directly while start_process
+        lowercases and underscores it at main.py:770) — a literal legacy
+        inconsistency reproduced rather than "fixed".
+        """
+        with self._lock:
+            sample_id = self.sample_id
+            if self.output_folder and os.path.isdir(self.output_folder):
+                rejected_folder = os.path.join(
+                    settings.OUTPUT_DIR, "rejected", self.commodity, self.variety, self.folder_name
+                )
+                os.makedirs(rejected_folder, exist_ok=True)
+                for name in os.listdir(self.output_folder):
+                    src = os.path.join(self.output_folder, name)
+                    if os.path.isfile(src):
+                        shutil.move(src, rejected_folder)
+            self.reset()
+        return {"cancelled": True, "sample_id": sample_id}
+
     # ------------------------------------------------------------------
     # Results
     # ------------------------------------------------------------------
@@ -379,7 +431,11 @@ class ScanSession:
         return {
             "Frame Count": frame_count,
             "FM Stop Count": csc["fm_count"],
-            # Legacy subtracts the initial start press (main.py:1553).
+            # stop_count is only ever incremented by stop_p() (main.py:1074),
+            # which fires for BOTH the manual Stop button and Submit
+            # (submit_video -> stop_p, main.py:1571). This "-1" discounts that
+            # implicit submit-time stop so the metric reflects only stops the
+            # operator actually chose mid-run (main.py:1554).
             "Manual Stop Count": max(0, csc["stop_count"] - 1),
             "FM Stop Time": round(csc["total_fm_time"], 3),
             "Manual Stop Time": round(csc["total_stop_time"], 3),
@@ -440,6 +496,13 @@ class ScanSession:
     def _snapshot(self, fm_detected: bool) -> Dict:
         return {
             "fm_detected": fm_detected,
+            # Port of frame_fm_count (main.py:2667/2675, fed by fo_count =
+            # len(coo) in GrabImage.py:621) — the count for the detection
+            # instance currently on screen, which is what label_fm_count
+            # actually displays live in legacy. NOT the same as
+            # total_fo_detected below, which legacy only ever uses for the
+            # final saved result/looker_data, never shown on this label.
+            "frame_fm_count": len(self.pending),
             "total_fo_detected": len(self.existing_track_ids),
             "frame_count": self.frame_count,
             "machine_start_locked": conveyor_service.machine_start_locked,

@@ -15,7 +15,9 @@ so its public URL stays ws://host/ws/camera/stream.
 
 import asyncio
 import base64
+import concurrent.futures
 import logging
+import os
 import threading
 import time
 
@@ -25,7 +27,8 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.services.camera_service import BaseCameraService, get_camera_service
-from app.services.inference_service import BaseInferenceService, get_inference_service
+from app.services.conveyor_service import conveyor_service
+from app.services.inference_service import BaseInferenceService, get_inference_service, normalize_commodity
 from app.services.scan_session import scan_session
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,21 @@ ws_router = APIRouter()
 # Services. The camera and the TensorRT context are single physical resources,
 # so they are guarded by a lock — several browser tabs must not interleave
 # grabs or run inference concurrently on one CUDA context.
+#
+# All of it also has to run on the SAME OS thread every time. run_inference.py
+# pushes a CUDA context onto whichever thread first touches it per-thread
+# (run_inference.py:179-204) and only pops it via an explicit cleanup() call
+# (run_inference.py:235-267) — nothing pops it automatically. FastAPI runs
+# each sync request handler on a fresh thread from its own pool, and the
+# asyncio default executor used inside the websocket loop is a THIRD, separate
+# pool — so without this, camera/inference calls could land on a different
+# thread almost every time, each one pushing a new context that never gets
+# popped. At shutdown, pycuda notices contexts still on some thread's stack
+# that were never cleaned up and hard-aborts the whole process ("PyCUDA
+# ERROR: The context stack was not empty... Aborted (core dumped)") — this
+# dedicated single-worker executor is what makes "the same thread every time"
+# actually true, so the one cleanup() call at shutdown pops the one context
+# that was ever pushed.
 # ---------------------------------------------------------------------------
 
 _camera: BaseCameraService | None = None
@@ -45,6 +63,36 @@ _camera_initialized = False
 _hardware_lock = threading.Lock()
 _stream_clients = 0
 _clients_lock = threading.Lock()
+
+_hw_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-hw")
+
+
+def _run_on_hw_thread(fn, *args, **kwargs):
+    """Run fn on the single dedicated camera/inference thread and block for
+    the result. Safe to call from a sync request handler (already running in
+    some other thread) or await via run_in_executor from async code."""
+    return _hw_executor.submit(fn, *args, **kwargs).result()
+
+# ---------------------------------------------------------------------------
+# Data Collection — raw frame dump for later manual labelling, no inference.
+# Port of the legacy "Data Collection" page (goto_dc_page / start_dc /
+# capture_image_dc / stop_dc, main.py:1843-2022), which is a completely
+# separate flow from the scan/detection one above: it just streams the raw
+# feed and, while "recording", saves every grabbed frame to disk untouched.
+# ---------------------------------------------------------------------------
+
+_dc_lock = threading.Lock()
+_dc_recording = False
+_dc_folder: str | None = None
+_dc_frame_count = 0
+
+
+def _dc_status() -> dict:
+    return {
+        "recording": _dc_recording,
+        "folder": _dc_folder,
+        "frame_count": _dc_frame_count,
+    }
 
 
 def _ensure_services() -> bool:
@@ -67,23 +115,36 @@ def _ensure_services() -> bool:
 
 
 def shutdown_camera_services():
-    """Called from the app lifespan on shutdown."""
+    """Called from the app lifespan on shutdown.
+
+    Must run on the same dedicated thread every other camera/inference call
+    used, so cleanup() pops the CUDA context on the thread that pushed it —
+    see the note above _hw_executor. The executor is shut down afterward so
+    that worker thread actually exits once the context is popped.
+    """
     global _camera, _inference, _camera_initialized
-    with _hardware_lock:
-        if _camera is not None:
-            try:
-                _camera.stop_grabbing()
-                _camera.close()
-            except Exception as exc:
-                logger.warning("Camera shutdown error: %s", exc)
-        if _inference is not None:
-            try:
-                _inference.cleanup()
-            except Exception as exc:
-                logger.warning("Inference shutdown error: %s", exc)
+
+    def _do_shutdown():
+        with _hardware_lock:
+            if _camera is not None:
+                try:
+                    _camera.stop_grabbing()
+                    _camera.close()
+                except Exception as exc:
+                    logger.warning("Camera shutdown error: %s", exc)
+            if _inference is not None:
+                try:
+                    _inference.cleanup()
+                except Exception as exc:
+                    logger.warning("Inference shutdown error: %s", exc)
+
+    try:
+        _run_on_hw_thread(_do_shutdown)
+    finally:
         _camera = None
         _inference = None
         _camera_initialized = False
+        _hw_executor.shutdown(wait=True)
 
 
 def camera_health() -> dict:
@@ -119,7 +180,9 @@ async def camera_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket client connected to /ws/camera/stream")
 
-    if not _ensure_services():
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(_hw_executor, _ensure_services)
+    if not ok:
         await websocket.send_json({"error": "Camera not available"})
         await websocket.close()
         return
@@ -142,7 +205,6 @@ async def camera_stream(websocket: WebSocket):
     fps_timer = time.time()
     current_fps = 0.0
     raw_frame_index = 0
-    loop = asyncio.get_running_loop()
 
     try:
         while True:
@@ -158,7 +220,9 @@ async def camera_stream(websocket: WebSocket):
                     dets, annotated = _inference.predict(frame)
                     return (frame, dets, annotated)
 
-            result = await loop.run_in_executor(None, grab_and_infer)
+            # Must run on _hw_executor, not the default pool — see the note
+            # above _hw_executor's definition.
+            result = await loop.run_in_executor(_hw_executor, grab_and_infer)
             if result is None or result[0] is None:
                 await asyncio.sleep(0.02)
                 continue
@@ -219,6 +283,73 @@ async def camera_stream(websocket: WebSocket):
         logger.info("WebSocket stream ended")
 
 
+@ws_router.websocket("/ws/data_collection/stream")
+async def data_collection_stream(websocket: WebSocket):
+    """Raw preview for the Data Collection page — no inference, no scan_session.
+
+    Sends a frame only while recording is on, matching legacy: dc_image_update
+    is only ever emitted from inside CollectionCameraThread.run() (GrabImage.py:
+    733-826), which only runs between start_dc/capture_image_dc and stop_dc. The
+    UI shows a blank/placeholder view the rest of the time — that is not a bug,
+    it is what the legacy page actually did.
+    """
+    global _dc_frame_count
+
+    await websocket.accept()
+    logger.info("WebSocket client connected to /ws/data_collection/stream")
+
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(_hw_executor, _ensure_services)
+    if not ok:
+        await websocket.send_json({"error": "Camera not available"})
+        await websocket.close()
+        return
+
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.STREAM_JPEG_QUALITY]
+
+    try:
+        while True:
+            if not _dc_recording:
+                await asyncio.sleep(0.1)
+                continue
+
+            def grab_and_save():
+                with _hardware_lock:
+                    frame = _camera.grab_frame()
+                if frame is None or not _dc_recording or not _dc_folder:
+                    return frame
+                # Same array, same cv2.imwrite call as legacy's
+                # CollectionCameraThread.run (GrabImage.py:780-782) — no color
+                # conversion here in legacy either, so none is added here.
+                image_name = time.time()
+                filename = f"{os.path.basename(_dc_folder)}_{image_name}.png"
+                cv2.imwrite(os.path.join(_dc_folder, filename), frame)
+                return frame
+
+            frame = await loop.run_in_executor(_hw_executor, grab_and_save)
+            if frame is None:
+                await asyncio.sleep(0.02)
+                continue
+
+            with _dc_lock:
+                _dc_frame_count += 1
+
+            ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+            if not ok:
+                continue
+            await websocket.send_json({
+                "frame": base64.b64encode(buffer).decode("utf-8"),
+                "frame_count": _dc_frame_count,
+                "recording": True,
+            })
+            await asyncio.sleep(1.0 / max(1, settings.STREAM_FPS))
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected from data collection stream")
+    except Exception as exc:
+        logger.error("Data collection WebSocket error: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # REST
 # ---------------------------------------------------------------------------
@@ -247,11 +378,15 @@ def switch_model(req: ModelSwitchRequest):
     Returns 503 on failure rather than {"success": false}: a scan running with
     no model produces zero detections and looks like a clean sample.
     """
-    if not _ensure_services():
-        raise HTTPException(status_code=503, detail="Camera/inference services unavailable")
+    def _do():
+        if not _ensure_services():
+            raise HTTPException(status_code=503, detail="Camera/inference services unavailable")
+        with _hardware_lock:
+            return _inference.load_model(req.commodity, req.variety)
 
-    with _hardware_lock:
-        ok = _inference.load_model(req.commodity, req.variety)
+    # Must run on _hw_executor, not whatever thread FastAPI assigns this
+    # request — see the note above _hw_executor's definition.
+    ok = _run_on_hw_thread(_do)
 
     if not ok:
         raise HTTPException(
@@ -264,7 +399,7 @@ def switch_model(req: ModelSwitchRequest):
 
 @router.post("/start")
 def start_camera():
-    if not _ensure_services():
+    if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera initialization failed")
     return {"success": True, **camera_health()}
 
@@ -274,8 +409,118 @@ def stop_camera():
     """Stop acquisition. Legacy paired this with a 1s conveyor deceleration
     delay (stop_camera_with_delay, main.py:720-739)."""
     global _camera_initialized
-    with _hardware_lock:
-        if _camera is not None:
-            _camera.stop_grabbing()
-        _camera_initialized = False
+
+    def _do():
+        with _hardware_lock:
+            if _camera is not None:
+                _camera.stop_grabbing()
+
+    _run_on_hw_thread(_do)
+    _camera_initialized = False
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# Data Collection
+# ---------------------------------------------------------------------------
+
+class DataCollectionRequest(BaseModel):
+    sample_id: str
+    commodity: str
+    variety: str = ""
+
+
+@router.post("/data_collection/prepare")
+def prepare_data_collection(req: DataCollectionRequest):
+    """Create the output folder for this visit to the Data Collection page.
+
+    Port of goto_dc_page (main.py:1843-1862): the folder is created once, from
+    <OUTPUT_DIR>/Data_Collection/<commodity>/<variety>/<epoch>_<sample_id>, and
+    every Start/capture Image press during this visit writes into it — it is
+    not recreated per button press.
+    """
+    global _dc_folder, _dc_frame_count
+    unique = f"{int(time.time())}_{req.sample_id}"
+    folder = os.path.join(
+        settings.OUTPUT_DIR, "Data_Collection",
+        normalize_commodity(req.commodity), normalize_commodity(req.variety),
+        unique,
+    )
+    os.makedirs(folder, exist_ok=True)
+    with _dc_lock:
+        _dc_folder = folder
+        _dc_frame_count = 0
+    return {"success": True, **_dc_status()}
+
+
+@router.post("/data_collection/start")
+def start_data_collection():
+    """Port of start_dc (main.py:1864-1869): start the belt, start saving frames.
+
+    Legacy calls self.start_conveyor() and self.start_dc_camera() back to back
+    without checking the first call's return value at all — a belt that fails
+    to ack does not stop frames from being grabbed and saved. Recording here
+    is not gated on the conveyor call either, for the same reason: this is a
+    raw capture tool, and refusing to record because the belt didn't answer
+    would be stricter than the code it is meant to reproduce.
+    """
+    global _dc_recording
+    if _dc_folder is None:
+        raise HTTPException(status_code=409, detail="Call prepare before starting.")
+    if not _run_on_hw_thread(_ensure_services):
+        raise HTTPException(status_code=503, detail="Camera not available")
+    conveyor_service.send("machine_start")
+    with _dc_lock:
+        _dc_recording = True
+    return {"success": True, **_dc_status()}
+
+
+@router.post("/data_collection/stop")
+def stop_data_collection():
+    """Port of stop_dc (main.py:1926-1931): stop saving frames, then the belt."""
+    global _dc_recording
+    with _dc_lock:
+        _dc_recording = False
+    conveyor_service.send("all_stop")
+    return {"success": True, **_dc_status()}
+
+
+@router.post("/data_collection/capture")
+def capture_image_data_collection():
+    """Port of capture_image_dc (main.py:2004-2010): record for 2s, then stop.
+
+    Only the camera thread is touched here, same as legacy — the conveyor is
+    not started or stopped by this action.
+    """
+    global _dc_recording
+    if _dc_folder is None:
+        raise HTTPException(status_code=409, detail="Call prepare before capturing.")
+    if not _run_on_hw_thread(_ensure_services):
+        raise HTTPException(status_code=503, detail="Camera not available")
+    with _dc_lock:
+        _dc_recording = True
+    time.sleep(2.0)
+    with _dc_lock:
+        _dc_recording = False
+    return {"success": True, **_dc_status()}
+
+
+@router.get("/data_collection/status")
+def data_collection_status():
+    return _dc_status()
+
+
+@router.post("/data_collection/finish")
+def finish_data_collection():
+    """Legacy's submit_dc/back_from_dc (main.py:2012-2022) just navigate home
+    without stopping the recording thread first — if the operator forgot to
+    press Stop, the camera thread and belt keep running in the background.
+    That is a leak in the original, not something worth reproducing here: this
+    unconditionally stops both, then the caller navigates away same as legacy.
+    """
+    global _dc_recording, _dc_folder
+    with _dc_lock:
+        _dc_recording = False
+        _dc_folder = None
+    conveyor_service.send("all_stop")
     return {"success": True}

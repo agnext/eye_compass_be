@@ -52,6 +52,28 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Startup all_stop failed: %s", exc)
 
+    # 2b. Legacy's run_inference.py registers a SIGTERM handler at import time
+    #     (run_inference.py:103), which only works from the main thread of the
+    #     main interpreter. TensorRTInferenceService.__init__ imports it lazily,
+    #     on the first POST /api/camera/model — which FastAPI runs in a
+    #     threadpool worker, not the main thread, so that first request always
+    #     crashed with "signal only works in main thread". Importing it here
+    #     instead, during startup (which runs on the main thread), registers
+    #     the handler successfully once; Python caches the module afterward, so
+    #     the later import from a worker thread just reuses it without
+    #     re-running any module-level code.
+    if not settings.USE_MOCK_CAMERA:
+        try:
+            import sys
+
+            if settings.EYE_COMPASS_SRC not in sys.path:
+                sys.path.insert(0, settings.EYE_COMPASS_SRC)
+            import run_inference  # noqa: F401
+
+            logger.info("Pre-imported run_inference on the main thread.")
+        except Exception as exc:
+            logger.warning("Could not pre-import run_inference: %s", exc)
+
     # 3. Background workers.
     tasks = []
 

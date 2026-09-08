@@ -1,47 +1,86 @@
-# Eye Compass: Architecture & Segregation Strategy
+# 1. Strategy — Why and How This Was Segregated
 
-This document outlines the high-level strategy for segregating the Eye Compass monolithic application into independent frontend, backend, and database components.
+This is the first document in a series. Read them in order (1 → 10) for a
+complete picture of the legacy application, why and how it was split into a
+frontend and a backend, how its behavior was verified to match the original,
+and what is left before a real device can run this instead of the legacy app.
 
-## Current Monolithic State
-- **Frontend & Backend:** Bundled together in Python using PyQt5 (`main.py`, `eye_compass_ui.py`).
-- **Hardware:** Runs on NVIDIA Jetson (aarch64) with a physical industrial camera using the Hikvision MVS SDK (`GrabImage.py`).
-- **Machine Learning:** YOLOv7 inference model (`agnext_opti`) running locally for tracking.
-- **Database:** SQLite (`database.py`) bundled in the same application.
-- **Data Sync:** Syncs data to Qualix via REST APIs (`api_handle.py`).
+## The one rule that governed every decision
 
-## Target Microservices Architecture
+**Segregation was the only intended change.** The legacy PyQt5 desktop
+application (`eye_compass`) is a single Python process that does everything:
+draws the UI, talks to the camera, runs inference, drives the conveyor,
+manages the database, and syncs to the cloud. The goal of this project was
+**not** to redesign how the machine behaves — it was to split that one process
+into a browser-based frontend (`eye_compass_fe`) talking over HTTP/WebSocket to
+a backend (`eye_compass_be`) that owns the hardware and business logic. Every
+button, every safety interlock, every retry policy, every quirk of the
+original was meant to keep working exactly as before; only *where the code
+lives* was supposed to change.
 
-### 1. Frontend: Progressive Web App (PWA)
-- **Tech Stack:** React (or Next.js/Vite) converted to a PWA.
-- **Role:** Replaces PyQt. It will render the UI and run in a Kiosk mode browser on the Jetson device.
-- **Hardware Integration:** Connects to the local Python backend via WebSockets to receive the real-time MJPEG camera stream and tracking results.
-- **Location:** `eye_compass_fe` repository.
+In practice, the first pass at this split did not fully hold to that rule —
+see `8 - remediation_log.md` and `9 - post_remediation_session_log.md` for the
+places where behavior had drifted from legacy (missing packages, wrong ports,
+a completely unimplemented detection loop) and had to be brought back in line
+by reading the legacy source line-by-line and porting the actual behavior,
+not just the intent.
 
-### 2. Backend: Python API (FastAPI) & AI Engine
-- **Tech Stack:** FastAPI (async Python web framework).
-- **Role:** Handles all hardware interaction, ML inference, database operations, and data syncing.
-- **Responsibilities:**
-  - Initialize and stream the Hikvision camera feed.
-  - Run the YOLOv7 ML models on the edge.
-  - Serve REST API endpoints for the frontend (login, start/stop tracking, results).
-  - Manage the existing Qualix data sync (via background workers/tasks).
-  - **AWS S3 Integration:** Handle the background uploading of output images/data to the `agnext-cognito` S3 bucket using Cognito Identity credentials (previously done via `QThread` in `s3_upload.py`).
-- **Data Routing to New Apps:** Implement an asynchronous publisher (e.g., webhooks, Redis Pub/Sub, or RabbitMQ) to dispatch data to two additional external applications concurrently without blocking the main event loop.
-- **Location:** `eye_compass` repository (refactored).
+## The legacy application, in one paragraph
 
-### 3. Database: PostgreSQL (Local Edge DB)
-- **Tech Stack:** PostgreSQL + SQLAlchemy ORM.
-- **Role:** Replaces SQLite for better concurrency and reliability.
-- **Why PostgreSQL over SQLite?**
-  - **Concurrency:** FastAPI's `BackgroundTasks` will asynchronously sync data to Google Sheets, S3, and Qualix. PostgreSQL handles concurrent reads/writes natively, preventing the "database is locked" exceptions common in SQLite under multi-threaded load.
-  - **Power-Loss Robustness:** PostgreSQL's Write-Ahead Logging (WAL) heavily mitigates the risk of data corruption if the physical Jetson device experiences a hard power-off during operation.
-  - **JSONB Support:** Native `JSONB` data types allow for clean storage and direct querying of the complex ML `analysis` payload objects, avoiding stringified-JSON hacks.
-- **Deployment:** Runs locally on the NVIDIA Jetson device (ARM64 compatible).
+`eye_compass` is a PyQt5 desktop app that runs directly on an NVIDIA Jetson
+edge device. It drives a physical Hikvision GigE industrial camera over the
+Hikvision MVS SDK, runs YOLOv7-family TensorRT models to detect foreign matter
+in a stream of commodity grain moving under the camera on a conveyor belt,
+talks to the belt's controller over a plain serial line to start/stop it and
+freeze it the instant something is detected, stores results in a local SQLite
+database, and syncs completed scans to Qualix (the customer's cloud analytics
+platform), Google Sheets, and an AWS S3 bucket. See
+`2 - current_codebase_overview.md` for the full tour, and
+`2b - dependencies_and_hardware.md` for the complete inventory of everything
+this application depends on to run.
 
-### 4. Authentication & Identity: Keycloak
-- **Role:** Unified Single Sign-On (SSO) login.
-- **Integration:** The PWA will authenticate users against Keycloak, and the FastAPI backend will validate the OIDC tokens.
-- **Session Expiry:** Configured in Keycloak realm settings to increase the refresh token / SSO session max lifespan to **1.5 months (45 days)**.
+## The target architecture
 
----
-*Note: This strategy ensures that all edge-dependent operations (camera, ML) remain local to the hardware to avoid latency, while modernizing the stack for better maintainability and scalability.*
+- **Frontend (`eye_compass_fe`)** — a React + Vite single-page app, configured
+  as an installable PWA, that renders every screen the operator sees and talks
+  to the backend over `fetch`/RTK Query and a WebSocket for the live camera
+  feed. It has zero direct hardware access — that is the entire point of the
+  split. See `3 - frontend_setup_walkthrough.md`.
+- **Backend (`eye_compass_be`)** — a FastAPI application that owns everything
+  hardware- and business-logic-related: the camera, the TensorRT inference,
+  the serial conveyor protocol, the detection/interlock state machine, the
+  database, and the Qualix/Sheets/S3 sync workers. See
+  `4 - backend_segregation.md`.
+- **Database** — PostgreSQL, replacing the legacy SQLite file, for the
+  concurrency and crash-safety reasons explained in
+  `5 - infrastructure_and_deployment.md`.
+- **Deployment** — a hybrid of Docker (frontend, database) and a native
+  systemd service (backend), not "everything in Docker." The reasoning for
+  that specific split is the main subject of
+  `5 - infrastructure_and_deployment.md`, since it was a deliberate,
+  non-obvious choice made for this specific device.
+
+## What was explicitly *not* part of this project
+
+- Authentication was not moved to an external identity provider (Keycloak,
+  OIDC, etc.). An earlier planning draft of this document proposed that; it
+  was never built. The actual implementation is a simple server-side bearer
+  token issued at login (`app/core/security.py`), matching the legacy app's
+  own login flow (online-first against Qualix, offline fallback against a
+  locally cached credentials table) rather than replacing it with something
+  new.
+- No message broker (Redis Pub/Sub, RabbitMQ) was introduced to fan data out
+  to other systems. The legacy app's own sync targets — Qualix, Google Sheets,
+  S3 — were ported as backend background workers, nothing more.
+- The machine's actual physical behavior — what the conveyor, camera, and
+  detection pipeline *do* — was not redesigned. Every place this document set
+  says "ported," it means the legacy Python was read and the same decisions
+  were reproduced in the new codebase, line-by-line where necessary, not
+  reinvented from a spec.
+
+## Where to go next
+
+Continue to `2 - current_codebase_overview.md` for a tour of the legacy
+codebase, then `2b - dependencies_and_hardware.md` for the full hardware/
+software dependency inventory, before reading how the split was actually
+carried out.

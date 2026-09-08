@@ -4,6 +4,13 @@ A file-level audit compared the legacy `eye_compass` monolith against
 `eye_compass_be` + `eye_compass_fe`. This records what was wrong and what was
 changed. Legacy line references are to the tree as it stood at the time.
 
+This was the *first* remediation pass — done statically, without physical
+hardware or a running frontend/backend to click through. A second, much
+longer pass happened afterward, working interactively against real hardware
+and real production screenshots; see `9 - post_remediation_session_log.md`
+for everything found and fixed since this document was written, and treat
+that one as more current wherever the two disagree.
+
 ## 1. The backend could not start
 
 | Problem | Fix |

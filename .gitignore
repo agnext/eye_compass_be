@@ -16,7 +16,12 @@ venv.bak/
 # ML weights / engines (leading slash so it never matches app/models/)
 /models/
 /ml_m/
-output/
+# Anchored to root for the same reason as /models/ above — an unanchored
+# "output/" would also match any future app/**/output/ directory.
+/output/
+/output_frame/
+/Data_Collection/
+/rejected/
 *.log
 
 # IDEs

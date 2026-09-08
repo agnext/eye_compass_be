@@ -1,28 +1,60 @@
 # 7. Deployment & QA Checklist
 
-The UI and architecture have been migrated to React + FastAPI + PostgreSQL, and the gaps found in the September 2026 audit have been closed in software (see `8 - remediation_log.md`). What has *not* happened is verification on the physical machine: nothing below has been exercised against a real camera, conveyor or TensorRT engine.
+The architecture is built (React + FastAPI + PostgreSQL, hybrid deployment —
+see `5 - infrastructure_and_deployment.md`), and the gaps found in the
+September audits have been closed in software (`8 - remediation_log.md`,
+`9 - post_remediation_session_log.md`). This document tracks what has and has
+not been verified **on the physical machine** — the master list of remaining
+work lives in `todos.md`; this page gives the status of the items that touch
+hardware specifically.
 
-Below is the checklist of required next steps to validate the system on physical hardware. Every item is still open.
+## What has actually been verified on real hardware (this session)
 
-## 1. Physical Hardware QA
-Currently, development and testing have occurred in a standard desktop environment. To finalize the migration, the Docker containers must be deployed onto the actual edge device (e.g., Jetson Nano, IPC).
-- **Camera Validation:** Verify that the MVS Camera SDK correctly binds to the Docker container and that the FastAPI WebSocket streams the physical camera feed.
-- **Serial Port Validation:** Verify that clicking the green **START** / **STOP** buttons in the React UI correctly sends the `machine_start` and `all_stop` serial bytes out of the hardware's `/dev/ttyUSB0` port to physically control the conveyor belt.
+- **Camera**: a genuine Hikvision GigE camera (`MV-CS023-10GC`, reachable at
+  `169.254.143.87`) is physically present on this dev unit, and the backend
+  successfully initializes it, negotiates the GigE packet size, loads the
+  calibration feature file, and grabs real frames end-to-end through
+  `/ws/camera/stream`.
+- **Conveyor**: the serial protocol over `/dev/ttyTHS1` has been exercised
+  against real hardware — sometimes it acknowledges commands correctly
+  (`machine_started`/`all_stoped` returned within tens of milliseconds),
+  sometimes nothing answers at all. This is consistent with there not being a
+  dedicated belt-controller adapter reliably wired to this specific dev unit
+  at all times, not a software defect — the retry-then-fail-safe behavior
+  itself has been confirmed correct either way.
+- **A process-crashing threading bug** in the camera/inference pipeline (a
+  CUDA context pushed on one thread and never popped, causing a hard
+  `Aborted (core dumped)` at shutdown) was found and fixed by funneling all
+  camera/inference work through one dedicated thread — see `9 -
+  post_remediation_session_log.md`.
 
-## 2. End-to-End System Run
-Run a physical sample of grain (e.g., Wheat) through the physical machine to ensure the entire pipeline triggers correctly in sequence:
-- **[ ]** Login securely.
-- **[ ]** Enter New Batch Details (12 fields).
-- **[ ]** Start Conveyor.
-- **[ ]** Verify YOLO Inference is running on the live frames and detections are logged.
-- **[ ]** Stop Conveyor.
-- **[ ]** Submit Results.
-- **[ ]** Verify that the results appear accurately on the `ResultsViewer` screen.
-- **[ ]** Verify the data is saved in PostgreSQL and appears on the `History` screen.
-- **[ ]** Verify any external cloud synchronizations (Qualix API, Google Sheets).
+## What is still open (hardware-dependent)
 
-## 3. Kiosk Mode Operating System Setup
-To ensure the Edge device feels like a dedicated appliance (rather than a standard desktop computer), the host OS should be configured for Kiosk Mode:
-- **Auto-start Services:** Configure `systemd` to automatically run `docker-compose up -d` on system boot.
-- **Fullscreen Browser:** Configure the OS desktop environment to launch a browser (Google Chrome or Mozilla Firefox) on startup.
-- **Kiosk Flags:** Launch the browser using kiosk flags (e.g., `chromium-browser --kiosk http://localhost:5143 --disable-restore-session-state`) so it locks the user into the Eye Compass React interface and hides the address bar/desktop.
+- **TensorRT engine loading and detection quality** — not yet verified
+  per-commodity; see `todos.md`'s thorough-testing item.
+- **The Qualix POST reaching a real Qualix endpoint successfully** — the
+  request is built and sent correctly by the backend, but an actual
+  successful round trip with the real Qualix service has not been confirmed
+  in this session; see `todos.md`.
+- **The `.optimized` model files for `stem_rice`, `toor`, `masoor_dal`, and
+  `chitra_rajma`** are absent from `models/` on this device (a pre-existing
+  gap in the legacy tree, not introduced here) — `stem_rice` is the fallback
+  model, so this should be resolved before the device runs an unmapped
+  commodity.
+- **The XAI feature's underlying model file** (`v6_best.pt`) is missing
+  device-wide — see `todos.md`.
+- **Kiosk/PWA install and boot-time autostart** — the PWA manifest exists
+  (`vite.config.js`) but has never been tested as an actually-installed app on
+  this or any device, and nothing yet configures the device to launch it
+  automatically on power-up. See `10 - pwa_and_deployment_rollout.md` and
+  `todos.md`.
+- **A real end-to-end run**: Login → New Batch → Start → a detection stops
+  the belt → operator classifies the object → Resume → Submit → confirm →
+  Qualix sync, run start to finish on physical hardware with a real sample.
+  Individual pieces of this have been exercised; the full chain back-to-back
+  has not.
+- **Migrating an actual production device onto this stack** — see
+  `todos.md`'s item on this; no rollout procedure exists yet.
+
+For the full, correctly-ordered list of everything outstanding — not just the
+hardware-touching items above — see `todos.md`.
