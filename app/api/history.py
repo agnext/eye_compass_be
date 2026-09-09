@@ -21,7 +21,6 @@ from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.models.schema import Result
 from app.services.database_service import DatabaseService
-from app.services.datagram import DISPLAY_EXCLUDE_KEYS
 from app.services.sync_service import sync_service
 
 logger = logging.getLogger(__name__)
@@ -100,14 +99,20 @@ def get_history(
 
 @router.get("/{result_id}")
 def get_result_detail(result_id: int, db: Session = Depends(get_db)):
-    """Full drill-down: the per-FO Item/Count breakdown legacy showed in
-    populate_result_table (main.py:2141-2152, called with ONLY
-    create_results()'s output — main.py:1689). `analysis` (returned
-    separately below) is the full Qualix-bound array — result + looker_data +
-    total_fo_detected merged, which is what actually gets stored — but
-    `breakdown` excludes the looker_data/total_fo_detected entries so the
-    operator sees exactly what legacy's own results table showed, not the
-    Qualix payload's extra stop-time/frame-count rows."""
+    """Full drill-down: the per-FO Item/Count breakdown legacy showed on its
+    History-detail screen.
+
+    The FRESH-submit results table (populate_result_table, main.py:1689/2141)
+    is called with ONLY create_results()'s output, so it shows just the
+    FM/NON-FM/Blower/Magnetic counts. But the History-detail table
+    (set_history_options_assessment, main.py:2181-2205) is built from the
+    saved record's full `analysis` array instead — result + looker_data +
+    total_fo_detected merged, all unfiltered (confirmed against a real prod
+    device: Frame Count/FM Stop Count/Manual Stop Count/FM Stop
+    Time/Manual Stop Time/Total Stop Time/total_fo_detected all show up
+    there). `breakdown` here matches that — nothing excluded — since this
+    endpoint only ever backs the saved/History-detail view, never the fresh
+    one."""
     r = db.query(Result).filter(Result.id == result_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Result not found")
@@ -123,7 +128,6 @@ def get_result_detail(result_id: int, db: Session = Depends(get_db)):
         "breakdown": [
             {"item": a.get("analysisName"), "count": a.get("totalAmount")}
             for a in analysis
-            if a.get("analysisName") not in DISPLAY_EXCLUDE_KEYS
         ],
     }
 
@@ -134,6 +138,7 @@ def get_result_images(
     db: Session = Depends(get_db),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    item: str | None = Query(None),
 ):
     """The saved FO crops for a past scan.
 
@@ -141,6 +146,12 @@ def get_result_images(
     Images are returned inline as data URIs so the browser needs no separate
     static mount, and the path is resolved from the stored image_unique_id
     rather than accepting one from the client.
+
+    `item` mirrors legacy's own drill-down (set_images/main.py:2219-2233):
+    clicking a row in the breakdown table there filters the image grid to
+    just that Item's crops via a case-insensitive substring match against the
+    filename. Same idea here, tolerant of the Item label using spaces where
+    the filename uses underscores.
     """
     r = db.query(Result).filter(Result.id == result_id).first()
     if not r:
@@ -166,6 +177,13 @@ def get_result_images(
     names = sorted(
         f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))
     )
+    if item:
+        needle = item.strip().lower()
+        needle_slug = needle.replace(" ", "_")
+        names = [
+            f for f in names
+            if needle in f.lower() or needle_slug in f.lower()
+        ]
     page = names[offset : offset + limit]
 
     images = []

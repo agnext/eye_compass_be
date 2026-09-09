@@ -568,3 +568,30 @@ grid layout and colors (`History.css`). `.history-wrapper h2` recolored to
 `#1a202c`, matching every other page's heading color. `layouts/MainLayout.jsx`
 and its CSS were deleted — nothing else referenced them, and they were
 actively broken.
+
+## 7i. The saved/History-detail breakdown table was wrongly excluding legacy's own rows
+
+`app/api/history.py`'s `get_result_detail` filtered its `breakdown` array
+down to just the FM/NON-FM/Blower FO/Magnetic FO item counts, on the
+assumption (stated in its own docstring) that legacy's results table never
+shows the `looker_data` rollups (Frame Count/FM Stop Count/Manual Stop
+Count/FM Stop Time/Manual Stop Time/Total Stop Time) or `total_fo_detected`.
+
+That assumption was only checked against the FRESH-submit results screen
+(`populate_result_table` called with just `create_results()`'s output,
+main.py:1689/2141-2152) — never against the separate History-detail screen
+(`set_history_options_assessment`, main.py:2181-2205), which is built from
+the saved record's full `analysis` array instead (result + looker_data +
+total_fo_detected, unfiltered). A real prod device screenshot confirmed the
+History-detail table genuinely shows all of it — Frame Count, FM Stop Count,
+Manual Stop Count, FM Stop Time, Manual Stop Time, Total Stop Time, and
+`total_fo_detected` all appear as their own rows there.
+
+Fixed: `get_result_detail`'s `breakdown` no longer filters anything out — it
+returns every entry in the stored `analysis` array as-is, same order legacy
+builds it in (result items, then looker_data, then total_fo_detected last).
+The now-unused `LOOKER_DATA_KEYS`/`DISPLAY_EXCLUDE_KEYS` constants were
+removed from `app/services/datagram.py` along with the dead import. The
+FRESH-submit screen (`isPending` in `ResultsViewer.jsx`) is unaffected — it
+never reads `detail.breakdown` at all, only `pendingResult.result`, which
+correctly stays just the item counts.

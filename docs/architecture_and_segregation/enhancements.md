@@ -204,6 +204,31 @@ them alongside further enhancements worth considering but not yet done.
   and calls `NewBatch.jsx`'s exported `clearDraft()` on a successful
   `confirmScan` — once a batch is genuinely done there's no round trip left
   to preserve the draft for.
+- **"Blower FO"/"Magnetic FO" no longer appear as tap-to-classify FM options,
+  and are shown in the Metric/Value table instead of the Item/Count table on
+  the results screen.** Both are members of some commodities' Qualix-supplied
+  `analysis` list (`CommodityDetails.analysis`), so — same as legacy, whose
+  tap-to-classify dropdown reads the identical field
+  (`main.py:1234`, `self.selected_analysis_dict = self.analysis_dict[com]`)
+  — they used to show up as tappable classification choices on the
+  detected-box overlay right alongside real FM types like Husk/Metal
+  Fragments/Stones, confirmed live on a real prod device. That's misleading:
+  they're not something the camera ever classifies at all, just two typed
+  totals for material already removed by other machines (an air blower / a
+  magnet) before or alongside the camera. Tapping either one was also
+  provably pointless even before this change — the crop got saved to disk,
+  but `create_results()` unconditionally overwrites
+  `counter["Blower FO"]`/`counter["Magnetic FO"]` with the manually-typed
+  sidebar values right after the file-count loop, in both legacy
+  (`main.py:1468-1469`) and this port (`scan_session.py:531-532`) — so any
+  per-object tally from tapping them was always silently discarded.
+  `Dashboard.jsx`'s `fmOptions` now filters both names out before they ever
+  reach the overlay or the `analysis_parameters` sent to the backend; on
+  `ResultsViewer.jsx`, both are added to `METRIC_ITEMS` alongside the
+  run-level metrics, so they render in the non-clickable Metric/Value table
+  instead of the clickable Item/Count one (there is nothing meaningful for
+  clicking them to filter the gallery to, now that they can never be tapped
+  during classification).
 
 ## Suggested future enhancements
 

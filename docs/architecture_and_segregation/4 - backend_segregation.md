@@ -52,6 +52,39 @@ FastAPI application that the frontend talks to over HTTP and one WebSocket.
    missing and `9 - post_remediation_session_log.md` for the two-step
    submit/confirm split added afterward to match legacy exactly.
 
+   **How FM / NON-FM / Blower FO / Magnetic FO counts are actually derived**
+   (came up as a live question — worth recording since it is easy to
+   misread as some kind of subtraction, and it isn't):
+
+   - FM and NON-FM are **not** computed from any total-minus-something math.
+     They are literally a count of saved crop *files*, by filename prefix.
+     Every time a detection stops the belt, the operator may tap a box and
+     pick an FM type from the on-screen buttons (`fmOptions`, configured per
+     commodity) — that crop is saved as `<FMType>_<timestamp>.png`
+     (`ScanSession.save_labelled`, mirrors legacy's tap-to-classify flow).
+     Any box left un-tapped when the operator dismisses the detection
+     (Resume/Start) is saved automatically as
+     `NON-FM_<timestamp>_<index>.png` by `save_unselected()`
+     (`scan_session.py:438-459`, port of `main.py:1325-1341`).
+   - At Submit, `create_results()` (`scan_session.py:517-533`, port of
+     `main.py:1372-1452`) walks every file in the run's output folder and
+     increments a counter for whichever known key (`FM`, `NON-FM`, or one of
+     the commodity's own `analysis_parameters`) the filename starts with.
+     That per-prefix file count *is* the FM/NON-FM number shown afterward —
+     nothing is derived by subtracting one count from another.
+   - Blower FO and Magnetic FO are a **completely separate, unrelated
+     input**: two plain numbers the operator types into the Dashboard
+     sidebar fields at Submit time, representing FO physically recovered by
+     the blower/magnetic separators downstream (real hardware, not the
+     camera/AI, and not tied to any detected box at all). They are merged
+     into the very same counter dict as literal values
+     (`counter["Blower FO"] = blower_fo`, `counter["Magnetic FO"] =
+     magnetic_fo`) with zero relationship to the per-object FM/NON-FM
+     classification above.
+   - So `Total FO` = (classified-FM file count) + (NON-FM file count) +
+     (typed Blower FO) + (typed Magnetic FO) — four independently-sourced
+     numbers summed, not one number subtracted from another.
+
 4. **XAI (`app/api/xai.py`, `app/services/xai_service.py`)** — generates an
    explainability heatmap for the current/a past frame. Wired up on the
    frontend during this session; the underlying legacy feature itself is

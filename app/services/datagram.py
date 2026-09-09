@@ -25,24 +25,14 @@ logger = logging.getLogger(__name__)
 ANALYSIS_TYPE = "ICOMPASS"
 
 # The Qualix "analysis" array below deliberately merges ScanSession.finish()'s
-# `result` (item/count breakdown) and `looker_data` (stop-time/frame-count
-# metrics) plus `total_fo_detected` into one flat list — that's what Qualix's
-# schema wants. Legacy's own operator-facing table (populate_result_table,
-# main.py:2141-2152, called with ONLY create_results()'s output at
-# main.py:1689) never shows looker_data or total_fo_detected at all. These are
-# exactly update_fm_count()'s six keys (scan_session.py) — used by
-# app/api/history.py to filter the stored/merged array back down to what the
-# operator should actually see, since only the flattened array survives to
-# the database (see Result.result in the schema).
-LOOKER_DATA_KEYS = {
-    "Frame Count",
-    "FM Stop Count",
-    "Manual Stop Count",
-    "FM Stop Time",
-    "Manual Stop Time",
-    "Total Stop Time",
-}
-DISPLAY_EXCLUDE_KEYS = LOOKER_DATA_KEYS | {"total_fo_detected"}
+# `result` (item/count breakdown), `looker_data` (stop-time/frame-count
+# metrics), and `total_fo_detected` into one flat list — that's what Qualix's
+# schema wants, and it's also exactly what legacy's own History-detail table
+# shows (set_history_options_assessment, main.py:2181-2205, confirmed against
+# a real prod device) — unlike the FRESH-submit results table
+# (populate_result_table, main.py:2141-2152, called with ONLY
+# create_results()'s output at main.py:1689), which only ever sees the
+# item/count breakdown and never these extra rows.
 
 
 def get_device_id() -> str:
