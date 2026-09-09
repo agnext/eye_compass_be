@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.models.schema import Result
 from app.services.database_service import DatabaseService
+from app.services.datagram import DISPLAY_EXCLUDE_KEYS
 from app.services.sync_service import sync_service
 
 logger = logging.getLogger(__name__)
@@ -64,17 +65,33 @@ def get_history(
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """Paged history, newest first."""
+    """Paged history.
+
+    Sort order matches legacy's populate_history_table (main.py:2100):
+    `sorted(list_of_lists, key=itemgetter(1, 2), reverse=True)`, where indexes
+    1 and 2 of that row tuple are Commodity and Receiving Date — i.e. sorted
+    by commodity name descending, then receiving date descending WITHIN each
+    commodity, as plain strings (not parsed as dates, same as legacy). Not
+    "most recent first" despite how that might read — confirmed against a
+    real legacy screenshot where rows were grouped/ordered by commodity name,
+    not by scan recency. (Briefly changed to sort by scan date/start_time
+    instead, then reverted back to this exact legacy match on request.)
+    """
     try:
-        query = db.query(Result).order_by(Result.id.desc())
-        total = query.count()
-        rows = query.offset(offset).limit(limit).all()
+        rows = db.query(Result).all()
+        summaries = [_row_to_summary(r) for r in rows]
+        summaries.sort(
+            key=lambda s: (s["commodity"] or "", s["receiving_date"] or ""),
+            reverse=True,
+        )
+        total = len(summaries)
+        page = summaries[offset : offset + limit]
         return {
             "status": "success",
             "total": total,
             "limit": limit,
             "offset": offset,
-            "data": [_row_to_summary(r) for r in rows],
+            "data": page,
         }
     except Exception as exc:
         logger.error("Failed to fetch history: %s", exc)
@@ -84,7 +101,13 @@ def get_history(
 @router.get("/{result_id}")
 def get_result_detail(result_id: int, db: Session = Depends(get_db)):
     """Full drill-down: the per-FO Item/Count breakdown legacy showed in
-    populate_result_table (main.py:2110-2128)."""
+    populate_result_table (main.py:2141-2152, called with ONLY
+    create_results()'s output — main.py:1689). `analysis` (returned
+    separately below) is the full Qualix-bound array — result + looker_data +
+    total_fo_detected merged, which is what actually gets stored — but
+    `breakdown` excludes the looker_data/total_fo_detected entries so the
+    operator sees exactly what legacy's own results table showed, not the
+    Qualix payload's extra stop-time/frame-count rows."""
     r = db.query(Result).filter(Result.id == result_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Result not found")
@@ -100,6 +123,7 @@ def get_result_detail(result_id: int, db: Session = Depends(get_db)):
         "breakdown": [
             {"item": a.get("analysisName"), "count": a.get("totalAmount")}
             for a in analysis
+            if a.get("analysisName") not in DISPLAY_EXCLUDE_KEYS
         ],
     }
 

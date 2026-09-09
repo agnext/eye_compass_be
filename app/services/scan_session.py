@@ -85,6 +85,28 @@ class ScanSession:
         self.pending_frame: Optional[np.ndarray] = None
         self.labelled_indices = set()
 
+        # Deliberate deviation from legacy, not a port of anything in
+        # main.py: after Submit, resume() clears machine_start_locked and
+        # capture_paused so the live view returns, but the belt is still
+        # physically stationary (Start hasn't been pressed). Legacy's own
+        # tracker still ran inference in that window and could re-detect the
+        # same still-in-frame object as "new" once frames resumed after the
+        # capture-pause gap, re-locking the interlock before the operator
+        # ever got to press Start. Confirmed live: the FM-review overlay was
+        # reappearing on its own seconds after Submit. This flag skips
+        # detection (not the live preview) until Start is pressed again, so
+        # Submit reliably lands on — and stays on — the Start/Stop screen.
+        # See enhancements.md.
+        self.detection_suspended = False
+
+        # Port of cam_thread.capture_paused (GrabImage.py:82/95). While set,
+        # legacy's capture loop grabs nothing at all, so no frames reach
+        # inference and the display stays frozen on the detection frame.
+        self.capture_paused = False
+        # Monotonic, never reused: a pause scheduled before this reset must
+        # not be able to land after it.
+        self._pause_token = getattr(self, "_pause_token", 0) + 1
+
         # Legacy conveyor_stop_count (main.py:104, 2610-2618).
         self.conveyor_stop_count = {
             "fm_count": 0,
@@ -103,8 +125,25 @@ class ScanSession:
 
     def start(self, sample_id: str, commodity: str, variety: str,
               analysis_parameters: List[str] = None, batch: Dict = None) -> Dict:
-        """Begin a run. Port of start_process (main.py:741-790)."""
+        """Begin a run, or resume one already in progress.
+
+        Port of start_process (main.py:751-839), which is guarded by
+        self.start_time_flag: the FIRST Start press for a batch resets
+        conveyor_stop_count and creates the output folders, but every
+        SUBSEQUENT press for the same batch (e.g. resuming after an FM
+        detection was dismissed via Submit) only accumulates stop time
+        (add_time_to_conveyor_stop_count) — it must not wipe the batch's
+        accumulated FM counts, tracker state, or output folder. `self.active`
+        already being True is this port's equivalent of start_time_flag=True.
+        """
         with self._lock:
+            if self.active:
+                self.accumulate_stop_times()
+                self.resume_capture()
+                self.detection_suspended = False
+                logger.info("Scan resumed (already active): sample=%s", self.sample_id)
+                return self.status()
+
             self.reset()
             now = datetime.now()
 
@@ -129,11 +168,55 @@ class ScanSession:
             os.makedirs(self.output_frame_folder, exist_ok=True)
 
             self.active = True
+            # start_process clears capture_paused (main.py:812/844).
+            self.resume_capture()
             logger.info(
                 "Scan started: sample=%s commodity=%s variety=%s folder=%s",
                 sample_id, commodity, variety, self.output_folder,
             )
             return self.status()
+
+    # ------------------------------------------------------------------
+    # Camera capture pause — port of cam_thread.capture_paused
+    # ------------------------------------------------------------------
+    #
+    # Legacy does not merely stop the belt when a detection freezes the
+    # screen: it stops grabbing frames altogether. stop_camera_with_delay
+    # (main.py:726-744) waits `delay_sec` for the conveyor to decelerate and
+    # then sets cam_thread.capture_paused = True, which makes the capture loop
+    # (GrabImage.py:95) sleep instead of grabbing, so nothing reaches
+    # inference at all. It is set on FM detection (via update_fm_image,
+    # main.py:983), on manual STOP (stop_p, main.py:1085) and after the
+    # Forward jog re-locks (main.py:888); it is cleared on START
+    # (main.py:812/844), on the Forward jog itself (main.py:868) and when a
+    # detection is resolved (main.py:1324).
+    #
+    # This is what keeps a stopped belt from producing further detections in
+    # legacy, and what keeps its frozen review frame aligned with its boxes.
+
+    def pause_capture(self, delay_sec: float = 1.0):
+        """Pause frame capture after `delay_sec` (conveyor deceleration)."""
+        self._pause_token += 1
+        token = self._pause_token
+
+        def delayed_pause():
+            time.sleep(delay_sec)
+            # Unlike legacy's own delayed_stop thread, this checks it is still
+            # the most recent request: without it, a resume landing inside the
+            # delay window would be overwritten a moment later and freeze a
+            # scan that had already been released, with nothing to unfreeze it.
+            if self._pause_token == token:
+                self.capture_paused = True
+                logger.info("Camera capture paused after %.1fs", delay_sec)
+
+        threading.Thread(target=delayed_pause, daemon=True).start()
+
+    def resume_capture(self):
+        """Resume frame capture immediately, cancelling any pending pause."""
+        self._pause_token += 1
+        if self.capture_paused:
+            logger.info("Camera capture resumed")
+        self.capture_paused = False
 
     def stop_belt_manually(self):
         """Operator pressed STOP. Legacy counted this separately from FM stops
@@ -142,6 +225,8 @@ class ScanSession:
             self.conveyor_stop_count["stop_count"] += 1
             self.conveyor_stop_count["stop_time"] = time.time()
         conveyor_service.send("all_stop")
+        # stop_p also pauses capture (main.py:1085).
+        self.pause_capture(delay_sec=1.0)
 
     def accumulate_stop_times(self):
         """Port of add_time_to_conveyor_stop_count (main.py:1592-1615)."""
@@ -210,6 +295,12 @@ class ScanSession:
 
         with self._lock:
             self.frame_count += 1
+
+            # Live view only, no detection, until Start is pressed again —
+            # see detection_suspended's comment in reset().
+            if self.detection_suspended:
+                return self._snapshot(fm_detected=False)
+
             h, w = frame.shape[:2]
 
             # 1. Commodity-specific suppression (process_results).
@@ -229,43 +320,35 @@ class ScanSession:
             track_ids = list(self.tracker.get_tracked_objects().keys())
             new_ids = set(track_ids) - self.existing_track_ids
 
-            # Deliberate deviation from legacy: a new physical object can only
-            # appear under the camera if the belt is actually advancing, so
-            # nothing "new" should be countable while machine_start is locked
-            # (an FM stop already in effect, awaiting Resume/Forward/Submit).
-            # Neither legacy's nor this port's inference loop is otherwise
-            # gated on belt motion at all, so a stationary object sitting
-            # under the camera during that stop can still generate fresh
-            # tracker ids from ordinary frame-to-frame detection jitter (see
-            # enhancements.md) — this closes that off at the source, not just
-            # for the subset that happens to collide with something already
-            # pending.
-            if new_ids and conveyor_service.machine_start_locked:
-                logger.info(
-                    "FM detected but not counted or queued (belt already "
-                    "locked/stopped): %s", new_ids
-                )
-                return self._snapshot(fm_detected=False)
+            # No belt-motion check here, deliberately. It is tempting (and an
+            # earlier version of this file did it) to refuse new ids while
+            # machine_start is locked, since a stopped belt cannot deliver new
+            # material. But legacy locks machine_start on purpose during the
+            # Forward jog and keeps capturing for that window (main.py:886 +
+            # 868/888) — that window is exactly when the nudged-forward
+            # material is supposed to be detected — so a lock-based gate would
+            # break Forward outright. What actually stops a stopped belt from
+            # producing detections in legacy is capture_paused: no frames are
+            # grabbed at all, so process_frame is never reached. See
+            # pause_capture above and the stream loop in app/api/camera.py.
 
             fm_detected = False
             if new_ids and not self._has_similar_x_axis(boxes, x_threshold=10):
                 fm_detected = True
                 self._on_foreign_matter(frame, boxes)
-                # Deliberate deviation from legacy (main.py:2597-2622): only
-                # count ids we actually surface for operator review. Legacy
-                # adds every new id to existing_track_ids unconditionally,
-                # even ones has_similar_x_axis suppressed from the pending
-                # queue, so total_fo_detected silently inflates from tracker
-                # jitter on a stationary object (see enhancements.md). An id
-                # suppressed here stays out of existing_track_ids, so it's
-                # still "new" on a later frame and gets a fair chance to be
-                # counted once whatever it collided with in `pending` clears.
-                self.existing_track_ids.update(new_ids)
             elif new_ids:
                 logger.info(
-                    "FM detected but not counted or queued (similar x-axis "
+                    "FM detected but not queued for review (similar x-axis "
                     "already pending): %s", new_ids
                 )
+
+            # Accumulate every new id, queued for review or not — exactly as
+            # legacy's handle_detection does (main.py:2618-2622), because
+            # total_fo_detected feeds the Qualix datagram and has to stay
+            # comparable with what legacy reports for the same material.
+            # has_similar_x_axis only decides whether the operator is asked to
+            # classify it, not whether it was a real object.
+            self.existing_track_ids.update(track_ids)
 
             return self._snapshot(fm_detected=fm_detected)
 
@@ -288,9 +371,27 @@ class ScanSession:
              "class_id": int(box[5]) if len(box) > 5 else None}
             for i, box in enumerate(boxes)
         ]
+        # Temporary diagnostic for the count-vs-visible-boxes discrepancy
+        # (confirmed NOT a cropping issue — object-fit: fill already shows the
+        # whole frame). Logging raw coordinates so the next occurrence shows
+        # whether the "missing" box is a near-duplicate overlapping another
+        # (renders as one box) or has degenerate/out-of-range size. Remove
+        # once root-caused — see enhancements.md / 9 -
+        # post_remediation_session_log.md.
+        logger.info(
+            "Pending box coordinates: %s",
+            [(p["index"], p["box"], round(p["box"][2] - p["box"][0], 1),
+              round(p["box"][3] - p["box"][1], 1), p["confidence"], p["class_id"])
+             for p in self.pending],
+        )
         self.pending_frame = frame.copy()
         self.labelled_indices = set()
         self.save_raw_frame(frame)
+
+        # update_fm_image pauses capture 1s later, once the belt has
+        # decelerated (main.py:983) — from here on the operator reviews a
+        # frozen frame and no further inference runs until they resolve it.
+        self.pause_capture(delay_sec=1.0)
 
         logger.info("Foreign matter detected: %s box(es) awaiting operator label", len(boxes))
 
@@ -358,9 +459,15 @@ class ScanSession:
             return saved
 
     def resume(self) -> Dict:
-        """Operator finished with the frozen frame — release the belt.
+        """Operator dismissed the frozen frame — release the interlock so
+        Start is allowed again, but do NOT restart the belt.
 
-        Legacy unlocked from Submit (main.py:1291) and Forward (main.py:856,877).
+        Port of submit_all_fo_new (main.py:1310-1348): it unlocks
+        machine_start_locked and clears capture_paused (live view returns),
+        but every line that would actually send machine_start or restart the
+        conveyor/camera threads is commented out in legacy. The belt only
+        moves again once the operator explicitly presses Start, which is
+        start_process (main.py:751-839) — a genuinely different function.
         """
         with self._lock:
             self.save_unselected()
@@ -368,9 +475,15 @@ class ScanSession:
             self.pending = []
             self.pending_frame = None
             self.labelled_indices = set()
+            # See the flag's own comment in reset(): suspend detection until
+            # Start is pressed again, so the live view can safely return
+            # without immediately re-locking on the same still-in-frame object.
+            self.detection_suspended = True
         conveyor_service.unlock_machine_start(reason="detection resolved")
-        ok = conveyor_service.send("machine_start")
-        return {"resumed": ok, **self.status()}
+        # Legacy clears capture_paused as part of resolving the detection
+        # (main.py:1324), which is what restarts the live feed.
+        self.resume_capture()
+        return {"resumed": True, **self.status()}
 
     def cancel(self) -> Dict:
         """Discard the run — archive its crops, don't delete them.
@@ -506,8 +619,17 @@ class ScanSession:
             "total_fo_detected": len(self.existing_track_ids),
             "frame_count": self.frame_count,
             "machine_start_locked": conveyor_service.machine_start_locked,
+            "capture_paused": self.capture_paused,
             **self.pending_status(),
         }
+
+    def live_state(self) -> Dict:
+        """State without a frame, for the stream loop while capture is paused.
+
+        Deliberately does not take self._lock: it only reads, and the stream
+        loop must never block behind an operator action mid-frame.
+        """
+        return self._snapshot(fm_detected=False)
 
     def status(self) -> Dict:
         return {

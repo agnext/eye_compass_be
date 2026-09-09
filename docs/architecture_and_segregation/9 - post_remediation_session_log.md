@@ -193,6 +193,208 @@ real obstacles came up and were resolved:
   real production identity), which is expected and was flagged before the
   swap.
 
+## 7e. The belt was restarting itself after dismissing an FM detection
+
+Symptom, reported directly against real legacy behavior: pressing the
+FM-review header's Submit button should return to the normal Start/Stop
+screen with the belt still stopped — the operator has to press Start
+themselves to actually resume motion. The port was instead restarting the
+belt automatically the moment Submit was pressed.
+
+Traced both halves in legacy:
+
+- **`submit_all_fo_new`** (`main.py:1310-1348`, the header Submit button) only
+  clears the pending detection, unlocks `machine_start_locked`, and clears
+  `capture_paused` (so the live view returns). Every line that would actually
+  restart the conveyor/camera threads or send `machine_start` is commented
+  out in the source — it genuinely never resumes the belt.
+- **`start_process`** (`main.py:751-839`, the sidebar Start button) is the
+  only thing that ever sends `machine_start` to resume motion. It is guarded
+  by `self.start_time_flag`: the first Start press for a batch resets
+  `conveyor_stop_count` and creates the output folders; every later press for
+  the *same* batch — e.g. resuming after Submit — only accumulates stop time
+  (`add_time_to_conveyor_stop_count`) and re-sends `machine_start`. It does
+  not touch the tracker, `existing_track_ids`, or any already-created folder.
+
+The port had both wrong: `scan_session.resume()` (bound to the header's
+Submit) called `conveyor_service.send("machine_start")` directly, and
+`scan_session.start()` (bound to the sidebar Start button) unconditionally
+ran `self.reset()` on every call — which would have wiped the batch's
+accumulated FM counts and tracker state even on a plain resume, not just
+skipped starting the belt at the wrong time.
+
+Fixed both: `resume()` no longer sends `machine_start` at all — only
+`start()` does, and only actually moves the belt if the operator presses it.
+`start()` now checks `self.active` first (this port's equivalent of
+`start_time_flag`): if a batch is already in progress, it just accumulates
+stop time and resumes capture, exactly like legacy's guarded branch; the full
+reset/setup only runs for a genuinely new batch.
+
+**This immediately surfaced a second, deeper bug**, caught on real hardware:
+leaving a batch via the in-app Back button and starting a new one continued
+the *previous* batch instead (same FM count carried over). `self.active` was
+the wrong signal for "is this a genuinely new batch" — legacy's real reset
+point is not "was a scan already active," it's **the operator leaving the
+batch-details form for the live-scan page**, `on_next_click` (`main.py:658-
+661`), which unconditionally clears `start_time_flag` regardless of whether
+the previous batch was ever formally finished — legacy's own Back button
+(`back_to_batch`, `main.py:934-935`) doesn't cancel anything either, same as
+this port's. Added `POST /api/scan/reset` (`scan_session.reset()` under the
+session lock), called once when `Dashboard.jsx` mounts, before Start can be
+pressed — the direct equivalent of `on_next_click`'s reset, independent of
+whatever `self.active` happened to be left at from an abandoned prior batch.
+
+**Two more issues surfaced while testing the fix above:**
+
+- **The browser Back button needed two presses to actually leave, and could
+  trigger the browser's own native unload dialog.** This project runs
+  `React.StrictMode`, which double-invokes effects in development. The
+  pushState-based Back-button guard (`Dashboard.jsx`) had no cleanup to undo
+  its `pushState` call, so every mount pushed *two* dummy history entries
+  instead of one — a single Back press only popped one of them (looked like
+  nothing happened), and enough phantom entries stacking up across repeated
+  navigation could plausibly overshoot the SPA's own history into a genuine
+  page unload, which is the only thing that can trigger that native dialog.
+  Fixed with a ref guard so the push only actually happens once per real
+  mount, regardless of StrictMode's double-invoke.
+- **The in-app Back button on the live-scan page was never disabled.** Legacy
+  has this same button (`pushButton_back_live`) on this page too, and
+  disables (not hides) it once scanning starts (`start_process`,
+  `main.py:757`), re-enabling only once Submit Batch computes results
+  (`submit_create_result`, `main.py:1834`). First ported as a matching
+  `backDisabled` state tied to Start/Submit, then on request made simpler and
+  stricter than legacy twice over: not just disabled but removed from the
+  page entirely for the whole time it shows an in-progress batch — Cancel
+  Batch is the only way to leave from here. A deliberate deviation from
+  legacy's exact show/enable lifecycle, not a bug fix — see
+  `enhancements.md`.
+- **Start AND Stop were both disabled after Submit-in-header, when Start
+  specifically should have been clickable.** A direct side-effect of the
+  `resume()` fix above: `handleResume` (`Dashboard.jsx`) still optimistically
+  set `isScanning(true)`, left over from when Submit-in-header used to
+  auto-restart the belt. Since Start is disabled by `isScanning || locked`,
+  `isScanning` stuck at `true` kept Start disabled even though the belt was
+  genuinely stopped and waiting on the operator. Changed to `setIsScanning
+  (false)`, matching that the belt does not move again until Start is
+  actually pressed.
+
+## 7b. The biggest miss so far: legacy pauses the camera, this port didn't
+
+Symptom, seen on real hardware: with the belt stopped and interlocked, the FM
+count kept climbing on its own, and the review screen showed red boxes
+floating over an apparently empty belt. Both turned out to be the same root
+cause, and it is the largest single behavioral gap found in the port to date.
+
+**Legacy stops grabbing frames entirely while a detection is under review.**
+`cam_thread.capture_paused` (`GrabImage.py:82`) is checked at the top of the
+capture loop (`GrabImage.py:95`): when set, the loop sleeps instead of
+grabbing, so nothing is queued, **no inference runs at all**, and the
+displayed pixmap simply stays as it was. It is set via
+`stop_camera_with_delay` (`main.py:726-744`), which waits one second for the
+conveyor to decelerate first. The full lifecycle:
+
+| Event | Legacy | Ported to |
+|---|---|---|
+| START | `capture_paused = False` (`main.py:812/844`) | `scan_session.start` |
+| FM detected | paused after 1s (`update_fm_image`, `main.py:983`) | `_on_foreign_matter` |
+| Manual STOP | paused after 1s (`stop_p`, `main.py:1085`) | `stop_belt_manually` |
+| Forward jog | unpaused (`main.py:868`), re-paused after re-lock (`main.py:888`) | `POST /api/scan/forward` |
+| Detection resolved | `capture_paused = False` (`main.py:1324`) | `scan_session.resume` |
+
+The port had none of this: its WebSocket loop grabbed and inferred
+continuously, so (a) a stationary object under a stopped belt kept minting
+fresh tracker ids from ordinary frame-to-frame box jitter — inflating
+`total_fo_detected` with the belt physically still — and (b) the SVG box
+overlay, computed from the detection frame, was drawn over whatever *newer*
+live frame had since arrived, so the boxes lined up with nothing.
+
+Ported as `scan_session.pause_capture()` / `resume_capture()` plus a check at
+the top of the stream loop in `app/api/camera.py`. While paused the loop
+grabs nothing, runs no inference, never calls `process_frame`, reports
+`fps: 0`, and sends the **frozen detection frame** (`pending_frame`, the exact
+frame the boxes were computed on) once, then state-only messages — so the
+overlay aligns with what's on screen, exactly as legacy's burnt-in boxes did.
+`pause_capture` also carries one small addition legacy lacks: a token check,
+so a pause scheduled a second earlier cannot land *after* the operator has
+already resolved the detection and freeze a scan that was just released.
+
+**Two earlier attempts at this were reverted as part of the fix**, both having
+targeted the symptom rather than the cause:
+1. Not adding `has_similar_x_axis`-suppressed ids to `existing_track_ids`.
+   Reverted: legacy counts them (`main.py:2618-2622`), and
+   `total_fo_detected` goes into the Qualix datagram, so it has to stay
+   comparable with what legacy reports for the same material. The check only
+   governs whether the operator is asked to classify something, not whether
+   it was a real object.
+2. Refusing new ids whenever `machine_start_locked` was set. Reverted because
+   it was actively wrong: legacy re-locks `machine_start` *on purpose* during
+   the Forward jog (`main.py:886`) while capture stays live for that window —
+   which is precisely when the nudged-forward material must be detected — so
+   a lock-based gate silently breaks the Forward button.
+
+## 7c. Ported legacy's periodic resource monitor (was completely missing)
+
+Found by comparing a real legacy startup log line by line against the new
+backend's: legacy logs `"Resource monitor started (interval: 300s)"` at boot
+(`logger.py`'s `ResourceMonitor`, a `QThread`/`threading.Thread` that calls
+`log_system_resources()` every 300s) — process memory/CPU, system-wide
+memory/swap, and disk usage, all via `psutil`, escalating to a `WARNING` log
+line above 85% system memory. Nothing in `eye_compass_be` did anything like
+this at all.
+
+Ported as `app/services/resource_monitor.py` — `get_system_resources()` /
+`log_system_resources()` are a direct line-for-line port of legacy's, with the
+same fields and the same 85%-memory warning threshold. `resource_monitor_worker()`
+replaces legacy's `QThread`/`threading.Thread` with an `asyncio` loop, matching
+`sync_worker.py`'s style, and is started from the app lifespan
+(`RESOURCE_MONITOR_ENABLED`, default on; `RESOURCE_MONITOR_INTERVAL_SECONDS`,
+default 300 to match legacy). `psutil` itself was also missing from this
+environment entirely — added to `requirements.txt` and installed into the
+deployment venv. Unlike legacy, which still starts the (useless) thread and
+loops forever doing nothing if `psutil` is missing, the port logs one warning
+and simply does not start the loop — no functional difference an operator
+would ever notice, since legacy's version produces no output either way.
+
+## 7d. Config.INI audit: run_env dead, device_id priority inverted, Sheet made env-aware
+
+A full audit of every `config.INI` key against both codebases (prompted by
+noticing the live device's `config.INI` actually has `run_env = prod`, not
+`dev` as an earlier doc entry assumed) found two real bugs and one deliberate
+new capability:
+
+1. **`QUALIX_RUN_ENV` was read but never consulted.** `QUALIX_API_URL`'s ini
+   fallback (`config.py`) was hardcoded to always look up `API_ENV.prod`
+   regardless of what `run_env` said — so switching `run_env` to `dev`/`qa` in
+   `config.INI` had no effect on which Qualix host was actually used. Fixed:
+   the ini lookup now uses `key=QUALIX_RUN_ENV` instead of the literal
+   `"prod"`, matching legacy's own `API_ENV[self.env]` (`api_handle.py:52-56`).
+2. **`device_id` priority was inverted from legacy's real behavior.** Traced
+   legacy's actual `get_cpu_id()` (found in an untouched reference copy,
+   `eye_compass_new/eye_compass/sheet_update.py` — the preserved
+   `eye_compass_legacy` copy is missing this function entirely, a legacy-side
+   anomaly independent of this port) — it is purely `/etc/machine-id` ->
+   `/var/lib/dbus/machine-id`, with **no config fallback at all**. This port's
+   `get_device_id()` (`app/services/datagram.py`) tried `settings.DEVICE_ID`
+   (the ini value, `VAR10223043`) first. Fixed: machine-id files are now tried
+   first, `settings.DEVICE_ID` only as a last resort if neither file exists.
+   Verified the fix resolves to the real machine ID
+   (`5dbfb12414a3456d9014d88183e338b1`), matching what actually appeared in
+   the datagram in a real legacy log shown during this session.
+3. **The Google Sheet was made environment-aware — a deliberate deviation,
+   not a fix.** See `enhancements.md`: legacy always writes to one hardcoded
+   sheet no matter what `run_env` is; `SHEETS_SPREADSHEET_ID_<ENV>` now
+   overrides `SHEETS_SPREADSHEET_ID` per environment, so `dev`/`qa` testing
+   doesn't land in the real prod sheet.
+
+The same audit also confirmed a long list of keys are either genuinely
+ported and working (region/bucket/pool_id, the OAuth/config/analysis URIs,
+`camera_index`, `_PATH_.parent`, Google Sheets' `enabled` flag) or correctly
+*not* ported because they're provably dead in legacy itself (`variety`,
+`location`, `_PATH_.cwd`, `S3.type`, `history_dashboard`/`history_by_mobile`,
+all five `CAMERA.runtime_*` keys, `camera_serial`, `feature_load_enabled`,
+`s3_base_path` as a read path) — see that finding for the full per-key
+breakdown if it's needed again.
+
 ## 7a. The live "FM Detected" label was showing the wrong count
 
 Found while comparing the live-scan header against real device behavior: the
@@ -215,6 +417,116 @@ label at that instead of the cumulative count. This is a legacy-matching
 correctness fix, not a deviation — see `1 - strategy.md` — so it isn't in
 `enhancements.md`.
 
+## 7f. The camera view was cropping detected boxes out of sight
+
+Reported live: the "FM Detected" count (already fixed correctly, §7a) didn't
+match the number of highlighted boxes actually visible on screen — e.g. 7
+detected, only 1 or 2 boxes visible. Not a counting bug: `Dashboard.css`'s
+`.camera-feed-img` used `object-fit: cover`, which scales the frame
+uniformly and crops off whatever doesn't fit the container's aspect ratio;
+the SVG box overlay used a matching `preserveAspectRatio="xMidYMid slice"` so
+boxes stayed pixel-aligned with what was visible — but any box whose source
+coordinates fell entirely in the cropped-off margin was never drawn at all,
+correctly counted server-side but invisible to the operator.
+
+Checked legacy's actual display code (`main.py:1128-1152`,
+`image_update_slot`): `ui.label_live_image_viewer.setScaledContents(True)`
+plus `cv2.resize(image, (label_width, label_height))` — the whole frame is
+stretched to the label's exact pixel dimensions with **no aspect-ratio
+preservation at all**. Nothing is ever cropped out of view in legacy; the
+tradeoff is a stretched/distorted image if the label's aspect ratio doesn't
+match the camera's, not missing content. Fixed by switching
+`.camera-feed-img` to `object-fit: fill` (non-uniform stretch, matching
+legacy's own behavior including the distortion) and the SVG overlay to
+`preserveAspectRatio="none"` to match. A legacy-matching correctness fix, not
+a deviation — the previous crop-instead-of-stretch choice had no legacy basis
+and was actively hiding real detections from the operator.
+
+A second, unrelated cause of the same symptom turned up later: two `pending`
+entries can have byte-identical coordinates (confirmed live via a coordinate
+log added to `_on_foreign_matter`), so two overlapping boxes render as one
+visible rectangle while the count still includes both. Traced to
+`inference_service.py:270-278`, which imports and runs `run_inference.py`
+directly from the shared, unmodified legacy source tree — its NMS
+(`run_inference.py:658`, `torchvision.ops.nms`, `agnostic=False`) only
+suppresses overlapping boxes of the *same* class, so the same physical object
+classified as two different FM types produces two undeduplicated detections.
+Legacy's own `fm_control`/`bounding_boxes` (`main.py:2604-2650`) takes the raw
+`coo` list the same way, no coordinate-based dedup either — so this appears
+to be a genuine characteristic of the shared detection model/NMS, not a
+porting bug, though not yet confirmed against real legacy hardware for this
+exact instance. Left as-is pending that confirmation, rather than adding
+dedup logic legacy itself doesn't have.
+
+## 7g. The results-review screen was missing legacy's Cancel button and showing extra header stats
+
+Reported live, screenshot-compared directly against legacy's own results-
+review screen (main.py's stackedWidget index 4, reached from
+submit_create_result, main.py:1689). Two things didn't match:
+
+- Legacy's header shows only Batch Id/Commodity/Variety. This port's
+  `ResultsViewer.jsx` also showed a "Total FO" stat, a "Not saved yet" pill,
+  and XAI View/History buttons — none of which exist on this legacy screen.
+  (Those elements now condition on `!isPending`, since they're meaningful for
+  viewing an already-saved record from History — a screen this port
+  deliberately consolidated with this one — but not for the fresh-from-Submit
+  case this screen equals in legacy.)
+- Legacy has **two** buttons here: `pushButton_save_res` → `save_result`
+  (`main.py:1829-1843`, persists + starts the Qualix/Sheets sync thread —
+  already matched by this port's `confirmScan`) and `pushButton_cancel_res`
+  → `cancel_result` (`main.py:2064-2081`, archives the batch's crops to
+  `rejected/` and abandons it — the same function Cancel Batch uses
+  elsewhere). This port only ever had the Save-equivalent button
+  ("Confirm & Finish", renamed to "Save" to match legacy's own label for this
+  case); Cancel was missing entirely, with no way to discard a computed-but-
+  unsaved result from this screen.
+
+Fixed: added `POST /api/scan/discard` (`app/api/scan.py`), reusing
+`scan_session.cancel()` — the same archive-to-`rejected/` logic Cancel Batch
+already uses — plus clearing the in-memory `_pending_submission` so a stale
+Save can't resurrect a discarded result. `ResultsViewer.jsx` now shows a
+"Cancel" button next to Save when `isPending`, calling the new endpoint. A
+legacy-matching correctness fix, not a deviation.
+
+A third mismatch found the same way: this port also showed a large camera-
+frame panel on the left of the breakdown table. `submit_create_result`
+(`main.py:1618-1661`) never sets any image widget on this screen — it only
+calls `populate_result_table(data)` and switches pages — so legacy shows no
+frame here at all. The `isPending` case now omits `.image-viewer` entirely.
+The frame area is kept for the saved/History-detail case (`!isPending`),
+where the XAI View button still exists and needs somewhere to render the
+heatmap toggle.
+
+A fourth and fifth mismatch, same comparison: legacy has no "Analysis"
+heading above the table at all (removed, both cases — it was a port
+addition, not tied to any legacy widget either way), and Save/Cancel live in
+their own side panel next to the table (`pushButton_save_res`/
+`pushButton_cancel_res`, `main.py:478/496`), not up in the header bar. Moved
+both buttons out of `header-actions` into a new `.results-actions-sidebar`
+(`isPending` only — same idea as Dashboard's Start/Stop sidebar, stacked
+vertically) that fills the grid's second column now that `.image-viewer` is
+gone for that case — so the earlier `.results-breakdown-full` full-span
+override is no longer needed and was removed; the existing 2-column grid
+(`minmax(0,2fr) minmax(240px,1fr)`) places `breakdown|sidebar` correctly on
+its own, the same way it already placed `image-viewer|breakdown` for
+`!isPending`.
+
+A visual pass followed, screenshot-compared directly against real legacy:
+the header became a plain 3-column bar (Batch Id value NOT bold / Commodity
+bold centered / Variety bold right — a separate `results-header-legacy`
+layout, since almost nothing is shared with the saved/History-detail header
+once XAI/History/Total FO are stripped), the table got legacy's grey-blue
+QTableView look (`results-breakdown-legacy`: grey background filling the
+full column height including the empty space below the last populated row,
+visible grid lines, centered column headers) instead of a white bordered
+card, and Save became a light-blue/thin-blue-border native-style button
+(`btn-save-legacy`) instead of the green pill used for primary actions
+elsewhere in this port. Approximated, not pixel-matched — real Qt widget
+chrome (native scrollbars, focus-rect artifacts) isn't meaningfully
+reproducible in CSS; the recognizable grey-table/native-button look is what
+was targeted. All `isPending`-only, via the same conditional-class pattern
+as the rest of §7g.
+
 ## 7. Investigated but not (yet) part of this codebase
 
 - **XAI View is broken in legacy itself** — traced to a missing PyTorch model
@@ -229,3 +541,30 @@ correctness fix, not a deviation — see `1 - strategy.md` — so it isn't in
   A separate Modbus-based VFD was found on the device (a different port,
   different protocol) with read-only monitoring scripts pointed at it, but no
   application anywhere on this device actually controls it.
+
+## 7h. History's header used a stale, unstyled layout component
+
+Reported live: the History page's top bar looked nothing like every other
+page's header (Home, New Batch, Login, the results-review screens) — small
+default-styled "Eye Compass"/Logout buttons crammed in the top-left corner
+instead of the shared "← Back | Compass Eye | Logout" bar, and a "Scan
+History" heading that was barely visible.
+
+Root cause: History.jsx was the only page still using `layouts/MainLayout.jsx`
+(every other page implements its own header inline instead). MainLayout's
+JSX used classes `main-layout`/`layout-bar`, but `MainLayout.css` only ever
+defined unrelated `layout-container`/`layout-header` rules — apparently
+stale from an earlier refactor, with no CSS for the classes actually
+rendered. So its header fell back to bare global `.btn-nav`/`.btn-logout`
+styling with no bar, no centering, no background. Separately,
+`.history-wrapper h2` was `color: #fff`, seemingly written for a dark page
+background MainLayout never actually provided (the real page background is
+`#f0f0f0`, from `variables.css`'s `--bg-primary`) — white-on-light-grey,
+functionally invisible.
+
+Fixed: `History.jsx` now implements the same `app-header` (Back/title/Logout)
+pattern as Home.jsx/NewBatch.jsx/Login.jsx directly, matching their exact
+grid layout and colors (`History.css`). `.history-wrapper h2` recolored to
+`#1a202c`, matching every other page's heading color. `layouts/MainLayout.jsx`
+and its CSS were deleted — nothing else referenced them, and they were
+actively broken.

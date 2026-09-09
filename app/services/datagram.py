@@ -24,15 +24,41 @@ logger = logging.getLogger(__name__)
 
 ANALYSIS_TYPE = "ICOMPASS"
 
+# The Qualix "analysis" array below deliberately merges ScanSession.finish()'s
+# `result` (item/count breakdown) and `looker_data` (stop-time/frame-count
+# metrics) plus `total_fo_detected` into one flat list — that's what Qualix's
+# schema wants. Legacy's own operator-facing table (populate_result_table,
+# main.py:2141-2152, called with ONLY create_results()'s output at
+# main.py:1689) never shows looker_data or total_fo_detected at all. These are
+# exactly update_fm_count()'s six keys (scan_session.py) — used by
+# app/api/history.py to filter the stored/merged array back down to what the
+# operator should actually see, since only the flattened array survives to
+# the database (see Result.result in the schema).
+LOOKER_DATA_KEYS = {
+    "Frame Count",
+    "FM Stop Count",
+    "Manual Stop Count",
+    "FM Stop Time",
+    "Manual Stop Time",
+    "Total Stop Time",
+}
+DISPLAY_EXCLUDE_KEYS = LOOKER_DATA_KEYS | {"total_fo_detected"}
+
 
 def get_device_id() -> str:
     """Machine id. Port of get_cpu_id (sheet_update.py:13-30).
 
+    Legacy's real get_cpu_id() has no config fallback at all — it's purely
+    /etc/machine-id -> /var/lib/dbus/machine-id, full stop; config.INI's
+    CONFIG_SETTINGS.device_id is never read by any legacy code path (confirmed
+    dead in main.py/api_handle.py/sheet_update.py). settings.DEVICE_ID is kept
+    here only as a last-resort fallback for a device with neither file (e.g. a
+    non-systemd dev environment), tried AFTER the real machine-id files, not
+    before them.
+
     Normalised to "" rather than None: the payload must not carry a bare
     Python None into the JSON body.
     """
-    if settings.DEVICE_ID:
-        return settings.DEVICE_ID
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         if os.path.exists(path):
             try:
@@ -42,7 +68,7 @@ def get_device_id() -> str:
                         return value
             except Exception:
                 continue
-    return ""
+    return settings.DEVICE_ID or ""
 
 
 def resolve_variety_id(db, commodity: str, variety_code: str) -> str:

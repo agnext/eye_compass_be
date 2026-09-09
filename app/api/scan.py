@@ -135,6 +135,36 @@ def sync_result_to_cloud(result_id: int, datagram: dict):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@router.post("/reset")
+def reset_scan():
+    """Entering the live-scan page for a batch, before Start is pressed.
+
+    Port of on_next_click (main.py:658-661): unconditionally clears
+    start_time_flag the moment the operator leaves the batch-details form for
+    the live view, regardless of whether a previous batch's session was ever
+    formally finished/cancelled. This is what start()'s active-batch guard
+    (see scan_session.start) actually depends on to tell "resuming after
+    dismissing an FM detection, same page" apart from "arrived at a fresh
+    batch, possibly abandoning a previous one via Back with no cancel" — both
+    look identical from start()'s point of view without this. Called once
+    when the Dashboard page mounts, before Start can be pressed.
+
+    Also unlocks the conveyor interlock — a deliberate deviation, not a
+    legacy port (on_next_click touches no conveyor state at all). Confirmed
+    live: a batch abandoned while `machine_start_locked` was engaged (and not
+    exited via Cancel Batch or browser-Back, both of which already unlock —
+    see enhancements.md) can leave a brand-new batch arriving at this exact
+    page already locked, before Start is ever pressed, with no pending
+    detections to Submit/Forward against to clear it — a genuine dead end for
+    the operator. Unlocking here closes that last gap: arriving fresh at this
+    page can never be blocked by a previous session's leftover lock.
+    """
+    with scan_session._lock:
+        scan_session.reset()
+    conveyor_service.unlock_machine_start(reason="new batch (page load)")
+    return {"success": True}
+
+
 @router.post("/start")
 def start_scan(req: ScanStartRequest, db: Session = Depends(get_db)):
     """Begin a run and start the belt."""
@@ -215,10 +245,15 @@ def forward_scan():
     if not scan_session.active:
         raise HTTPException(status_code=409, detail="No active scan")
     conveyor_service.unlock_machine_start(reason="forward jog (live scan)")
+    # Legacy resumes capture for the jog (main.py:868) and pauses it again
+    # once the jog has re-locked (main.py:888), so the operator gets a fresh
+    # frozen frame of whatever the nudge brought into view.
+    scan_session.resume_capture()
     conveyor_service.send("machine_start")
     time.sleep(0.1)
     conveyor_service.send("FM_detected")
     conveyor_service.lock_machine_start(reason="forward jog re-lock")
+    scan_session.pause_capture(delay_sec=1.0)
     return {"success": True, **scan_session.status()}
 
 
@@ -351,3 +386,24 @@ def confirm_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
     background_tasks.add_task(sync_result_to_cloud, saved.id, datagram)
 
     return {"success": True, "result_id": saved.id}
+
+
+@router.post("/discard")
+def discard_pending():
+    """Discard a /submit result before it's confirmed. Port of cancel_result
+    (main.py:2064-2081), bound to pushButton_cancel_res on this exact screen
+    (main.py:496) — legacy's results-review page has both Save (save_result,
+    confirm_scan's port) and Cancel here, and this port had only the former.
+    Archives the batch's crops to rejected/ rather than deleting them, same
+    as scan_session.cancel() already does for Cancel Batch elsewhere.
+    """
+    global _pending_submission
+
+    if _pending_submission is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Nothing to discard — submit a result first.",
+        )
+    _pending_submission = None
+    result = scan_session.cancel()
+    return {"success": True, **result}

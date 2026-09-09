@@ -135,9 +135,15 @@ class Settings:
     )
 
     # ---------------- Qualix ----------------
+    # Simple and direct: QUALIX_API_URL is whatever is written here, full
+    # stop — no environment selection, no per-env variable indirection. Set
+    # it to whichever Qualix host (dev/qa/prod) you actually want data to go
+    # to. QUALIX_RUN_ENV is kept only because config.INI has it
+    # (CONFIG_SETTINGS.run_env) and it still selects the ini fallback used
+    # when QUALIX_API_URL itself isn't set at all.
     QUALIX_RUN_ENV: str = _env("QUALIX_RUN_ENV", section="CONFIG_SETTINGS", key="run_env", default="prod")
     QUALIX_API_URL: str = _env(
-        "QUALIX_API_URL", section="API_ENV", key="prod", default="https://assaying.qualix.ai/"
+        "QUALIX_API_URL", section="API_ENV", key=QUALIX_RUN_ENV, default="https://assaying.qualix.ai/"
     )
     QUALIX_USERNAME: str = _env(
         "QUALIX_USERNAME", section="CONFIG_SETTINGS", key="username", default=""
@@ -175,6 +181,12 @@ class Settings:
     SHEETS_ENABLED: bool = _as_bool(
         _env("SHEETS_ENABLED", section="GOOGLE_SHEETS", key="enabled"), False
     )
+    # Simple and direct, same as QUALIX_API_URL above: SHEETS_SPREADSHEET_ID
+    # is whatever is written here, full stop — no per-environment variable
+    # indirection. Set it to whichever sheet you actually want data to land
+    # in. Legacy always writes to one hardcoded sheet regardless of
+    # environment (sheet_update.py:7); this at least makes the sheet
+    # explicitly configurable rather than hardcoded in source.
     SHEETS_SPREADSHEET_ID: str = _env(
         "SHEETS_SPREADSHEET_ID", section="GOOGLE_SHEETS", key="spreadsheet_id", default=""
     )
@@ -190,6 +202,12 @@ class Settings:
     # Legacy retried unsynced records every 15 minutes (main.py:2828).
     SYNC_RETRY_INTERVAL_MINUTES: int = _as_int(os.getenv("SYNC_RETRY_INTERVAL_MINUTES"), 15)
     SYNC_WORKER_ENABLED: bool = _as_bool(os.getenv("SYNC_WORKER_ENABLED"), True)
+
+    # Legacy logged CPU/memory/disk every 300s (logger.py's ResourceMonitor).
+    RESOURCE_MONITOR_INTERVAL_SECONDS: int = _as_int(
+        os.getenv("RESOURCE_MONITOR_INTERVAL_SECONDS"), 300
+    )
+    RESOURCE_MONITOR_ENABLED: bool = _as_bool(os.getenv("RESOURCE_MONITOR_ENABLED"), True)
 
     # ---------------- CORS ----------------
     # Comma-separated. Defaults to the kiosk + dev origins rather than "*",

@@ -205,10 +205,57 @@ async def camera_stream(websocket: WebSocket):
     fps_timer = time.time()
     current_fps = 0.0
     raw_frame_index = 0
+    frozen_frame_sent = False
+
+    def encode_display(img):
+        out = img
+        if settings.STREAM_MAX_WIDTH and out.shape[1] > settings.STREAM_MAX_WIDTH:
+            scale = settings.STREAM_MAX_WIDTH / out.shape[1]
+            out = cv2.resize(out, (settings.STREAM_MAX_WIDTH, int(out.shape[0] * scale)))
+        ok, buf = cv2.imencode(".jpg", out, encode_params)
+        if not ok:
+            return None
+        return base64.b64encode(buf).decode("utf-8"), int(out.shape[1]), int(out.shape[0])
 
     try:
         while True:
             loop_start = time.time()
+
+            # Port of cam_thread.capture_paused (GrabImage.py:95): while a
+            # detection is under review, or the belt has been stopped, legacy
+            # grabs no frames at all — so no inference runs, no track ids are
+            # minted, and the operator reviews a frame frozen at the moment of
+            # detection. Streaming live frames here instead would (a) keep
+            # producing detections off a stationary belt and (b) leave the
+            # box overlay drawn over a newer frame than it was computed on.
+            if scan_session.capture_paused:
+                payload = {"fps": 0.0, **scan_session.live_state()}
+                if not frozen_frame_sent:
+                    frozen = scan_session.pending_frame
+                    if frozen is not None:
+                        enc = await loop.run_in_executor(None, encode_display, frozen)
+                        if enc:
+                            b64, disp_w, disp_h = enc
+                            payload.update({
+                                "frame": b64,
+                                "frame_width": disp_w,
+                                "frame_height": disp_h,
+                                "source_width": int(frozen.shape[1]),
+                                "source_height": int(frozen.shape[0]),
+                                "detections": [],
+                            })
+                    # No pending_frame (e.g. a manual STOP): send no frame at
+                    # all, so the client simply holds the last one it has.
+                    frozen_frame_sent = True
+                await websocket.send_json(payload)
+                await asyncio.sleep(0.2)
+                continue
+
+            if frozen_frame_sent:
+                # Just resumed — don't average the paused interval into FPS.
+                frozen_frame_sent = False
+                fps_counter = 0
+                fps_timer = time.time()
 
             def grab_and_infer():
                 # One lock for the whole grab+infer step: the camera handle and
@@ -239,17 +286,10 @@ async def camera_stream(websocket: WebSocket):
                 None, scan_session.process_frame, frame, detections
             )
 
-            display = annotated if annotated is not None else frame
-            if settings.STREAM_MAX_WIDTH and display.shape[1] > settings.STREAM_MAX_WIDTH:
-                scale = settings.STREAM_MAX_WIDTH / display.shape[1]
-                display = cv2.resize(
-                    display, (settings.STREAM_MAX_WIDTH, int(display.shape[0] * scale))
-                )
-
-            ok, buffer = cv2.imencode(".jpg", display, encode_params)
-            if not ok:
+            enc = encode_display(annotated if annotated is not None else frame)
+            if enc is None:
                 continue
-            b64_frame = base64.b64encode(buffer).decode("utf-8")
+            b64_frame, display_width, display_height = enc
 
             fps_counter += 1
             elapsed = time.time() - fps_timer
@@ -260,8 +300,8 @@ async def camera_stream(websocket: WebSocket):
 
             await websocket.send_json({
                 "frame": b64_frame,
-                "frame_width": int(display.shape[1]),
-                "frame_height": int(display.shape[0]),
+                "frame_width": display_width,
+                "frame_height": display_height,
                 "source_width": int(frame.shape[1]),
                 "source_height": int(frame.shape[0]),
                 "detections": [[float(v) for v in d] for d in (detections or [])],

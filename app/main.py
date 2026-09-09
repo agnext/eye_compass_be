@@ -94,6 +94,13 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(s3_task.start(), name="s3-upload"))
         logger.info("S3 background uploader started.")
 
+    if settings.RESOURCE_MONITOR_ENABLED:
+        from app.services.resource_monitor import resource_monitor_worker
+
+        tasks.append(
+            asyncio.create_task(resource_monitor_worker(), name="resource-monitor")
+        )
+
     app.state.background_tasks = tasks
 
     try:

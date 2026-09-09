@@ -88,6 +88,20 @@ than inheriting silently:
 
 ## Other tracked findings (not yet in the priority list above)
 
+### Confirm whether PO Number should really accept alphabets
+
+New Batch's PO Number field currently takes plain free text, same as legacy —
+checked `lineEdit_po_number` in both `.ui` files (`eye_compass_updated.ui:6196`,
+`eye_compass_ui.ui:6275`) and grepped `main.py` for any `setValidator` call:
+there is none anywhere in the file, and the widget has no input mask either,
+so legacy genuinely lets the operator type letters (or anything else) into
+PO Number, unlike Sorting Quantity which this port now restricts to digits
+(plus one decimal point) on request. This looks like it might just be an
+oversight in legacy rather than an intentional design choice — a PO number is
+usually numeric in practice — so **confirm with the team whether PO Number
+should be restricted the same way Sorting Quantity was**, or left as free
+text matching legacy's real (unvalidated) behavior.
+
 ### S3 upload paths (found while auditing "at what other points does it upload to S3?")
 
 Legacy has three upload-related code paths, of which only two are real:
@@ -97,10 +111,14 @@ Legacy has three upload-related code paths, of which only two are real:
    Walks the output folders, waits for inference to be idle, retries
    transient failures, deletes local files after a successful upload by
    default.
-2. **In-app background thread** (`main.py:3114-3124`, `s3_upload.py`'s
-   `s3Uploading` QThread) — started once at app boot, loops forever on its
-   own internal timer. This is the one already ported to `s3_worker.py`'s
-   `S3UploaderTask`.
+2. **In-app background thread** (`main.py:3148`, `s3_upload.py`'s
+   `s3Uploading` QThread) — started once at app boot and **does not loop**:
+   `run()` walks the whole `output/` tree once and the thread ends, confirmed
+   against a real startup log (the "All images of ... uploaded Successfully"
+   line appears exactly once, never again for the rest of the session). This
+   is the one already ported to `s3_worker.py`'s `S3UploaderTask` — which
+   *does* loop, on `S3_UPLOAD_INTERVAL_SECONDS`, a deliberate improvement over
+   legacy's one-shot-at-boot behavior; see `enhancements.md`.
 3. **Login-triggered upload — does NOT actually exist.** `main.py:588, 612,
    638` print log lines like `"Starting the s3 upload thread in login."`,
    but there is no code near them that starts or restarts the thread.

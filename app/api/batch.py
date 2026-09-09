@@ -12,6 +12,7 @@ all 12 fields from the Qualix payload.
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -50,6 +51,21 @@ class BatchCreate(BaseModel):
             raise ValueError("Batch number is required")
         if not cleaned.isalnum():
             raise ValueError("Batch number must be alphanumeric (no spaces or symbols)")
+        return cleaned
+
+    @field_validator("sorting_quantity")
+    @classmethod
+    def sorting_quantity_must_be_numeric(cls, value: Optional[str]) -> Optional[str]:
+        # NewBatch.jsx already strips anything but digits/a single "." as the
+        # operator types (it's a weight, e.g. "40.5") — this is the same
+        # check on the server side, since the frontend check alone can't be
+        # trusted for a request that didn't go through that form at all.
+        cleaned = (value or "").strip()
+        # \d+(\.\d+)? rather than a bare float() call, which would also accept
+        # forms the frontend's char-level filter can't even produce (e.g.
+        # "1e10", "inf", "nan").
+        if cleaned and not re.fullmatch(r"\d+(\.\d+)?", cleaned):
+            raise ValueError("Sorting quantity must be a number")
         return cleaned
 
 

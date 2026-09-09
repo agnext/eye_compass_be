@@ -12,49 +12,46 @@ them alongside further enhancements worth considering but not yet done.
 ## Enhancements already made
 
 ### Backend
-- **Fixed a genuine legacy FM-counting bug: the count no longer inflates for
-  detections that were never actually shown to the operator.** Legacy's
-  `handle_detection` (`main.py:2597-2622`) adds every new tracker id to
-  `existing_track_ids` (and `total_fo_detected` is exactly its length)
-  **unconditionally** — even one the `has_similar_x_axis` check decided NOT to
-  queue for operator review because a similar-looking detection was already
-  pending. Only the operator-facing queue was ever actually gated; the count
-  climbed regardless. Confirmed as a real, pre-existing legacy defect by
-  reading `main.py`/`sort.py` directly (not a porting error) — legacy's own
-  object tracker (`x_tolerance=10`px) can mint a "new" track id for a
-  completely stationary object from ordinary frame-to-frame detection jitter,
-  since neither legacy's nor this port's inference loop is gated on the
-  conveyor actually moving. On the ground this silently inflated the FM count
-  any time the belt was stopped (e.g. by the FM interlock itself) while an
-  object stayed under the camera — first noticed on this dev unit as log
-  lines like `FM detected but skipped (similar x-axis already pending)`
-  appearing repeatedly with the belt stopped, while the on-screen FM count
-  kept climbing anyway. Fixed in `scan_session.py`'s `process_frame`: an id
-  suppressed by `has_similar_x_axis` is now left out of `existing_track_ids`
-  entirely, so it doesn't inflate the count, and it's still eligible to be
-  properly detected and counted once whatever it collided with in `pending`
-  clears. The log line was also reworded, from "FM detected but **skipped**"
-  (misleadingly implies nothing happened) to "FM detected but **not counted or
-  queued**" (states plainly that neither happened, matching the new
-  behavior).
-- **Also gated FM counting directly on belt motion, closing the same bug at
-  its root rather than only its symptom.** The fix above only stops a
-  suppressed id from inflating the count when it happens to collide with
-  something already in `pending` — it does nothing for a false detection that
-  fires after `pending` has already cleared, or the very first false trigger
-  after a stop, since there's nothing for `has_similar_x_axis` to match
-  against in either case. Added a second, more direct check in
-  `process_frame`: if `conveyor_service.machine_start_locked` is already
-  `True` (an FM stop already in effect, waiting on Resume/Forward/Submit),
-  **no** new tracker id is counted or queued at all, full stop — a new
-  physical object cannot legitimately appear under the camera while the belt
-  isn't moving, so nothing "new" should be believed while it isn't. This is a
-  real behavior change from legacy, not present there in any form (legacy's
-  `handle_detection` has no belt-motion check whatsoever), made because the
-  bug it closes was reproducible and actively confusing during this project's
-  own testing (see the log excerpt in `9 - post_remediation_session_log.md`
-  if that gets recorded, or this conversation's own log lines showing the FM
-  count climbing while the belt sat stopped and locked).
+- **History's Re-sync has no legacy equivalent at all.** Legacy has no
+  operator-facing way to force a resync — the only thing that ever re-sends
+  a `sync_status='0'` record is the fully automatic
+  `sync_unsynced_data_Thread` (`main.py:2826-2966`), on its own 15-minute
+  timer, with no manual trigger anywhere. `POST /api/history/{id}/resync`
+  and its button (now inline in each row's own Sync Status cell, see
+  `History.jsx`) are a straightforward manual on-demand call into the same
+  underlying sync logic the background worker already uses
+  (`sync_service.post_analysis_data`/`post_to_sheets`) — for when the
+  operator doesn't want to wait for the next scheduled pass. Labeled "Sync"
+  for a `'0'` record (never actually delivered yet — this click would be its
+  first real send) and "Re-sync" for a `'2'` (already sent once and
+  rejected) — no button at all once a row reaches `'1'` (delivered).
+- **The Google Sheet can now vary per environment, unlike legacy.** Legacy
+  always writes to one hardcoded spreadsheet regardless of `run_env`
+  (`sheet_update.py:7`'s `SPREADSHEET_ID` constant) — so testing against
+  `dev`/`qa` would still write real rows into the same sheet used in
+  production. `SHEETS_SPREADSHEET_ID` now resolves an optional
+  `SHEETS_SPREADSHEET_ID_<ENV>` override first (e.g.
+  `SHEETS_SPREADSHEET_ID_DEV`), keyed off `QUALIX_RUN_ENV`, before falling
+  back to the single `SHEETS_SPREADSHEET_ID` / `config.INI` value — so an
+  untouched device still gets legacy's one-sheet-for-everything behavior, but
+  a device or developer that sets a per-environment override can test without
+  touching the real sheet. Requested alongside fixing `QUALIX_API_URL`'s
+  `run_env` selection, which is a different, unrelated fix — that one made the
+  Qualix host actually follow `run_env` the way legacy's real (working)
+  behavior always did; the Sheet was never environment-aware in legacy at
+  all, so this is a genuine deviation, not a legacy-matching fix. See
+  `9 - post_remediation_session_log.md`.
+- **The S3 upload sweep now runs continuously, not just once at app boot.**
+  Legacy's `s3_upload.py` (`s3Uploading` QThread) is started once at startup
+  and never again — `run()` walks the whole `output/` tree once, uploads
+  anything missing/stale, and the thread simply ends; a file saved mid-session
+  doesn't reach S3 until the app is restarted. Confirmed directly from a real
+  startup log: the "All images of ... uploaded Successfully" line appears
+  exactly once, right after boot. `S3UploaderTask.start()` in `s3_worker.py`
+  runs the same sweep immediately at startup (matching legacy's one-shot
+  behavior) but then keeps repeating it every `S3_UPLOAD_INTERVAL_SECONDS`
+  for the life of the process, so newly-saved files get uploaded without
+  needing a restart.
 - **Real HTTP error codes instead of silent failure.** Legacy's conveyor
   commands returned `200 {"success": false}` (or nothing at all — a warning
   only in a log file the operator never sees) for both a blocked interlock and
@@ -73,19 +70,52 @@ them alongside further enhancements worth considering but not yet done.
   (`SessionStore`, 45-day TTL) for both the online and offline login paths.
 
 ### Frontend
-- **The live-scan sidebar (Start/Stop, Blower FO/Magnetic FO, Submit Batch)
-  stays visible even once an FM detection locks the belt**, instead of
-  disappearing the way legacy's equivalent page does. This was added after a
+- **The live-scan page's in-app Back button is not shown at all for the
+  whole time a batch is in progress**, stricter than legacy. Legacy has this
+  same button (`pushButton_back_live`) and only disables (not hides) it once
+  scanning has actually started (`start_process`, `main.py:757`), re-enabling
+  it once results are computed (`submit_create_result`, `main.py:1834`) — so
+  in legacy it's visible and briefly clickable right after arriving at this
+  page, before Start is pressed. Here it's removed from the page entirely
+  for as long as a batch is in progress, on request — Cancel Batch is the
+  only way to leave. See
+  `9 - post_remediation_session_log.md` §7e.
+- **An available (currently OFF) option: keep the live-scan sidebar visible
+  even once an FM detection locks the belt**, instead of disappearing the way
+  legacy's equivalent page does. This was added, and briefly enabled, after a
   real operational problem on the dev unit: the FM interlock was tripping on
   an empty belt (a separate detection-quality issue, tracked on its own), and
   legacy's page-switch design has no way to finish/submit the batch from the
   locked screen at all — the operator would be stuck until the false
-  detection was dismissed. Start and Stop are disabled while locked (Start
-  because the interlock refuses it anyway; Stop because it would send a
-  redundant `all_stop` that still increments the "Manual Stop Count" metric,
-  corrupting `looker_data` for a stop that didn't really happen), but Submit
-  Batch works the same as always, since `/api/scan/submit` only requires an
-  active scan session, not an unlocked belt.
+  detection was dismissed. On reflection this wasn't actually needed: legacy's
+  own header Submit button (`handleResume`) already returns to the normal
+  Start/Stop screen from the locked view — confirmed directly against real
+  hardware — so the sidebar reappears anyway as soon as the operator dismisses
+  the detection normally. `Dashboard.jsx`'s `SHOW_SIDEBAR_DURING_FM_REVIEW`
+  flag now defaults to `false`, matching legacy's hide-on-lock behavior
+  exactly, but the capability (and its safety reasoning around disabling
+  Start/Stop while locked) is kept in code in case a real stuck-operator
+  scenario comes up again — set the flag back to `true` if so.
+- **A "CONNECTED"/"disconnected"/"error" pill shows the live WebSocket
+  status** on the normal scan header. Legacy has nothing like this at all — a
+  desktop app talking to hardware over USB/serial doesn't have a "dropped
+  connection to a stream" failure mode in the same sense a browser does, so
+  there was no equivalent UI to match. Added because a silently-dead
+  WebSocket with a frozen last frame looked identical to a healthy paused
+  stream otherwise; see `Dashboard.jsx`'s stream-connection handling. Note
+  this only reflects the *transport* — the socket being open — not whether
+  the camera is actually producing frames (see `capture_paused` in
+  `9 - post_remediation_session_log.md` §7b for that distinction). Controlled
+  by the `SHOW_CONNECTION_STATUS` flag right above the component; set it to
+  `false` to hide the pill entirely.
+- **An FPS readout plus a "CONVEYOR LOCKED" badge floats above the belt view**
+  on the live-scan page. Legacy has no on-screen stream-stats display at all —
+  frame rate only ever appears in internal camera-config log lines
+  (`GrabImage.py:734`), never shown to the operator — and "locked" is
+  communicated purely by the whole page switching to the FM-review layout,
+  not a separate badge. Controlled by the `SHOW_STREAM_STATS` flag next to
+  `Dashboard`'s other display flags; set it to `false` to remove the whole
+  bar.
 - **Numeric fields reject non-numeric input as you type**, rather than only
   validating after submission. Legacy (and an early version of this port)
   let you type anything into Blower FO/Magnetic FO/Sorting Quantity and only
@@ -107,12 +137,73 @@ them alongside further enhancements worth considering but not yet done.
   same "Invalid credentials"-style message regardless of the actual cause,
   which was actively misleading while diagnosing an unrelated networking bug
   during this project — see `9 - post_remediation_session_log.md`.
-- **A New Batch draft survives navigating away and back**, instead of
-  silently discarding everything typed. This one exists specifically *because*
-  of the web architecture (a React page component is destroyed and rebuilt on
-  navigation; legacy's equivalent Qt page object never was), not because
-  legacy did anything better here — but the end result is a genuine
-  improvement in operator experience.
+- **Abandoning a locked batch actually releases the conveyor interlock**,
+  instead of leaving it stuck. `machine_start_locked` is one global flag
+  shared by every screen that can send `machine_start`, in both legacy and
+  here — legacy's `send_control_command` (`main.py:2320-2326`) checks it for
+  any caller, including the unrelated Data Collection page's own Start button
+  (`start_conveyor`, `main.py:1860-1865`). Legacy only ever clears the flag
+  from the batch-scan flow itself, via Submit (`main.py:1321`) or Forward
+  (`main.py:864`) — its own Cancel Batch (`cancel_result`, `main.py:2064-2081`)
+  doesn't touch it either. So in legacy, walking away from a locked batch by
+  any means other than Submit/Forward leaves the interlock engaged
+  indefinitely, blocking Start on every other screen until the operator
+  happens to revisit that exact batch and resolve it — confirmed live on real
+  hardware (`POST /api/conveyor/command` for `machine_start` kept returning
+  `409` from the Data Collection page long after the batch that caused the
+  lock was gone). Three exits now clear it instead: `Dashboard.jsx`'s browser-
+  Back handler calls the same `cancelScan` cleanup Cancel Batch already used
+  (unlock, `all_stop`, archive crops) before letting the navigation through —
+  it was the one abandon-a-batch path with no in-app click site to hook a
+  cleanup into; `DetailsEntry.jsx` (the Data Collection page) unlocks on
+  arrival, so a stale lock from an unrelated abandoned batch can't block its
+  own hardware-test Start button; and `POST /api/scan/reset` (called once
+  every time Dashboard mounts, before Start can be pressed for that batch)
+  also unlocks — confirmed live: a fresh batch could arrive at this exact
+  screen already locked from a previous session, with Start disabled and no
+  pending detections to Submit/Forward against to clear it, a genuine dead
+  end with no way out except Cancel Batch. `POST /api/scan/cancel` already
+  did this for in-app Cancel Batch before this change; `/api/conveyor/unlock`
+  (already existed for the Submit/Forward-adjacent paths) is what the new
+  call sites use. A deliberate improvement over legacy's real stuck-forever
+  trap, not a bug fix.
+- **Submit reliably lands on, and stays on, the Start/Stop screen instead of
+  sometimes flipping back into the FM-review overlay on its own.** `resume()`
+  (Submit) clears `machine_start_locked` and `capture_paused` so the live view
+  returns, matching legacy's `submit_all_fo_new` (`main.py:1310-1348`) exactly
+  — but the belt is still physically stationary at that point (Start hasn't
+  been pressed), and confirmed live on real hardware: the still-in-frame
+  object that just tripped the interlock got redetected as "new" seconds
+  later and re-locked the interlock on its own, no operator action, sending
+  the UI right back into the FM-review overlay it had just left. The likely
+  mechanism is the tracker losing that object's track across the
+  capture-pause gap (no frames reach it while paused) and reassigning it a
+  fresh id once frames resume — legacy's own tracker has no special handling
+  for this gap either, so this may reproduce a genuine legacy bug rather than
+  a porting mistake, but it wasn't verified against real legacy hardware and
+  the fix was requested regardless. `scan_session.py`'s new
+  `detection_suspended` flag (set in `resume()`, cleared in `start()`) skips
+  detection — not the live preview — until the operator explicitly presses
+  Start again, so Submit can't self-trigger a new lock. A deliberate
+  deviation, not a legacy-matching fix, since it has no corresponding flag or
+  gate in `main.py`.
+- **A New Batch draft survives an involuntary round trip back to this screen**
+  (the browser's own Back button carrying the operator back from Dashboard
+  mid-batch), instead of silently discarding everything typed. This one exists
+  specifically *because* of the web architecture (a React page component is
+  destroyed and rebuilt on navigation; legacy's equivalent Qt page object
+  never was), not because legacy did anything better here. Scope is
+  deliberately narrow, per explicit request: leaving this screen on purpose —
+  its own "← Back" button or Cancel, both `NewBatch.jsx`'s own click sites —
+  clears the draft; only the round trip that lands back here without the
+  operator choosing to return should restore it. A third site clears it too:
+  confirmed live — completing a batch all the way through (Confirm & Finish
+  on `ResultsViewer.jsx`) still left the just-finished batch's details
+  prefilled on the next New Batch form, since that page has no connection to
+  `NewBatch.jsx`'s sessionStorage draft at all. `handleFinish` now imports
+  and calls `NewBatch.jsx`'s exported `clearDraft()` on a successful
+  `confirmScan` — once a batch is genuinely done there's no round trip left
+  to preserve the draft for.
 
 ## Suggested future enhancements
 
@@ -142,10 +233,18 @@ alongside the more clear-cut open work in `todos.md`.
   If the machine's controller can report individual component status, surfacing
   it in the UI would be a genuine capability legacy never had, not just a
   port of one.
-- **Finalize the PWA manifest's branding** (icon, theme color) to match
-  legacy's actual "Compass Eye" identity instead of the current placeholder
-  values — see `3 - frontend_setup_walkthrough.md` and
-  `10 - pwa_and_deployment_rollout.md`.
+- **Finalize the PWA manifest's branding** (icon, theme color) to match the
+  app's actual "Eye Compass" identity instead of the current placeholder
+  values. `/public/logo.png` is the unrelated "Compass Group" corporate
+  logo — legacy's own `app.setWindowIcon` (`main.py:3123`) uses the exact
+  same file, so this isn't something this port broke, but it was never
+  replaced with real branding either. Tried replacing it with a generated
+  icon at one point; reverted on request (a stylized "Eye Compass" text
+  wordmark was wanted instead, not a graphical mark — see `.brand-wordmark`
+  in `global.css`, used in every header) — so the file itself is back to
+  the original placeholder and still needs real artwork if the icon/favicon/
+  PWA install icon should ever show something other than it. See
+  `3 - frontend_setup_walkthrough.md` and `10 - pwa_and_deployment_rollout.md`.
 - **Fix XAI View for real**, rather than just wiring the frontend button to
   the existing (currently broken) backend endpoint. See `todos.md` for the
   two candidate approaches already identified.
