@@ -595,3 +595,77 @@ removed from `app/services/datagram.py` along with the dead import. The
 FRESH-submit screen (`isPending` in `ResultsViewer.jsx`) is unaffected — it
 never reads `detail.breakdown` at all, only `pendingResult.result`, which
 correctly stays just the item counts.
+
+## 7j. XAI View was drawing nothing, then the wrong colors, then crashing the process at shutdown
+
+Reported live: clicking "XAI View" during an active FM detection showed only
+a background-color change — no red detection boxes, no confidence labels,
+nothing resembling legacy's heatmap. Four separate bugs, found and fixed one
+at a time as each was uncovered:
+
+1. **No boxes drawn at all.** `Dashboard.jsx`'s `handleXaiToggle` sent
+   `detections: pending.map((p) => p.box)` — bare `[x1, y1, x2, y2]` arrays.
+   `xai_service.py`'s `build_confidence_heatmap` requires at least 6 values
+   per detection (`det[4]` = confidence, `det[5]` = class_id) or it silently
+   skips that detection (`if len(det) < 6: continue`) — so every detection
+   was always skipped, the mask stayed all-zero, and the function returned
+   the frame completely unmodified.
+
+2. **Wrong background color.** `app/api/xai.py` applied
+   `cv2.cvtColor(image, cv2.COLOR_RGB2BGR)` on the frame decoded from the
+   client's `frame_base64`, on the assumption (copied from legacy's
+   `xai_optimized.py:51-53`, which applies to a different input — a raw
+   in-memory frame straight off the camera, never JPEG-encoded) that the
+   input was RGB. But `cv2.imdecode` always yields correct BGR for a
+   standard JPEG regardless of the camera's original colorspace, and
+   `frame_base64` here is the very same JPEG already displayed correctly in
+   the live view — so this swap re-flipped already-correct colors. Confirmed
+   live: a genuinely blue conveyor belt rendered brown/orange in XAI View
+   only. Removed the extra conversion.
+
+3. **Investigating fix 1 further: after sending real
+   confidence/class_id, detections still came back empty when re-inferred.**
+   Root cause: legacy's `show_xai_image` (main.py:1015-1055) re-runs
+   inference on `image` — the same in-memory frame object frozen at
+   `fm_control`'s lock time (main.py:2661), at its original resolution. This
+   port's XAI request instead re-inferred on the client's `frame_base64`,
+   which is the WebSocket **preview** copy — JPEG-compressed and possibly
+   downscaled to `STREAM_MAX_WIDTH` (`camera.py`'s `encode_display`) for
+   bandwidth. Re-running inference on that lossy/downscaled copy found
+   nothing, even though the same frame's full-resolution original had just
+   found 4 detections live. Fixed: when no `detections` are supplied,
+   `generate_heatmap` now prefers `scan_session.pending_frame` (the exact
+   full-resolution frame frozen at lock time, `scan_session.py:387`) over
+   the client-supplied preview, matching legacy's own frame object exactly.
+   `pending_frame` is RGB (same as what the live loop already feeds
+   `_inference.predict()` directly, `camera.py:267`), so it's re-run
+   unconverted and only turned to BGR afterward for the drawing/colormap
+   step. This also meant a related design decision: `Dashboard.jsx` no
+   longer sends any `detections` at all for XAI (previously sent the stored
+   `pending` boxes) — legacy re-infers fresh rather than reusing the boxes
+   that triggered the lock, so this port now does the same.
+
+4. **Process aborts at shutdown: `PyCUDA ERROR: The context stack was not
+   empty upon module cleanup... Aborted (core dumped)`.** Every other
+   camera/inference call site in `camera.py` is carefully routed through one
+   dedicated worker thread (`_hw_executor`/`_run_on_hw_thread`), because
+   TensorRT/pycuda pushes a CUDA context onto whichever OS thread first
+   calls `predict()` and only pops it via an explicit `cleanup()` call made
+   on that SAME thread at shutdown (see the note above `_hw_executor`'s
+   definition). `api/xai.py`'s `generate_heatmap`, a plain sync FastAPI
+   handler, called `_inference.predict(...)` directly — Starlette runs sync
+   handlers on its own internal thread pool, a different (and
+   non-deterministic) thread every request, so each XAI call could push a
+   context that shutdown's `cleanup()` never sees, and the process
+   hard-aborts once one is left dangling. This bug predates this session's
+   XAI changes; it was already present in the original endpoint. Fixed:
+   `generate_heatmap` now submits inference to `_run_on_hw_thread` (via a
+   small `_run_inference` helper) exactly like every other hardware-touching
+   call in `camera.py`.
+
+The confidence-score label drawn on each box (`0.59`-style text) and the
+JET-colormap-tinted background are both intentional, matching legacy exactly
+— see `xai_service.py`'s `build_confidence_heatmap` (same math as
+`xai_optimized.py`): a strongly-colored blob at a detection means high
+confidence; the red-dominant background is JET's "low activation" end,
+correctly recolored across the whole frame, not a residual color bug.
