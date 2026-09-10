@@ -108,6 +108,44 @@ as a PWA" concretely means, and `todos.md` for the still-open work of
 formalizing how an already-running prod device gets its existing legacy
 install replaced by this stack.
 
+## Debug mode vs. production mode
+
+**These are the same three services either way** (backend via systemd/venv,
+frontend+db via Docker) — "debug" here just means running the backend
+manually in a foreground terminal instead of through systemd, so tracebacks
+and print/log output are visible live instead of only in `journalctl`. There
+is no separate build/config for "debug backend" vs "production backend" —
+it's the identical `uvicorn app.main:app` command either way.
+
+**Debug mode** (developing/diagnosing — what this whole project has been run
+as so far):
+```bash
+cd /home/nvidia/eye_compass_new/eye_compass_be
+/home/nvidia/.virtualenvs/eye_compass/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+Stop the systemd-managed instance first (`sudo systemctl stop
+eye-compass-backend.service`) or this fails with "address already in use" —
+both bind the same port 8000.
+
+**Production mode** (unattended device, boot-to-running with no terminal):
+```bash
+sudo systemctl enable --now eye-compass-backend.service   # one-time
+sudo systemctl start eye-compass-backend.service           # every subsequent boot, automatic
+```
+**Already done on this dev unit** — enabled, started, and verified working
+(`journalctl -u eye-compass-backend` showed a clean startup identical to the
+manual run, `curl http://localhost:8000/` responded correctly). See
+`9 - post_remediation_session_log.md` / `todos.md` item 7 for that
+verification.
+
+The frontend has the same debug/production distinction, but only the debug
+side has actually been run: `docker-compose.yml`'s `frontend` service runs
+Vite's own **dev server** (`npm run dev`, live-reloading, unminified) — this
+is what every screen in this project has been tested against, including the
+kiosk setup below. A production build (`eye_compass_fe/Dockerfile` +
+`nginx.conf`, already present but not yet wired into `docker-compose.yml` or
+tried) is still open work — see `todos.md`.
+
 ## The exact commands used on this dev unit
 
 **Everyday start** (both containers plus the backend):
@@ -125,9 +163,10 @@ sudo systemctl stop eye-compass-backend.service
 sudo docker compose down           # or: docker compose stop, to keep the containers
 ```
 
-**Enable the backend to survive a reboot** (not yet done on this dev unit —
-still manual today, see `todos.md` item 7 for the remaining "does the whole
-device come up clean after a reboot" question):
+**The backend surviving a reboot is already set up** on this dev unit —
+`eye-compass-backend.service` is installed at `/etc/systemd/system/` and
+`enable`d (`Restart=always` besides, so it also comes back after a crash, not
+just a reboot). The commands that did this, for reference/a fresh device:
 
 ```bash
 sudo cp eye_compass_be/eye-compass-backend.service /etc/systemd/system/
@@ -135,14 +174,41 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now eye-compass-backend.service
 ```
 
-**Running the backend directly, without systemd** (useful for watching
-tracebacks live, e.g. while chasing the PyCUDA crash in
-`9 - post_remediation_session_log.md` §4):
+**Kiosk browser** (the actual on-screen app window — see
+`10 - pwa_and_deployment_rollout.md` for the full detail on why this is a
+standalone Firefox, not the system's Chromium/Firefox):
 
 ```bash
-cd /home/nvidia/eye_compass_new/eye_compass_be
-/home/nvidia/.virtualenvs/eye_compass/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Launch it manually (e.g. to test without rebooting) — from a plain
+# terminal (not the graphical autostart path) DISPLAY/XAUTHORITY aren't set
+# by default, so the launch fails with "no DISPLAY environment variable
+# specified" unless both are passed explicitly, pointed at the actual
+# logged-in graphical session (nvidia's is display :0):
+DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority /home/nvidia/.local/bin/eye-compass-kiosk.sh
+
+# See whether it found the backend/frontend ready, and when:
+cat ~/.local/state/eye-compass-kiosk.log
+
+# Close it — the script now launches with --kiosk (full-screen, no title
+# bar/close button by request), so there is no on-screen way to close the
+# window; use Alt+F4, or from any terminal:
+pkill -f "firefox --profile /home/nvidia/.local/opt/firefox-kiosk-profile"
 ```
+At graphical login it starts on its own — no command needed, and no
+DISPLAY/XAUTHORITY to set manually either (the autostart entry already runs
+inside that graphical session) — via
+`~/.config/autostart/eye-compass-kiosk.desktop` (standard XDG autostart),
+since GDM auto-login for user `nvidia` is already enabled.
+
+The script briefly went through a non-`--kiosk` windowed/maximized variant
+(`userChrome.css` hiding just the toolbars, `xulstore.json` forcing
+maximized, keeping the native title bar/minimize/close buttons) after
+`--kiosk`'s missing close button was flagged as wrong — then reverted back
+to `--kiosk` on a later, explicit request for genuine full-screen. The
+`userChrome.css`/`xulstore.json` files are still in the profile and harmless
+either way; only the `--kiosk` flag in the launch script actually decides
+which behavior is active. To go back to the windowed/maximized variant,
+remove `--kiosk` from `~/.local/bin/eye-compass-kiosk.sh`'s launch command.
 
 **Tailing logs:**
 

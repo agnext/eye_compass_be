@@ -55,42 +55,101 @@ but has not yet been the one actually run:
 
 Tying together `5 - infrastructure_and_deployment.md`'s hybrid split:
 
-1. **Database + frontend**: `sudo docker compose up -d` from the folder
-   containing the root `docker-compose.yml` (switched to the production
-   frontend build/Nginx target once that path is actually exercised — see
-   `todos.md`).
-2. **Backend**: the systemd unit (`eye-compass-backend.service`) enabled so
-   it starts on boot and restarts on failure, pointed at the virtualenv with
-   both the web and ML stacks (`/home/nvidia/.virtualenvs/eye_compass`).
-3. **Kiosk browser autostart**: the device's desktop session needs to launch
-   a browser, full-screen, pointed at the frontend, with no further
-   interaction. The general shape (not yet set up or tested on this device):
-   - A `systemd` **user** service, or an XDG autostart `.desktop` entry, that
-     runs on graphical login/boot.
-   - Launches Chromium with kiosk flags, e.g.
-     `chromium-browser --kiosk --app=http://localhost:5173 --noerrdialogs --disable-session-crashed-bubble`
-     — `--app=` (rather than plain `--kiosk <url>`) is what makes Chromium
-     treat it as an installed-app-style window (no tabs, no address bar)
-     rather than merely a full-screen normal browser window.
-   - The device should already be logged into a graphical session
-     automatically (auto-login), since there is no operator available to type
-     a password at boot on an unattended kiosk.
+1. **Database + frontend**: `docker-compose.yml`'s `db`/`frontend` services
+   both have `restart: always`, and `docker.service` is enabled at boot
+   (confirmed via `systemctl is-enabled docker`) — so both come back on
+   their own after a reboot with no manual `docker compose up` needed.
+   Still the dev-server frontend target, not production Nginx — see
+   `todos.md`.
+2. **Backend**: `eye-compass-backend.service` is installed at
+   `/etc/systemd/system/`, enabled, and verified working (`sudo systemctl
+   start` + `journalctl -u eye-compass-backend` showed a clean startup
+   matching the manual `uvicorn` run exactly).
+3. **Kiosk browser autostart**: done, via
+   `~/.local/bin/eye-compass-kiosk.sh` (waits for both
+   `http://localhost:8000/` and `http://localhost:5173` to actually respond,
+   logs to `~/.local/state/eye-compass-kiosk.log`, then launches the
+   browser) plus `~/.config/autostart/eye-compass-kiosk.desktop` (standard
+   XDG autostart, fires at graphical login). GDM auto-login for user
+   `nvidia` was already enabled (`/etc/gdm3/custom.conf`).
+
+   **Real, confirmed finding: Chromium (and Firefox) cannot run as snaps on
+   this device at all.** This Jetson's kernel
+   (`5.15.148-tegra`) was built with `CONFIG_SECURITY_APPARMOR` unset
+   entirely (confirmed via `/proc/config.gz`; `aa-status` reports "apparmor
+   not present") — `snap-confine` hard-requires AppArmor and fails
+   immediately (`snap-confine is packaged without necessary permissions and
+   cannot continue`) regardless of user/sudo/capabilities. This is a kernel
+   build limitation, not a permissions issue, and not fixable without a
+   custom kernel rebuild — the same category of limitation as the missing
+   `iptable_raw.ko` module that forced Docker into `network_mode: host` (see
+   `5 - infrastructure_and_deployment.md`).
+
+   Ubuntu 22.04 arm64's `chromium-browser` and `firefox` **apt** packages
+   are both transitional dummy packages that just install the snap
+   (`apt-cache show chromium-browser`: "This is a transitional dummy
+   package... chromium-browser is now replaced by the chromium snap"; same
+   for `firefox`, `Pre-Depends: debconf, snapd`) — so neither is usable
+   here either. The working solution: **Mozilla's official standalone
+   Firefox Linux-aarch64 tarball**, downloaded directly from
+   `download.mozilla.org` and extracted to `~/.local/opt/firefox` — a real
+   ELF binary with no snap/AppArmor dependency. Launched with a dedicated
+   kiosk profile (`~/.local/opt/firefox-kiosk-profile/user.js`) that
+   suppresses first-run/crash-restore/update prompts, via:
+   ```
+   firefox --profile ~/.local/opt/firefox-kiosk-profile --kiosk --no-remote <url>
+   ```
+   Chromium's `--app=<url>` trick (no tabs, no address bar) doesn't apply
+   here since Chromium isn't an option on this device at all; Firefox's
+   plain `--kiosk <url>` already hides all browser chrome.
+
+   **This went through two iterations on window chrome.** `--kiosk` was
+   first removed after live testing showed it strips the OS-drawn title bar
+   entirely — no minimize/close button at all, flagged as wrong — and
+   replaced with a windowed/maximized variant instead: `userChrome.css` in
+   the profile's `chrome/` folder hides just `#TabsToolbar`/`#nav-bar`/
+   `#PersonalToolbar` (tabs, address bar, bookmarks), and `xulstore.json`
+   forces `sizemode: maximized`, leaving the native title bar (and its
+   minimize/maximize/close buttons) untouched. That was later reverted back
+   to plain `--kiosk` on an explicit follow-up request for genuine
+   full-screen — there is no Firefox CLI flag that gives full-screen while
+   still leaving a title bar toggle reachable (`xdotool`/`wmctrl`, which
+   could fake it via an EWMH fullscreen window-manager toggle instead, are
+   not installed on this device), so `--kiosk` was the only way to satisfy
+   that specific ask. Both sets of profile files remain in place; only the
+   `--kiosk` flag in `~/.local/bin/eye-compass-kiosk.sh` actually switches
+   between the two — see `5 - infrastructure_and_deployment.md`'s Kiosk
+   browser section for the exact toggle and how to close a `--kiosk` window
+   (`Alt+F4`, or `pkill -f "firefox --profile
+   ~/.local/opt/firefox-kiosk-profile"` from any terminal, since there's no
+   on-screen close button in this mode).
+
+   Launching the script manually from a plain (non-graphical-autostart)
+   terminal also needs `DISPLAY`/`XAUTHORITY` set explicitly — they aren't
+   inherited there the way they are for the XDG autostart entry below,
+   which already runs inside the graphical session:
+   ```
+   DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority /home/nvidia/.local/bin/eye-compass-kiosk.sh
+   ```
 
 ## What's genuinely still open here
 
-- Whether to rely on Chromium's own "installed PWA" mechanism (`--app=`) or a
-  plain `--kiosk <url>` full-screen browser window — both achieve a
-  chrome-less full-screen view, but behave slightly differently around things
-  like the service worker's install prompt and update flow. Worth deciding
-  deliberately, not defaulting to whichever is easiest to script.
 - The manifest's icon and theme colors are still placeholders (see
   `3 - frontend_setup_walkthrough.md`) — worth finalizing to match legacy's
-  actual "Compass Eye" branding before this is what a technician sees appear
+  actual "Eye Compass" branding before this is what a technician sees appear
   on a real device.
-- None of this has been tested against an actual reboot cycle — auto-login,
-  service startup ordering (the browser launching before the frontend
-  container/backend are actually ready to answer requests is a real failure
-  mode worth explicitly handling, e.g. a retry/splash rather than a blank
-  error page), and recovery after a crash.
+- Switching the kiosk target from the Vite dev server to a production
+  frontend build (`todos.md`).
+- **Not yet tested against an actual reboot cycle** (deliberate — configured
+  this session, reboot-test deferred to later, per explicit request; see
+  `todos.md`): auto-login, service startup ordering, whether the kiosk
+  script's wait-and-retry actually covers a cold boot's slower container
+  startup in practice, and recovery after a crash.
+- Firefox's own auto-update mechanism isn't disabled at the OS/package level
+  (only `app.update.auto`/`app.update.enabled` in the kiosk profile) — a
+  standalone tarball install like this one doesn't self-update via any
+  system package manager, so this is likely moot, but worth confirming
+  nothing on the device (e.g. a stray cron job) could replace or upgrade
+  `~/.local/opt/firefox` unexpectedly.
 
 See `todos.md` for this tracked as an explicit open item.

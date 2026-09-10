@@ -49,12 +49,61 @@ for the hardware-QA-specific subset of this list.
    folder already — `stem_rice` specifically is the fallback model, so this
    blocks testing an unmapped commodity until restored.
 7. **Test running this as an installed PWA, and set it to start on device
-   boot.** The PWA manifest/service worker exist in the build
-   (`vite-plugin-pwa`) but have never been tested as an actually-installed
-   app, and nothing yet configures the device to launch it automatically at
-   power-on. See `10 - pwa_and_deployment_rollout.md` for the intended
-   mechanism (production build, kiosk-mode Chromium, autostart) — none of
-   which has been tried on real hardware yet.
+   boot.** Boot-time launch is now wired up on this dev device (backend
+   service already verified working; kiosk browser launch not yet verified
+   end-to-end — see the sub-items below):
+   - `~/.local/bin/eye-compass-kiosk.sh` — waits for both the backend
+     (`:8000/`) and frontend (`:5173`) to actually answer before launching
+     the browser (see below) in kiosk mode, instead of firing it blindly at
+     login and risking a blank/error page.
+   - **Real finding, not in the original plan: neither Chromium nor Firefox
+     can run as a snap on this device at all.** This Jetson's kernel has
+     `CONFIG_SECURITY_APPARMOR` unset, which `snap-confine` hard-requires —
+     confirmed via `/proc/config.gz` and `aa-status`, and this is what
+     Ubuntu 22.04 arm64's `chromium-browser`/`firefox` apt packages both
+     actually install (both are transitional dummy packages, not real
+     browsers). Worked around by downloading Mozilla's official standalone
+     Firefox linux-aarch64 tarball to `~/.local/opt/firefox` (a real ELF
+     binary, no snap involved) and launching it with a dedicated kiosk
+     profile (`~/.local/opt/firefox-kiosk-profile`) via `--kiosk
+     --no-remote`. See `10 - pwa_and_deployment_rollout.md` for the full
+     detail.
+   - `~/.config/autostart/eye-compass-kiosk.desktop` — XDG autostart entry
+     that runs the script above at graphical login. GDM auto-login for user
+     `nvidia` was already enabled (`/etc/gdm3/custom.conf`), so no manual
+     login step is needed at power-on.
+   - `docker-compose.yml`'s `db`/`frontend` services already have
+     `restart: always`, and `docker.service` is already enabled at boot
+     (confirmed via `systemctl is-enabled docker`) — so both containers
+     should come back on their own after a reboot.
+   - The backend systemd service was set up AND verified working this
+     session: enabled, manually started once (after stopping the
+     dev-terminal `uvicorn` process), `journalctl -u eye-compass-backend`
+     showed a clean startup identical to the manual run, and both
+     `curl http://localhost:8000/` and `:5173` responded correctly
+     afterward. That verification did **not** require the sudo commands
+     below (they were run interactively by the user, not this session):
+     ```
+     sudo cp /home/nvidia/eye_compass_new/eye_compass_be/eye-compass-backend.service /etc/systemd/system/
+     sudo systemctl daemon-reload
+     sudo systemctl enable eye-compass-backend.service
+     ```
+     Enabled AND started (see the verification note above) — the
+     systemd-managed instance bound port 8000 and served requests cleanly,
+     with no conflict from the previously-manual terminal run. It will keep
+     running across restarts/reboots on its own from here.
+   - **Sub-todo: switch the kiosk to a production frontend build.** The
+     kiosk script currently points at the Vite **dev** server (`:5173`, via
+     Docker) on purpose, per an explicit decision to keep matching what's
+     already been tested all session rather than switch to an untested
+     production/Nginx target right now — see
+     `10 - pwa_and_deployment_rollout.md`'s "Prerequisite: serve a real
+     production build" section for what that switch actually involves.
+   - **Sub-todo: test a real reboot cycle.** None of the above has been
+     verified against an actual power-cycle yet (explicit decision this
+     session to configure it now, reboot-test later) — need to confirm
+     service startup ordering, the kiosk script's wait-and-retry actually
+     works in practice, and recovery after a crash.
 
 ## Submit Batch is a two-step flow — a batch can be silently never saved
 
