@@ -26,6 +26,7 @@ unique track ids for the whole run (existing_track_ids) and produced the final
 per-FM breakdown by listing saved crop files. Both are reproduced here.
 """
 
+import base64
 import json
 import logging
 import os
@@ -426,7 +427,24 @@ class ScanSession:
 
             crop = self.pending_frame[y1:y2, x1:x2]
             safe_name = fm_name.replace(" ", "_")
-            filename = f"{safe_name}_{int(time.time() * 1000)}.png"
+            # Nanosecond timestamp AND the box's own index, not just a
+            # millisecond timestamp: confirmed live, two boxes on the same
+            # reviewed frame tapped in quick succession landed in the same
+            # millisecond, giving two different crops (different FM types,
+            # different files) the exact same timestamp suffix — and since
+            # that suffix is also this crop's own object_id (see
+            # _crop_object_id), the collision showed up as two entirely
+            # different objects both displaying as the same "Object N" in
+            # the reclassify gallery. Nanosecond resolution alone made a
+            # repeat far less likely but still isn't a real guarantee (clock
+            # resolution isn't specified/guaranteed by the platform); the
+            # box index costs nothing and rules it out deterministically,
+            # since two boxes from the very same label_detection pass always
+            # have distinct indices. history.py's get_result_images derives
+            # its own display fm_type generically (strips ALL trailing
+            # underscore-separated numeric tokens, not just one) specifically
+            # so this extra token doesn't need any matching change there.
+            filename = f"{safe_name}_{time.time_ns()}_{index}.png"
             path = os.path.join(self.output_folder, filename)
             # Legacy writes the crop through a BGR->RGB conversion (main.py:1361).
             cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -451,8 +469,13 @@ class ScanSession:
                 if x2 <= x1 or y2 <= y1:
                     continue
                 crop = self.pending_frame[y1:y2, x1:x2]
+                # Nanosecond, same reasoning as label_detection's own
+                # filename above — the box index already disambiguates
+                # different boxes from the same frame, but not two
+                # unclassified boxes across two frames swept within the
+                # same millisecond.
                 path = os.path.join(
-                    self.output_folder, f"NON-FM_{int(time.time() * 1000)}_{item['index']}.png"
+                    self.output_folder, f"NON-FM_{time.time_ns()}_{item['index']}.png"
                 )
                 cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
                 saved += 1
@@ -531,6 +554,118 @@ class ScanSession:
         counter["Blower FO"] = blower_fo
         counter["Magnetic FO"] = magnetic_fo
         return dict(counter)
+
+    def _crop_fm_type(self, name: str) -> str:
+        """Reverse create_results' own prefix match for one filename, so the
+        reclassify gallery can label each crop with the type it's currently
+        counted as — same stem-splitting logic, applied to one name instead
+        of a whole directory listing."""
+        params = sorted(list(self.analysis_parameters) + ["FM", "NON-FM"], key=len, reverse=True)
+        parts = name.split("_")
+        stem = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+        return next((key for key in params if stem.startswith(key)), "NON-FM")
+
+    def _crop_object_id(self, name: str) -> str:
+        """The part of a crop's filename that is NOT its FM-type prefix —
+        e.g. `1789033003109` for `Insect_1789033003109.png`, or
+        `1789033003109_0` for `NON-FM_1789033003109_0.png` (save_unselected
+        appends the box index too, to disambiguate multiple unclassified
+        boxes from the same frame). This is the one part of the filename
+        that's genuinely unique to this specific captured object — unlike
+        the FM-type prefix, which is exactly what a reclassify changes.
+        relabel_crop preserves it across a rename for that reason: it's the
+        closest thing this design has to a real, stable per-object name.
+        """
+        fm_type = self._crop_fm_type(name)
+        stem_no_ext = name.rsplit(".", 1)[0]
+        prefix = fm_type.replace(" ", "_") + "_"
+        if stem_no_ext.startswith(prefix):
+            return stem_no_ext[len(prefix):]
+        return stem_no_ext
+
+    def list_pending_crops(self) -> List[Dict]:
+        """Crops saved so far for the batch on the review screen — after
+        Submit, before Confirm/Discard — so the operator can reclassify one
+        before saving. Not a legacy feature (legacy has no reclassify path
+        at all, live or at submit); see enhancements.md.
+
+        Ordered by file mtime, most recently captured first — not by name:
+        relabel_crop renames the file (new FM-type prefix), and a plain
+        alphabetical `sorted(os.listdir(...))` would then reshuffle that
+        crop to wherever its new name happens to sort — confirmed live,
+        reported as objects visibly changing position on every reclassify.
+        os.rename() does not touch a file's mtime (only its ctime), so
+        sorting by mtime keeps every crop in its original capture order
+        (latest-first, on request) regardless of how many times it's since
+        been renamed.
+        """
+        with self._lock:
+            folder = self.output_folder
+            if not folder or not os.path.isdir(folder):
+                return []
+            crops = []
+            for name in os.listdir(folder):
+                if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                    continue
+                path = os.path.join(folder, name)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as fh:
+                    data = base64.b64encode(fh.read()).decode("ascii")
+                mime = "png" if name.lower().endswith(".png") else "jpeg"
+                crops.append({
+                    "name": name,
+                    "fm_type": self._crop_fm_type(name),
+                    "object_id": self._crop_object_id(name),
+                    "data_uri": f"data:image/{mime};base64,{data}",
+                    "_mtime": os.path.getmtime(path),
+                })
+            crops.sort(key=lambda c: c["_mtime"], reverse=True)
+            for crop in crops:
+                del crop["_mtime"]
+            return crops
+
+    def relabel_crop(self, name: str, fm_name: str) -> str:
+        """Reclassify one already-saved crop before the batch is confirmed.
+
+        The filename IS the classification record (see label_detection) —
+        create_results just re-counts the directory afterward, so renaming
+        the file is the whole operation. New to this port; legacy has no
+        equivalent (mousePressEvent, main.py:219-246, no-ops on an
+        already-labelled box and never revisits it, even at submit).
+
+        Keeps the SAME object_id suffix (see _crop_object_id) rather than
+        minting a fresh timestamp — confirmed live, the operator can tell a
+        crop's file has its own name (e.g. the `..._1789033003109_0.png` in
+        its path) and reasonably expects reclassifying it to change what
+        it's called, not what it IS. Only the FM-type prefix changes; the
+        part of the name that actually identifies this specific captured
+        object stays fixed, so it can be reclassified any number of times
+        and still be recognized as the same object throughout.
+        """
+        valid = set(self.analysis_parameters) | {"NON-FM"}
+        if fm_name not in valid:
+            raise ValueError(f"{fm_name!r} is not a valid FM type for this commodity")
+
+        with self._lock:
+            folder = self.output_folder
+            if not folder or not os.path.isdir(folder):
+                raise FileNotFoundError("No batch folder to reclassify in")
+            # Ignore any directory component a caller might pass — this must
+            # only ever touch a file directly inside output_folder.
+            safe_source = os.path.basename(name)
+            src = os.path.join(folder, safe_source)
+            if not os.path.isfile(src):
+                raise FileNotFoundError(f"No such crop: {name}")
+
+            object_id = self._crop_object_id(safe_source)
+            safe_name = fm_name.replace(" ", "_")
+            new_name = f"{safe_name}_{object_id}.png"
+            dest = os.path.join(folder, new_name)
+            if dest != src:
+                os.rename(src, dest)
+            logger.info("Reclassified crop %s -> %s (%s)", safe_source, new_name, fm_name)
+            return new_name
 
     def update_fm_count(self) -> Dict[str, float]:
         """The six looker_data metrics. Port of update_fm_count (main.py:1535-1563)."""

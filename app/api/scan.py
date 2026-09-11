@@ -28,7 +28,9 @@ fragility, reproduced here rather than fixed, since an exact match was
 requested over the earlier one-step version.
 """
 
+import json
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -78,6 +80,11 @@ class SubmitRequest(BaseModel):
     blower_fo: str = "0"
     magnetic_fo: str = "0"
     surveyor_name: str = ""
+
+
+class RelabelCropRequest(BaseModel):
+    name: str
+    fm_name: str
 
 
 # ---------------------------------------------------------------------------
@@ -339,12 +346,90 @@ def submit_scan(
         "datagram": datagram,
         "commodity": status_before.get("commodity", ""),
         "variety": status_before.get("variety", ""),
+        # Kept only so a reclassify (see /pending-crops/relabel below) can
+        # rebuild the datagram exactly the way this endpoint just did,
+        # without the frontend having to resend anything.
+        "batch": batch,
+        "status_before": status_before,
+        "surveyor_name": req.surveyor_name,
     }
 
     return {
         "status": "success",
         "result": result_payload,
         "datagram": datagram,
+    }
+
+
+@router.get("/pending-crops")
+def list_pending_crops():
+    """Crops saved for the batch currently awaiting /confirm or /discard —
+    lets the review screen show what was captured before the operator saves.
+
+    Gated on _pending_submission rather than just scan_session.active (which
+    is already False by this point, see /submit) so this only ever applies
+    to the specific window between Submit and Confirm/Discard, not to some
+    unrelated leftover folder.
+    """
+    if _pending_submission is None:
+        raise HTTPException(status_code=409, detail="Nothing pending to show crops for")
+    return {"crops": scan_session.list_pending_crops()}
+
+
+@router.post("/pending-crops/relabel")
+def relabel_pending_crop(req: RelabelCropRequest, db: Session = Depends(get_db)):
+    """Reclassify one crop before the batch is confirmed — new to this port,
+    not a legacy feature (see scan_session.relabel_crop's own docstring and
+    enhancements.md). Renames the file, then recounts and rebuilds the same
+    result/datagram shape /submit returned, so the frontend can just replace
+    its local copy of both with this response.
+    """
+    global _pending_submission
+
+    if _pending_submission is None:
+        raise HTTPException(status_code=409, detail="Nothing pending to reclassify")
+
+    try:
+        scan_session.relabel_crop(req.name, req.fm_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    pending = _pending_submission
+    prev_result = pending["result_payload"]["result"]
+    blower = prev_result.get("Blower FO", 0)
+    magnetic = prev_result.get("Magnetic FO", 0)
+
+    new_data = scan_session.create_results(blower, magnetic)
+    total = sum(v for v in new_data.values() if isinstance(v, int))
+
+    result_payload = dict(pending["result_payload"])
+    result_payload["result"] = new_data
+    result_payload["total_fo_detected"] = total
+
+    try:
+        os.makedirs(scan_session.output_folder, exist_ok=True)
+        with open(os.path.join(scan_session.output_folder, "result.json"), "w") as fh:
+            json.dump(result_payload, fh, indent=4)
+    except Exception as exc:
+        logger.error("Could not rewrite result.json after reclassify: %s", exc)
+
+    datagram = build_datagram(
+        db,
+        session_status=pending["status_before"],
+        result_payload=result_payload,
+        batch=pending["batch"],
+        surveyor_name=pending["surveyor_name"],
+    )
+
+    _pending_submission = {**pending, "result_payload": result_payload, "datagram": datagram}
+
+    return {
+        "status": "success",
+        "result": result_payload,
+        "datagram": datagram,
+        "crops": scan_session.list_pending_crops(),
     }
 
 

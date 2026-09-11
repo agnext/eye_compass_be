@@ -29,6 +29,18 @@ router = APIRouter()
 SYNC_LABELS = {"1": "Synced", "2": "Rejected", "0": "Pending"}
 
 
+def _strip_trailing_numeric_tokens(stem: str) -> list:
+    """Drop every trailing underscore-separated token that's purely digits
+    (a timestamp, a box index, or both) from a crop filename's stem (no
+    extension), leaving just the FM-type words. See get_result_images'
+    fm_type field below for why this can't assume exactly one such token.
+    """
+    parts = stem.split("_")
+    while len(parts) > 1 and parts[-1].isdigit():
+        parts.pop()
+    return parts
+
+
 def _row_to_summary(r: Result) -> dict:
     payload = r.result if isinstance(r.result, dict) else {}
     scan_data = payload.get("scan_data", {}) or {}
@@ -196,8 +208,18 @@ def get_result_images(
                 {
                     "name": name,
                     # The FM type is the filename prefix — that is how results
-                    # are counted, so it is the label to show.
-                    "fm_type": name.rsplit("_", 1)[0].replace("_", " "),
+                    # are counted, so it is the label to show. A plain
+                    # rsplit("_", 1) assumed exactly one trailing numeric
+                    # token (a timestamp) — already wrong for NON-FM crops
+                    # (NON-FM_<ts>_<box index>.png has two), and now also for
+                    # labelled ones (scan_session.label_detection appends a
+                    # box index too, to make its object_id collision-proof).
+                    # Stripping every trailing all-digit token, not just the
+                    # last one, handles any of these regardless of how many
+                    # numeric suffixes a given crop's filename happens to have.
+                    "fm_type": " ".join(
+                        _strip_trailing_numeric_tokens(name.rsplit(".", 1)[0])
+                    ),
                     "data_uri": f"data:{mime};base64,{encoded}",
                 }
             )

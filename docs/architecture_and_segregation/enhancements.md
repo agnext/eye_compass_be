@@ -230,6 +230,40 @@ them alongside further enhancements worth considering but not yet done.
   clicking them to filter the gallery to, now that they can never be tapped
   during classification).
 
+- **Reclassify a captured object on the pre-Save review screen.** Genuinely
+  new — legacy has no equivalent at all: `ImageLabel.mousePressEvent`
+  (`main.py:219-246`) no-ops on a box that already has a label, and neither
+  `create_results` nor `submit_create_result`/`save_result` offer any
+  edit/undo path, even at Submit. Requested directly, not a legacy-parity
+  fix.
+
+  Classification is stored as the crop file's own filename prefix
+  (`{fm_name}_{epoch_ms}.png`, `scan_session.label_detection`), and
+  `create_results()` just counts files by that prefix — so reclassifying is
+  a rename, nothing more, and only meaningful before `/confirm` persists the
+  batch (after that, the crops may already be archived/synced). New backend
+  methods `scan_session.list_pending_crops()`/`relabel_crop()` and endpoints
+  `GET /api/scan/pending-crops` / `POST /api/scan/pending-crops/relabel`
+  (`app/api/scan.py`), gated on the same `_pending_submission` window
+  `/confirm` and `/discard` already use. A relabel re-runs `create_results()`
+  and `build_datagram()` so the counts stay correct, rewrites `result.json`,
+  and returns the same `{status, result, datagram}` shape `/submit` does, so
+  `ResultsViewer.jsx`'s pending screen just swaps in the new result rather
+  than re-fetching anything. Surfaced as a small gallery inside the pending
+  screen's existing breakdown panel — each captured object has a dropdown to
+  re-tap it to a different FM type (or back to `NON-FM`).
+
+  **Known limitation, not fixed here**: the S3 upload worker
+  (`s3_worker.py`, see `11 - data_folders_and_s3_upload.md`) sweeps
+  `output/`/`output_frame/` every 60s independent of whether a batch is
+  still pending, keyed by local filename with no rename-tracking. If a crop
+  is uploaded before it's reclassified, the rename leaves a stale orphan
+  object in S3 under the old name and a second upload under the new one —
+  local and S3 state diverge for that one file. Rare in practice (a
+  reclassify happens promptly, within the same short review window a
+  60-second sweep may or may not have already caught), but a real gap if it
+  does line up.
+
 ## Suggested future enhancements
 
 These are not yet built. Some originate from open questions raised during
