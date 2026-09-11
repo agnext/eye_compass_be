@@ -12,6 +12,20 @@ them alongside further enhancements worth considering but not yet done.
 ## Enhancements already made
 
 ### Backend
+- **Captured-object crops now have a 30px margin around the detection box,
+  not legacy's 10px.** Every saved crop (`scan_session.label_detection`/
+  `save_unselected`) is cut directly from the box in `self.pending`, which is
+  built by padding the model's raw detection box via `enlarge_bbox` before
+  it's ever stored — one enlarge, then a single slice, not crop-then-pad.
+  Legacy pads by exactly the same mechanism at the same call site
+  (`GrabImage.py:574-616`, `pad=10`), and the port matched that value
+  exactly until now. Reported live: crops were too tightly cropped around
+  the object to read clearly, especially on this device's touchscreen where
+  a technician is judging a small thumbnail. `enlarge_bbox(b, pad=30, ...)`
+  in `scan_session.py`'s `process_frame` — a deliberate deviation from
+  legacy's value, not a bug fix, and it also widens the tap-to-classify
+  overlay box shown live on the frozen frame (both draw from the same
+  padded list), which is an intended side effect, not a separate change.
 - **History's Re-sync has no legacy equivalent at all.** Legacy has no
   operator-facing way to force a resync — the only thing that ever re-sends
   a `sync_status='0'` record is the fully automatic

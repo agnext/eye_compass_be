@@ -313,8 +313,15 @@ class ScanSession:
                 return self._snapshot(fm_detected=False)
 
             # 2. Pad boxes the way emit_results does before anything downstream
-            #    sees them (main.py / GrabImage.py:577).
-            boxes = [enlarge_bbox(b, pad=10, img_w=w, img_h=h) for b in detections]
+            #    sees them (main.py / GrabImage.py:577) — legacy uses pad=10,
+            #    but the saved crops (label_detection/save_unselected cut
+            #    directly from this same padded box, see their own comments)
+            #    were reported as too tightly cropped to read clearly.
+            #    Widened to 30px on request — a deliberate deviation from
+            #    legacy's exact value, not a bug fix; see enhancements.md.
+            #    Also widens the tap-to-classify overlay box shown live on
+            #    the frozen frame, since both draw from this same list.
+            boxes = [enlarge_bbox(b, pad=30, img_w=w, img_h=h) for b in detections]
 
             # 3. Track, then take only ids we have never seen in this run.
             self.tracker.update(detections, self.frame_count, (h, w))
@@ -589,15 +596,16 @@ class ScanSession:
         before saving. Not a legacy feature (legacy has no reclassify path
         at all, live or at submit); see enhancements.md.
 
-        Ordered by file mtime, most recently captured first — not by name:
+        Ordered by file mtime, EARLIEST captured first (on request — Object 1
+        is the first object identified this scan, Object N the most recent;
+        see ReclassifyObjects.jsx's own objectNumberById) — not by name:
         relabel_crop renames the file (new FM-type prefix), and a plain
         alphabetical `sorted(os.listdir(...))` would then reshuffle that
         crop to wherever its new name happens to sort — confirmed live,
         reported as objects visibly changing position on every reclassify.
         os.rename() does not touch a file's mtime (only its ctime), so
         sorting by mtime keeps every crop in its original capture order
-        (latest-first, on request) regardless of how many times it's since
-        been renamed.
+        regardless of how many times it's since been renamed.
         """
         with self._lock:
             folder = self.output_folder
@@ -620,7 +628,7 @@ class ScanSession:
                     "data_uri": f"data:image/{mime};base64,{data}",
                     "_mtime": os.path.getmtime(path),
                 })
-            crops.sort(key=lambda c: c["_mtime"], reverse=True)
+            crops.sort(key=lambda c: c["_mtime"])
             for crop in crops:
                 del crop["_mtime"]
             return crops
