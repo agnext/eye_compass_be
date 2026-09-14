@@ -82,6 +82,46 @@ them alongside further enhancements worth considering but not yet done.
   `"dummy_offline_token"` for an offline login, which nothing downstream could
   actually authenticate with. The backend issues a real session token
   (`SessionStore`, 45-day TTL) for both the online and offline login paths.
+- **The live `total_fo_detected` no longer counts detections that were
+  suppressed from operator review.** Legacy's `handle_detection`
+  (`main.py:2618-2622`) adds every new tracker id to `existing_track_ids`
+  whether or not `has_similar_x_axis` decided it was the same physical object
+  already awaiting a label — so a re-identified duplicate inflates the count
+  as if it were a second object, and one that is never photographed, since
+  crops are only written for items that reach `self.pending`. `scan_session`
+  now keeps a second set, `counted_track_ids`, holding only ids actually
+  queued for review, and the live count reports that instead.
+  `existing_track_ids` is still accumulated unchanged, purely to keep a
+  suppressed duplicate from being re-evaluated on every subsequent frame.
+  Requested directly after the mismatch was noticed on screen. Note this only
+  moves the **live, in-progress** number shown during a scan: the saved
+  result's `total_fo_detected` is computed by `create_results()` counting crop
+  *files* on disk, which never included suppressed detections in the first
+  place. An earlier attempt at this was reverted (see
+  `9 - post_remediation_session_log.md` §7b) to preserve legacy parity for the
+  Qualix datagram — that reasoning still applies to the saved figure, which is
+  unchanged here.
+- **The reclassify endpoint is serialized against itself and against Save.**
+  `POST /api/scan/pending-crops/relabel` renames one crop, then re-counts the
+  entire batch folder and overwrites the module-level `_pending_submission`
+  with what it measured. Only the rename was locked. FastAPI runs plain `def`
+  endpoints on a threadpool, and the reclassify screen fires one request per
+  staged change (≈20 within a few seconds in a real batch), so a request that
+  measured the folder *before* a sibling's rename landed could finish last and
+  write its stale totals over the fresher ones — and whatever sits in that
+  slot when the operator presses Save is exactly what is persisted and synced
+  to Qualix. Reproduced with a threaded harness against the unlocked code (4
+  of 12 runs persisted counts that disagreed with the folder, e.g. a phantom
+  `FM: 1` alongside `Husk: 7` where disk held `Husk: 8`); 12 of 12 clean once
+  locked. Note this is a *latent* bug — it is NOT what corrupted batch
+  `milind4550` (see the `create_results` double-count in
+  `9 - post_remediation_session_log.md`), since a pure rename cannot change
+  the file total the way that record's did. A module-level
+  `_pending_lock` now spans the whole rename → recount → publish cycle, and
+  `/submit`, `/confirm`, `/discard` and `/pending-crops` take it too, so Save
+  waits for an in-flight reclassify instead of persisting a half-applied one.
+  Not a legacy concern at all — legacy has no reclassify path and is
+  single-threaded Qt.
 
 ### Frontend
 - **The live-scan page's in-app Back button is not shown at all for the

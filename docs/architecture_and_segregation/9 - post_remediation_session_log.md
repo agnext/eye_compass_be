@@ -669,3 +669,57 @@ JET-colormap-tinted background are both intentional, matching legacy exactly
 `xai_optimized.py`): a strongly-colored blob at a detection means high
 confidence; the red-dominant background is JET's "low activation" end,
 correctly recolored across the whole frame, not a residual color bug.
+
+## 7k. `create_results` counted every FM crop twice (wrong totals saved AND synced)
+
+Found from the History → record-view screen: batch `milind4550` showed
+`Total FO: 247` beside a gallery captioned `Captured objects (245)`. Both
+numbers are derived, and they disagreed by exactly 2.
+
+The stored record claims `FM: 4`; the batch folder holds exactly 2
+`FM_*.png` crops. Every other one of the 12 categories matched its file
+count exactly.
+
+`create_results` (`scan_session.py`) builds its match list as:
+
+```python
+params = list(self.analysis_parameters) + ["FM", "NON-FM"]
+```
+
+and then, for each file, increments `counter[key]` for every `key` in
+`params` the filename's stem starts with. **Most commodities already carry
+`"FM"` in their own analysis vocabulary** — Urad White's is `['Others',
+'Blower FO', 'Magnetic FO', 'Husk', 'FM', 'Metal Fragments', ...]` — so the
+hardcoded `+ ["FM", ...]` puts `"FM"` in the list **twice**, and with no
+`break` in the inner loop each FM crop is counted once per occurrence.
+2 crops × 2 = the stored `FM: 4`, and since `total_fo_detected` is summed
+straight from these values, 245 real crops became the stored 247. Replaying
+the exact pre-fix logic over that folder reproduces `FM: 4`/`total: 247`
+deterministically; the fixed version yields `FM: 2`/`total: 245`.
+
+**This is a porting bug, not legacy behavior.** Legacy does not iterate a
+list — it builds a dict first (`main.py:1443`):
+
+```python
+filename_mapping = {param: param.replace(" ", "_") for param in analysis_parameters}
+...
+for key, mapped_value in filename_mapping.items():
+    if file_name.startswith(key):
+        counter[key] += 1
+```
+
+A dict comprehension silently collapses the duplicate `"FM"` to one key, so
+legacy matches it once. The port swapped that dict for a plain list and
+reintroduced the duplicate. Fixed by deduplicating while preserving order
+(`dict.fromkeys(...)`), which restores legacy's own semantics exactly rather
+than changing them. The missing `break` is deliberately left as-is: legacy
+has no break either, so a genuine prefix-collision pair would double-count
+there too — no commodity's vocabulary currently contains such a pair.
+
+**Scope of the damage.** This affected the saved `result`/`total_fo_detected`
+for every batch that captured at least one crop labelled with the generic
+`FM` type, on any commodity whose vocabulary also lists `FM` — and those
+inflated numbers went into the Qualix datagram, so they were *synced*, not
+just displayed. Already-stored rows are not retroactively corrected by this
+fix; they keep the inflated values until someone decides whether to
+recompute and re-deliver them.

@@ -31,6 +31,7 @@ requested over the earlier one-step version.
 import json
 import logging
 import os
+import threading
 import time
 from typing import List, Optional
 
@@ -55,6 +56,20 @@ router = APIRouter()
 # slot: this machine has one operator and one active scan at a time, same
 # assumption scan_session itself already makes.
 _pending_submission: dict | None = None
+
+# Guards the whole read-modify-write cycle on _pending_submission, not just the
+# assignment. FastAPI runs plain `def` endpoints on a threadpool, so several
+# /pending-crops/relabel calls genuinely execute in parallel — the reclassify
+# screen fires one per staged change, ~20 within a few seconds in a real
+# observed batch. Each call renames its crop (scan_session.relabel_crop takes
+# the session lock for that part) and then RE-COUNTS THE WHOLE FOLDER and
+# overwrites this global with the totals it just measured. Without a lock
+# spanning both halves, a request that measured the folder before a sibling's
+# rename landed can finish last and write its now-stale counts over the
+# sibling's fresher ones — and whatever is in this slot at /confirm is exactly
+# what gets persisted and synced to Qualix. Confirmed live: batch milind4550's
+# stored result claims FM: 4 while its folder holds only 2 FM-prefixed crops.
+_pending_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +356,19 @@ def submit_scan(
         surveyor_name=req.surveyor_name,
     )
 
-    _pending_submission = {
-        "result_payload": result_payload,
-        "datagram": datagram,
-        "commodity": status_before.get("commodity", ""),
-        "variety": status_before.get("variety", ""),
-        # Kept only so a reclassify (see /pending-crops/relabel below) can
-        # rebuild the datagram exactly the way this endpoint just did,
-        # without the frontend having to resend anything.
-        "batch": batch,
-        "status_before": status_before,
-        "surveyor_name": req.surveyor_name,
-    }
+    with _pending_lock:
+        _pending_submission = {
+            "result_payload": result_payload,
+            "datagram": datagram,
+            "commodity": status_before.get("commodity", ""),
+            "variety": status_before.get("variety", ""),
+            # Kept only so a reclassify (see /pending-crops/relabel below) can
+            # rebuild the datagram exactly the way this endpoint just did,
+            # without the frontend having to resend anything.
+            "batch": batch,
+            "status_before": status_before,
+            "surveyor_name": req.surveyor_name,
+        }
 
     return {
         "status": "success",
@@ -371,9 +387,10 @@ def list_pending_crops():
     to the specific window between Submit and Confirm/Discard, not to some
     unrelated leftover folder.
     """
-    if _pending_submission is None:
-        raise HTTPException(status_code=409, detail="Nothing pending to show crops for")
-    return {"crops": scan_session.list_pending_crops()}
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(status_code=409, detail="Nothing pending to show crops for")
+        return {"crops": scan_session.list_pending_crops()}
 
 
 @router.post("/pending-crops/relabel")
@@ -383,54 +400,61 @@ def relabel_pending_crop(req: RelabelCropRequest, db: Session = Depends(get_db))
     enhancements.md). Renames the file, then recounts and rebuilds the same
     result/datagram shape /submit returned, so the frontend can just replace
     its local copy of both with this response.
+
+    The rename, the recount and the _pending_submission update all happen
+    under _pending_lock as ONE atomic step — see that lock's own comment for
+    the race this closes. list_pending_crops() is inside it too, so the crop
+    list returned to the screen can't describe a folder state older than the
+    counts returned alongside it.
     """
     global _pending_submission
 
-    if _pending_submission is None:
-        raise HTTPException(status_code=409, detail="Nothing pending to reclassify")
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(status_code=409, detail="Nothing pending to reclassify")
 
-    try:
-        scan_session.relabel_crop(req.name, req.fm_name)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        try:
+            scan_session.relabel_crop(req.name, req.fm_name)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
-    pending = _pending_submission
-    prev_result = pending["result_payload"]["result"]
-    blower = prev_result.get("Blower FO", 0)
-    magnetic = prev_result.get("Magnetic FO", 0)
+        pending = _pending_submission
+        prev_result = pending["result_payload"]["result"]
+        blower = prev_result.get("Blower FO", 0)
+        magnetic = prev_result.get("Magnetic FO", 0)
 
-    new_data = scan_session.create_results(blower, magnetic)
-    total = sum(v for v in new_data.values() if isinstance(v, int))
+        new_data = scan_session.create_results(blower, magnetic)
+        total = sum(v for v in new_data.values() if isinstance(v, int))
 
-    result_payload = dict(pending["result_payload"])
-    result_payload["result"] = new_data
-    result_payload["total_fo_detected"] = total
+        result_payload = dict(pending["result_payload"])
+        result_payload["result"] = new_data
+        result_payload["total_fo_detected"] = total
 
-    try:
-        os.makedirs(scan_session.output_folder, exist_ok=True)
-        with open(os.path.join(scan_session.output_folder, "result.json"), "w") as fh:
-            json.dump(result_payload, fh, indent=4)
-    except Exception as exc:
-        logger.error("Could not rewrite result.json after reclassify: %s", exc)
+        try:
+            os.makedirs(scan_session.output_folder, exist_ok=True)
+            with open(os.path.join(scan_session.output_folder, "result.json"), "w") as fh:
+                json.dump(result_payload, fh, indent=4)
+        except Exception as exc:
+            logger.error("Could not rewrite result.json after reclassify: %s", exc)
 
-    datagram = build_datagram(
-        db,
-        session_status=pending["status_before"],
-        result_payload=result_payload,
-        batch=pending["batch"],
-        surveyor_name=pending["surveyor_name"],
-    )
+        datagram = build_datagram(
+            db,
+            session_status=pending["status_before"],
+            result_payload=result_payload,
+            batch=pending["batch"],
+            surveyor_name=pending["surveyor_name"],
+        )
 
-    _pending_submission = {**pending, "result_payload": result_payload, "datagram": datagram}
+        _pending_submission = {**pending, "result_payload": result_payload, "datagram": datagram}
 
-    return {
-        "status": "success",
-        "result": result_payload,
-        "datagram": datagram,
-        "crops": scan_session.list_pending_crops(),
-    }
+        return {
+            "status": "success",
+            "result": result_payload,
+            "datagram": datagram,
+            "crops": scan_session.list_pending_crops(),
+        }
 
 
 @router.post("/confirm")
@@ -446,13 +470,18 @@ def confirm_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
     """
     global _pending_submission
 
-    if _pending_submission is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Nothing to confirm — submit a result first.",
-        )
-    pending = _pending_submission
-    _pending_submission = None
+    # Under the lock so a reclassify still in flight can't be persisted
+    # half-applied: the Save click follows the last relabel by milliseconds,
+    # and this is the read whose result actually reaches the database and
+    # Qualix. Taking it here makes Save wait for that relabel to land.
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to confirm — submit a result first.",
+            )
+        pending = _pending_submission
+        _pending_submission = None
 
     result_payload = pending["result_payload"]
     datagram = pending["datagram"]
@@ -484,11 +513,13 @@ def discard_pending():
     """
     global _pending_submission
 
-    if _pending_submission is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Nothing to discard — submit a result first.",
-        )
-    _pending_submission = None
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to discard — submit a result first.",
+            )
+        _pending_submission = None
+
     result = scan_session.cancel()
     return {"success": True, **result}

@@ -76,8 +76,21 @@ class ScanSession:
         self.frame_count = 0
         self.saved_frame_count = 0
 
-        # Cumulative unique detections for the whole run (legacy existing_track_ids).
+        # Cumulative unique detections for the whole run (legacy existing_track_ids)
+        # — used only to dedupe the tracker's own ids frame to frame, so an
+        # x-axis-suppressed duplicate isn't re-evaluated (and re-logged) on
+        # every subsequent frame while it's still under the camera.
         self.existing_track_ids = set()
+        # Cumulative ids actually queued for operator review (a strict subset
+        # of existing_track_ids) — this, not existing_track_ids, is what
+        # total_fo_detected counts. Deliberate deviation from legacy on
+        # request: legacy's handle_detection (main.py:2618-2622) counts every
+        # new track id whether or not has_similar_x_axis suppressed it from
+        # review, which double-counts a duplicate detection of the same
+        # physical object as if it were a second one — never photographed,
+        # since save_unselected/label_detection only ever act on self.pending.
+        # See enhancements.md.
+        self.counted_track_ids = set()
         self.tracker = ObjectTracker(x_tolerance=10)
         self.tracker.update([[0, 0, 0, 0, 0, 0]], 0, (1200, 1920))
 
@@ -344,18 +357,19 @@ class ScanSession:
             if new_ids and not self._has_similar_x_axis(boxes, x_threshold=10):
                 fm_detected = True
                 self._on_foreign_matter(frame, boxes)
+                # Only ids actually queued for review count toward
+                # total_fo_detected — see counted_track_ids' comment above.
+                self.counted_track_ids.update(new_ids)
             elif new_ids:
                 logger.info(
                     "FM detected but not queued for review (similar x-axis "
                     "already pending): %s", new_ids
                 )
 
-            # Accumulate every new id, queued for review or not — exactly as
-            # legacy's handle_detection does (main.py:2618-2622), because
-            # total_fo_detected feeds the Qualix datagram and has to stay
-            # comparable with what legacy reports for the same material.
-            # has_similar_x_axis only decides whether the operator is asked to
-            # classify it, not whether it was a real object.
+            # existing_track_ids still accumulates every new id regardless
+            # (queued or suppressed) — purely so a suppressed duplicate isn't
+            # treated as "new" again on the very next frame while the same
+            # physical object is still under the camera.
             self.existing_track_ids.update(track_ids)
 
             return self._snapshot(fm_detected=fm_detected)
@@ -546,8 +560,28 @@ class ScanSession:
 
     def create_results(self, blower_fo: int, magnetic_fo: int) -> Dict[str, int]:
         """Count saved crops by filename prefix. Port of create_results
-        (main.py:1372-1452)."""
-        params = list(self.analysis_parameters) + ["FM", "NON-FM"]
+        (main.py:1372-1452).
+
+        dict.fromkeys, not a plain list: legacy iterates
+        `filename_mapping.items()`, a DICT comprehension over
+        `analysis_parameters` (main.py:1443-1457), so a name appearing twice
+        in that list collapses to one key and is matched once. This port
+        originally iterated the list itself, and since most commodities
+        already carry "FM" in their own analysis vocabulary, the hardcoded
+        + ["FM", ...] below made "FM" appear twice — counting every
+        FM-prefixed crop twice, inflating both that row and total_fo_detected
+        (which is summed from these values) in the saved record AND in the
+        Qualix datagram. Confirmed on batch milind4550: 2 FM crops on disk
+        stored as "FM": 4, total 247 against 245 real crops. Restores legacy's
+        own behavior rather than changing it.
+
+        The inner loop deliberately does NOT break on first match, matching
+        legacy exactly: if one param were a prefix of another, legacy counts
+        the file under both. No commodity's vocabulary currently has such a
+        pair, so this is theoretical — but it is legacy's semantics, so it is
+        left alone.
+        """
+        params = list(dict.fromkeys(list(self.analysis_parameters) + ["FM", "NON-FM"]))
         counter = Counter()
 
         if os.path.isdir(self.output_folder):
@@ -731,8 +765,10 @@ class ScanSession:
 
             self.active = False
             logger.info(
-                "Scan finished: sample=%s total_fo=%s unique_tracks=%s",
-                self.sample_id, total, len(self.existing_track_ids),
+                "Scan finished: sample=%s total_fo=%s reviewed_tracks=%s "
+                "unique_tracks=%s",
+                self.sample_id, total,
+                len(self.counted_track_ids), len(self.existing_track_ids),
             )
             return result_dict
 
@@ -759,7 +795,7 @@ class ScanSession:
             # total_fo_detected below, which legacy only ever uses for the
             # final saved result/looker_data, never shown on this label.
             "frame_fm_count": len(self.pending),
-            "total_fo_detected": len(self.existing_track_ids),
+            "total_fo_detected": len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "machine_start_locked": conveyor_service.machine_start_locked,
             "capture_paused": self.capture_paused,
@@ -784,7 +820,7 @@ class ScanSession:
             "start_time": self.start_time,
             "image_unique_id": self.folder_name,
             "output_folder": self.output_folder,
-            "total_fo_detected": len(self.existing_track_ids),
+            "total_fo_detected": len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "conveyor_stop_count": dict(self.conveyor_stop_count),
             "machine_start_locked": conveyor_service.machine_start_locked,

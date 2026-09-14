@@ -26,7 +26,7 @@ from app.services.sync_service import sync_service
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-SYNC_LABELS = {"1": "Synced", "2": "Rejected", "0": "Pending"}
+SYNC_LABELS = {"1": "Synced", "2": "Sync Failed", "0": "Pending"}
 
 
 def _strip_trailing_numeric_tokens(stem: str) -> list:
@@ -78,21 +78,18 @@ def get_history(
 ):
     """Paged history.
 
-    Sort order matches legacy's populate_history_table (main.py:2100):
-    `sorted(list_of_lists, key=itemgetter(1, 2), reverse=True)`, where indexes
-    1 and 2 of that row tuple are Commodity and Receiving Date — i.e. sorted
-    by commodity name descending, then receiving date descending WITHIN each
-    commodity, as plain strings (not parsed as dates, same as legacy). Not
-    "most recent first" despite how that might read — confirmed against a
-    real legacy screenshot where rows were grouped/ordered by commodity name,
-    not by scan recency. (Briefly changed to sort by scan date/start_time
-    instead, then reverted back to this exact legacy match on request.)
+    Sorted latest-first by scan date/start_time (r.date, r.start_time — both
+    plain strings but written as "%Y-%m-%d"/"%H:%M:%S" by database_service.py,
+    so a string sort is chronological). This deviates from legacy's
+    populate_history_table (main.py:2100), which grouped rows by commodity
+    name (then receiving date) instead of scan recency — changed back to
+    latest-first on request.
     """
     try:
         rows = db.query(Result).all()
         summaries = [_row_to_summary(r) for r in rows]
         summaries.sort(
-            key=lambda s: (s["commodity"] or "", s["receiving_date"] or ""),
+            key=lambda s: (s["date"] or "", s["start_time"] or ""),
             reverse=True,
         )
         total = len(summaries)
@@ -148,13 +145,17 @@ def get_result_detail(result_id: int, db: Session = Depends(get_db)):
 def get_result_images(
     result_id: int,
     db: Session = Depends(get_db),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     item: str | None = Query(None),
 ):
     """The saved FO crops for a past scan.
 
-    Legacy paged through these with previous/next buttons (main.py:2204-2277).
+    The frontend's gallery is a single scrollable grid now (not legacy's
+    paged previous/next viewer), so it requests every crop in one call — the
+    le cap here just needs to comfortably exceed any real scan's crop count,
+    not stay small. Legacy paged through these with previous/next buttons
+    (main.py:2204-2277).
     Images are returned inline as data URIs so the browser needs no separate
     static mount, and the path is resolved from the stored image_unique_id
     rather than accepting one from the client.
