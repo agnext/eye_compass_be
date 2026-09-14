@@ -723,3 +723,63 @@ inflated numbers went into the Qualix datagram, so they were *synced*, not
 just displayed. Already-stored rows are not retroactively corrected by this
 fix; they keep the inflated values until someone decides whether to
 recompute and re-deliver them.
+
+## 7l. Every saved crop and raw frame had red and blue transposed
+
+Reported from the History → record-view gallery: the captured-object crops
+looked like XAI heatmaps rather than photographs — a red/brown field with
+blue blobs, which reads exactly like a JET colormap. Nothing from the XAI
+path was actually leaking into the gallery; the crops were simply being
+written with their red and blue channels swapped. The belt is a blue
+food-grade belt and the objects are cream/tan, so transposing R and B turns
+the belt brown and the grains blue, which is what made it look like a
+heatmap.
+
+Both codebases debayer identically — `cv2.COLOR_BAYER_RG2RGB`, legacy at
+`GrabImage.py:45`, this port at `camera_service.py:230`. Call that array
+`B`. Legacy then swaps the channels a **second** time before anything
+downstream sees the frame (`GrabImage.py:308`,
+`image_rgb = cv2.cvtColor(pic, cv2.COLOR_BGR2RGB)`), and it is that `img`
+copy which `emit_results` hands to the crop/save path and which the global
+`image` used by the XAI view points at. So:
+
+| | legacy | port (before) | port (after) |
+|---|---|---|---|
+| array reaching the save path | `S(B)` | `B` | `B` |
+| conversion at write time | `BGR2RGB` | `BGR2RGB` | none |
+| net | identity → `B` as BGR ✓ | one swap ✗ | identity → `B` as BGR ✓ |
+
+The port has no equivalent of that `GrabImage.py:308` conversion, so copying
+legacy's write-time conversion literally (`main.py:1361` for crops,
+`main.py:2464` for raw frames) left exactly one uncancelled swap. Dropping
+it at the three save sites in `scan_session.py` (`label_detection`,
+`save_unselected`, `save_raw_frame`) restores legacy's **net** behavior
+rather than changing it — see `_COLOR_ORDER_NOTE` at the top of that file.
+
+Verified three ways: legacy's own `output/` crops show a blue belt with
+cream rice grains; R/B-swapping one of this port's crops reproduces exactly
+that; and re-running the fixed save path over a recovered frame produces the
+blue belt/tan object directly.
+
+The live view was never affected and needed no change — `camera.py`'s
+`encode_display` hands the frame straight to `cv2.imencode` with no
+conversion, which is already the correct `B`-as-BGR reading. That is also
+why the discrepancy went unnoticed: the operator's screen was right while
+the files on disk were not.
+
+**The XAI view had the same defect, from the same misconception.**
+`xai.py` was converting `pending_frame` with `COLOR_RGB2BGR` before building
+the heatmap. Legacy hands its own array to Qt, whose `QImage` reads it as
+RGB; this port hands it to `cv2.imencode`, which reads it as BGR — so the
+photograph *underneath* the heatmap was swapped, while the JET colormap
+itself (produced by `applyColorMap` in OpenCV's own BGR order) came out
+correct. That combination is why §7j's earlier review concluded the
+red-dominant background was legitimate JET output: the colormap was right,
+but the belt beneath it was brown instead of blue and reinforced the
+impression. Now blended onto an unconverted `.copy()` — the copy also
+matters on its own, since `build_confidence_heatmap` blends into the array
+it is given, and passing `pending_frame` itself would burn the heatmap into
+the very frame every later crop is cut from.
+
+Already-saved crops are not rewritten by this fix; existing batches keep
+their swapped colors on disk and in S3.

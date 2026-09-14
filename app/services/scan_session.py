@@ -47,6 +47,32 @@ from app.services.sort import ObjectTracker
 
 logger = logging.getLogger(__name__)
 
+# _COLOR_ORDER_NOTE — why the three save sites below write their frame/crop
+# as-is, dropping the cv2.COLOR_BGR2RGB conversion legacy applies at each of
+# its own (main.py:1361 submit_fm_type, main.py:2464 save_raw_image).
+#
+# Both pipelines debayer identically: cv2.COLOR_BAYER_RG2RGB, legacy at
+# GrabImage.py:45, this port at camera_service.py:230. But legacy then swaps
+# the channels a SECOND time before anything downstream sees the frame —
+# GrabImage.py:308's `image_rgb = cv2.cvtColor(pic, cv2.COLOR_BGR2RGB)`,
+# whose `img` copy is what emit_results hands to the crop/save path. So
+# legacy's saved files net TWO swaps (an identity), while this port, which
+# has no equivalent of that 308 conversion, netted only ONE — writing every
+# crop and raw frame with red and blue transposed.
+#
+# Visible as a JET-heatmap look that got mistaken for the XAI view leaking
+# into the gallery: the blue food-grade belt saved as brown, cream/tan
+# objects as blue. Confirmed against legacy's own output/ crops (a blue belt
+# with cream rice grains) and by R/B-swapping one of this port's crops, which
+# reproduces exactly that.
+#
+# Dropping the conversion here restores legacy's NET behavior rather than
+# changing it, and makes a saved crop match what the operator already sees
+# live — the stream encodes the same frame with no conversion either
+# (camera.py's encode_display), which is why the live view was always right
+# while the files were not. Inference is unaffected: it runs on the
+# unconverted frame in both codebases.
+
 
 def _slug(value: str) -> str:
     return (value or "").strip().lower().replace(" ", "_")
@@ -266,8 +292,10 @@ class ScanSession:
         """
         try:
             path = os.path.join(self.output_frame_folder, f"r_frame_{self.saved_frame_count}.jpg")
+            # As-is, not through legacy's cv2.COLOR_BGR2RGB (main.py:2464) —
+            # see _COLOR_ORDER_NOTE.
             encoded = cv2.imencode(
-                ".jpg", cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 95]
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
             )[1]
             with open(path, "wb") as fh:
                 fh.write(encoded.tobytes())
@@ -467,8 +495,11 @@ class ScanSession:
             # so this extra token doesn't need any matching change there.
             filename = f"{safe_name}_{time.time_ns()}_{index}.png"
             path = os.path.join(self.output_folder, filename)
-            # Legacy writes the crop through a BGR->RGB conversion (main.py:1361).
-            cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            # Written as-is, NOT through the cv2.COLOR_BGR2RGB conversion
+            # legacy's submit_fm_type applies (main.py:1361) — see
+            # _COLOR_ORDER_NOTE above for why copying that line literally
+            # swapped red and blue in every saved crop.
+            cv2.imwrite(path, crop)
 
             self.labelled_indices.add(index)
             logger.info("Labelled detection %s as %r -> %s", index, fm_name, filename)
@@ -498,7 +529,8 @@ class ScanSession:
                 path = os.path.join(
                     self.output_folder, f"NON-FM_{time.time_ns()}_{item['index']}.png"
                 )
-                cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                # As-is, same as label_detection — see _COLOR_ORDER_NOTE.
+                cv2.imwrite(path, crop)
                 saved += 1
             return saved
 

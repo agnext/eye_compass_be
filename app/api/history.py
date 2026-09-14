@@ -26,7 +26,13 @@ from app.services.sync_service import sync_service
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-SYNC_LABELS = {"1": "Synced", "2": "Sync Failed", "0": "Pending"}
+# '2' means Qualix rejected the payload outright (HTTP 400) — a permanent,
+# data-shaped failure, not a transient one. Legacy's own retry worker only
+# ever queries sync_status == '0' (main.py:2891's get_unsynced_records), so
+# legacy never retried a '2' either; resending the exact same bytes would
+# just get rejected again. Labeled "Rejected" rather than "Sync Failed" (on
+# request) so it doesn't read as something a retry could fix.
+SYNC_LABELS = {"1": "Synced", "2": "Rejected", "0": "Pending"}
 
 
 def _strip_trailing_numeric_tokens(stem: str) -> list:
