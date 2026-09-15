@@ -357,12 +357,18 @@ class ScanSession:
             #    sees them (main.py / GrabImage.py:577) — legacy uses pad=10,
             #    but the saved crops (label_detection/save_unselected cut
             #    directly from this same padded box, see their own comments)
-            #    were reported as too tightly cropped to read clearly.
-            #    Widened to 30px on request — a deliberate deviation from
-            #    legacy's exact value, not a bug fix; see enhancements.md.
-            #    Also widens the tap-to-classify overlay box shown live on
-            #    the frozen frame, since both draw from this same list.
-            boxes = [enlarge_bbox(b, pad=30, img_w=w, img_h=h) for b in detections]
+            #    were reported as too tightly cropped to read clearly, so this
+            #    was widened to 30. At 30 the object turned out to fill only
+            #    about a third of its own crop — a ~30px object in a ~90px
+            #    image, the rest belt — making it small and hard to read in
+            #    the preview. Settled at 20 on request: a deliberate deviation
+            #    from legacy's value in either direction, not a bug fix; see
+            #    enhancements.md. Note this is the ONLY lever on apparent crop
+            #    clarity — the object is only ~30-55 real sensor pixels, so
+            #    less padding makes it render bigger, never sharper.
+            #    Also sets the tap-to-classify overlay box shown live on the
+            #    frozen frame, since both draw from this same list.
+            boxes = [enlarge_bbox(b, pad=20, img_w=w, img_h=h) for b in detections]
 
             # 3. Track, then take only ids we have never seen in this run.
             self.tracker.update(detections, self.frame_count, (h, w))

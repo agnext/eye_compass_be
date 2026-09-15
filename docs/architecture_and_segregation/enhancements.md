@@ -12,20 +12,33 @@ them alongside further enhancements worth considering but not yet done.
 ## Enhancements already made
 
 ### Backend
-- **Captured-object crops now have a 30px margin around the detection box,
+- **Captured-object crops now have a 20px margin around the detection box,
   not legacy's 10px.** Every saved crop (`scan_session.label_detection`/
   `save_unselected`) is cut directly from the box in `self.pending`, which is
   built by padding the model's raw detection box via `enlarge_bbox` before
   it's ever stored — one enlarge, then a single slice, not crop-then-pad.
   Legacy pads by exactly the same mechanism at the same call site
   (`GrabImage.py:574-616`, `pad=10`), and the port matched that value
-  exactly until now. Reported live: crops were too tightly cropped around
-  the object to read clearly, especially on this device's touchscreen where
-  a technician is judging a small thumbnail. `enlarge_bbox(b, pad=30, ...)`
-  in `scan_session.py`'s `process_frame` — a deliberate deviation from
-  legacy's value, not a bug fix, and it also widens the tap-to-classify
-  overlay box shown live on the frozen frame (both draw from the same
-  padded list), which is an intended side effect, not a separate change.
+  exactly until this was first raised: crops were reported as too tightly
+  cropped around the object to read clearly, especially on this device's
+  touchscreen where a technician is judging a small thumbnail, and it went
+  to 30. That overshot — measured on a real batch, a 30px pad left the
+  object filling only about a third of its own crop (a ~30px object in a
+  ~90px image, the rest bare belt), so it rendered small in the preview.
+  Settled at 20 on request. `enlarge_bbox(b, pad=20, ...)` in
+  `scan_session.py`'s `process_frame` — a deliberate deviation from legacy's
+  value, not a bug fix, and it also sets the tap-to-classify overlay box
+  shown live on the frozen frame (both draw from the same padded list),
+  which is an intended side effect, not a separate change.
+
+  Worth recording for the next time crop legibility comes up: **padding is
+  the only software lever on it.** The objects are ~30-55 real sensor pixels
+  in a 1920x1200 frame, so less padding makes an object render *bigger*, never
+  sharper. Upscaling the crop at save time was tried and measured against a
+  browser's own stretch of the same file — the two are visually
+  indistinguishable, so it was not adopted (it would have inflated every
+  stored crop ~9x for no visible gain). Anything beyond this needs more
+  optical resolution, not code.
 - **History's Re-sync has no legacy equivalent at all.** Legacy has no
   operator-facing way to force a resync — the only thing that ever re-sends
   a `sync_status='0'` record is the fully automatic
@@ -73,6 +86,20 @@ them alongside further enhancements worth considering but not yet done.
   blocked, an expected operating state) and `502` (real failure) with a
   message, so the frontend can show the operator what actually happened
   instead of a generic error or nothing.
+- **Data Collection's page shows a live camera preview immediately, not only
+  once recording starts.** Legacy only ever emits a preview frame from inside
+  `CollectionCameraThread.run()` (`GrabImage.py:733-826`), i.e. between
+  `start_dc`/`capture_image_dc` and `stop_dc` — the port matched that
+  exactly at first, so arriving at the page showed a grey placeholder until
+  Start was pressed. Reported as looking like a broken/frozen camera, not
+  "recording hasn't started yet" (worth noting: it wasn't actually a bug at
+  the time — this doc's own earlier text said so — just an unhelpful piece
+  of legacy fidelity). `data_collection_stream` (`app/api/camera.py`) now
+  grabs and sends a frame on every loop iteration regardless of
+  `_dc_recording`; only the disk write (the actual "data collection" part)
+  stays gated on it, matching Dashboard's own live-scan page
+  (`/ws/camera/stream`), which never had this restriction. A deliberate
+  deviation from legacy, not a bug fix.
 - **Data Collection's finish step cleans up unconditionally.** Legacy's
   `submit_dc`/`back_from_dc` just navigate away — if the operator forgot to
   press Stop first, the frame-recording thread and the belt both keep running

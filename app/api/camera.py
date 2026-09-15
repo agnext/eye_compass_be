@@ -325,13 +325,19 @@ async def camera_stream(websocket: WebSocket):
 
 @ws_router.websocket("/ws/data_collection/stream")
 async def data_collection_stream(websocket: WebSocket):
-    """Raw preview for the Data Collection page — no inference, no scan_session.
+    """Live preview for the Data Collection page — no inference, no scan_session.
 
-    Sends a frame only while recording is on, matching legacy: dc_image_update
-    is only ever emitted from inside CollectionCameraThread.run() (GrabImage.py:
-    733-826), which only runs between start_dc/capture_image_dc and stop_dc. The
-    UI shows a blank/placeholder view the rest of the time — that is not a bug,
-    it is what the legacy page actually did.
+    Legacy only ever emitted a preview frame from inside CollectionCameraThread.run()
+    (GrabImage.py:733-826), i.e. only while recording, and this port matched that
+    exactly at first. Changed on request: arriving at the page showed a grey
+    placeholder until Start was pressed, which read as a broken/frozen camera
+    rather than "recording hasn't started yet" — legacy's own live-scan page
+    (Dashboard, /ws/camera/stream) shows its feed immediately for the same
+    reason. A deliberate deviation from legacy, not a bug fix.
+
+    A frame is now grabbed and sent on every iteration regardless of
+    `_dc_recording`; only the disk write (the actual "data collection" part)
+    stays gated on it, unchanged from before.
     """
     global _dc_frame_count
 
@@ -349,11 +355,7 @@ async def data_collection_stream(websocket: WebSocket):
 
     try:
         while True:
-            if not _dc_recording:
-                await asyncio.sleep(0.1)
-                continue
-
-            def grab_and_save():
+            def grab_and_maybe_save():
                 with _hardware_lock:
                     frame = _camera.grab_frame()
                 if frame is None or not _dc_recording or not _dc_folder:
@@ -366,13 +368,14 @@ async def data_collection_stream(websocket: WebSocket):
                 cv2.imwrite(os.path.join(_dc_folder, filename), frame)
                 return frame
 
-            frame = await loop.run_in_executor(_hw_executor, grab_and_save)
+            frame = await loop.run_in_executor(_hw_executor, grab_and_maybe_save)
             if frame is None:
                 await asyncio.sleep(0.02)
                 continue
 
-            with _dc_lock:
-                _dc_frame_count += 1
+            if _dc_recording:
+                with _dc_lock:
+                    _dc_frame_count += 1
 
             ok, buffer = cv2.imencode(".jpg", frame, encode_params)
             if not ok:
@@ -380,7 +383,7 @@ async def data_collection_stream(websocket: WebSocket):
             await websocket.send_json({
                 "frame": base64.b64encode(buffer).decode("utf-8"),
                 "frame_count": _dc_frame_count,
-                "recording": True,
+                "recording": _dc_recording,
             })
             await asyncio.sleep(1.0 / max(1, settings.STREAM_FPS))
 
