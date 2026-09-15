@@ -783,3 +783,43 @@ the very frame every later crop is cut from.
 
 Already-saved crops are not rewritten by this fix; existing batches keep
 their swapped colors on disk and in S3.
+
+## 7m. The captured-object preview modal appeared to "blink" and Preview seemed dead
+
+Reported directly: double-tapping a thumbnail on ReclassifyObjects.jsx made
+the enlarged preview flash open and immediately close again, and the
+"Preview" button (jump-to-object-number) seemed to do nothing at all.
+
+The preview *was* opening correctly both times — it was being closed again
+instantly. The modal's backdrop (`reclassify-preview-overlay`/
+`results-preview-overlay`) covers the whole screen the moment it renders
+and closes the preview on any click. On this touchscreen, the **second tap**
+of a double-tap lands on that just-rendered backdrop and dismisses it before
+it can be seen, which reads as a blink. The same mechanism explains the
+Preview button: pressed twice in quick succession (as an operator retrying
+what looked like a dead button naturally would), the first tap opens the
+preview and the second immediately closes it.
+
+Fixed by timestamping when the preview last opened
+(`previewOpenedAtRef`/`handlePreviewBackdropClick` in both
+ReclassifyObjects.jsx and ResultsViewer.jsx) and ignoring a backdrop click
+within 400ms of that — comfortably inside a double-tap's timing, comfortably
+below any deliberate "tap to dismiss" gap. The modal's own ✕ close button is
+unaffected and still closes unconditionally on any single tap.
+
+## 7n. A "Change to" dropdown opened visually behind the preview modal it lives in
+
+Reported directly, with a screenshot: opening the "Change to" dropdown from
+inside the reclassify preview modal showed the option list rendering
+*underneath* the modal, so taps on any option landed on the modal instead
+and the operator couldn't select anything.
+
+`CustomSelect`'s option panel is portal-rendered onto `document.body`
+specifically so it can escape its trigger's own clipping ancestors (see
+`CustomSelect.jsx`'s own docstring), but that also means its stacking order
+is no longer determined by where it sits in the DOM tree — it needs its own
+`z-index` high enough to clear anything else on the page, including a modal
+the trigger happens to be inside. It was left at `z-index: 40`
+(`CustomSelect.css`) while both pages' preview-modal overlays are
+`z-index: 50` — so the panel was opening correctly, just one layer beneath
+the modal. Raised to `z-index: 60`, above every modal in the app.

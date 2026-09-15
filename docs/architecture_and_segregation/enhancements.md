@@ -344,6 +344,102 @@ them alongside further enhancements worth considering but not yet done.
   reclassify happens promptly, within the same short review window a
   60-second sweep may or may not have already caught), but a real gap if it
   does line up.
+- **XAI View is disabled on the live-scan page.** The button and its handler
+  (`Dashboard.jsx`'s `handleXaiToggle`/`xaiImage` state) are left in place
+  but commented out of the rendered header, on request, "until further
+  notice." Not a removal of the feature, just hidden.
+- **"Item" renamed to "FO Category"** in the breakdown table headers on both
+  the Save/Results-review screen and the History → record-view screen
+  (`ResultsViewer.jsx`), on request — purely a label change, the underlying
+  `item`/`itemRows` field names are untouched.
+- **A note on Blower FO / Magnetic FO** was added explaining they are typed
+  totals from other machine stages (the air blower, the magnetic separator),
+  not camera detections, and can't be reclassified like a captured crop —
+  shown only on the pending (not-yet-saved) results screen
+  (`showFoInfoNote`, gated to `isPending`), not on a saved History record.
+- **The reclassify screen's own staged-changes log is ordered by object
+  number, not by the order each change was staged.** Object 1's change (if
+  any) always appears above Object 5's, matching `objectNumberById`'s own
+  numbering, rather than reshuffling every time the operator reclassifies
+  something out of order.
+- **The live tap-to-classify FM overlay (Dashboard.jsx) has no Cancel
+  option.** Once the operator taps a detected box, they must pick an FM
+  type from the popup — there is no way to dismiss the picker without
+  labeling it, on request. (This also matches legacy, which never had a
+  Cancel/dismiss affordance on this exact overlay either — main.py's own
+  detection-review flow has no equivalent button.)
+- **FM type lists are alphabetized app-wide** (the Reclassify "Change to"
+  dropdown, Dashboard's tap-to-classify overlay, DetailsEntry's pre-scan FM
+  select, and the reclassify gallery's own type filter) — `NON-FM` (and, in
+  the FO Category table specifically, `Blower FO`/`Magnetic FO`) stay pinned
+  to a fixed position rather than sorting in alphabetically, since they
+  aren't real "found" FM types the way the rest are.
+- **`CustomSelect` (`src/components/CustomSelect.jsx`) and `ScrollFrame`
+  (`src/components/ScrollFrame.jsx`)** are new reusable components with no
+  legacy equivalent. A native `<select>`'s open dropdown draws its own
+  scrollbar at the OS/browser level, which can't be made to behave like the
+  rest of the app's always-visible ScrollFrame scrollbars (it flashes and
+  auto-hides), so `CustomSelect` renders its own option list (via
+  `ScrollFrame`) in a `document.body` portal instead — used for
+  ReclassifyObjects.jsx's "Change to" dropdown and both pages' "Filter by
+  type" gallery filter; not yet swapped in for every native `<select>` in
+  the app (kept scoped on request). `ScrollFrame` itself pairs a real,
+  always-visible native scrollbar with up/down nudge buttons, and is only
+  rendered when there is actual overflow to scroll.
+- **Tap-to-preview modal for captured-object crops**, on both
+  ReclassifyObjects.jsx and ResultsViewer.jsx — tapping a gallery thumbnail
+  opens an enlarged view with Previous/Next navigation (and, on the
+  reclassify page, a jump-to-object-number control); not a legacy feature.
+  Sized at `min(760px, 96vw)` / up to 70vh image height (enlarged from an
+  initial, smaller size on request — crop legibility is bounded by the
+  underlying ~30-55px of real sensor detail, see the crop-padding entry
+  above, so this is a genuine size increase, not a workaround for blur).
+- **History's Sync Status is a pill only, with no manual retry button at
+  all**, for every status. Legacy has no manual resync concept in the first
+  place (see the very next bullet); this port initially added a button for
+  both a pending ('0') and a failed/rejected ('2') record, then removed both
+  on request: `sync_worker.py`'s own 15-minute retry already covers '0'
+  automatically, and a '2' record was rejected by Qualix outright (HTTP
+  400) — resending the exact same payload changes nothing, so a retry button
+  there never actually helped. `'2'`'s label was changed from "Sync Failed"
+  to "Rejected" to stop implying a retry could fix it. Applied identically
+  on the History table and the ResultsViewer record-view header.
+- **History is sorted latest-first (by scan date/start_time), not by
+  legacy's commodity-name grouping.** Legacy's own `populate_history_table`
+  (`main.py:2100`) sorts rows by commodity name descending, then receiving
+  date descending within each commodity — reproduced exactly at first, then
+  changed to latest-first on request once it was confirmed this diverges
+  from legacy on purpose (see `history.py`'s own `get_history` docstring for
+  the full reasoning).
+- **The record-view gallery fetches every crop for the record in a single
+  request**, not paged 12/24 at a time. The gallery is now a single
+  scrollable grid (ScrollFrame provides the scrolling), not legacy's paged
+  previous/next viewer, so paging server-side only capped the grid at its
+  first page with nothing to reach the rest once the paged viewer's own
+  prev/next controls were removed. `get_result_images`'s `limit` cap was
+  raised from 200 to 2000 to match.
+- **Data Collection's live camera preview and the reclassify/record-view
+  crop previews had their own render/UX bugs found and fixed along the
+  way** — see `9 - post_remediation_session_log.md` §7m (preview closing
+  itself on a double-tap) and §7n (a portal-rendered dropdown opening
+  visually behind a modal).
+- **The saved/History-detail record-view screen (`ResultsViewer.jsx`,
+  `!isPending`) no longer has a docked, narrow enlarged-crop column.** It
+  originally mirrored the pending-review screen's own frame/breakdown
+  layout; on request this became first a full-width thumbnail gallery with
+  a "Filter by type" dropdown (tapping a thumbnail opens the same
+  tap-to-preview modal used elsewhere instead of an inline enlarged view),
+  then restructured again to match ReclassifyObjects.jsx's own layout
+  exactly — a gallery grid on the left, a fixed-width panel on the right
+  (the FO Category/Metric tables, in place of reclassify's staged-changes
+  log). The `isPending` (pre-save) screen's own layout from §7g is
+  untouched by any of this.
+- **Sync Status pill and the (now-removed) Sync Now button were sized to
+  match the Home button, and made uppercase.** Both were noticeably smaller
+  than the header's own Home button on this device's screen; sizing was
+  matched explicitly rather than inherited from a shared button class,
+  since they sit in the same header row on both History.jsx and
+  ResultsViewer.jsx.
 
 ## Suggested future enhancements
 
