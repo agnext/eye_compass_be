@@ -79,6 +79,11 @@ class SessionStore:
                     first_name=extra.get("first_name", ""),
                     email=extra.get("email", ""),
                     roles=extra.get("roles", []) or [],
+                    # Free from the JWT already on hand at login — no admin
+                    # call needed just to capture it. What lets the daily
+                    # worker later ask Keycloak's Admin API about this exact
+                    # account (see fetch_account_status).
+                    keycloak_user_id=extra.get("keycloak_user_id", ""),
                 )
             )
             db.commit()
@@ -122,9 +127,12 @@ class SessionStore:
                 "created_at": row.created_at,
                 "last_verified_at": row.last_verified_at,
                 "needs_relogin": bool(row.needs_relogin),
+                "relogin_suggested": bool(row.relogin_suggested),
                 "first_name": row.first_name or "",
                 "email": row.email or "",
                 "roles": row.roles or [],
+                "keycloak_user_id": row.keycloak_user_id or "",
+                "password_credential_created_at": row.password_credential_created_at,
             }
         except Exception as exc:
             logger.error("Session lookup failed: %s", exc)
@@ -152,10 +160,18 @@ class SessionStore:
     def online_sessions_with_refresh_token(
         self, skip_if_verified_after: datetime = None
     ) -> List[dict]:
-        """Online-mode sessions that still hold a refresh token.
+        """Every session that still holds a refresh token, of any mode.
 
-        These are the only ones that can be checked silently, without the
-        operator typing anything.
+        Having a refresh token — not the mode label — is what actually makes a
+        session checkable silently, without the operator typing anything. This
+        used to also require mode == "online", but that wrongly excluded a
+        cached-hash (offline/pending) login that carried a still-good refresh
+        token forward from an earlier online login on this same device (see
+        auth.py's _cached_keycloak_identity and the Creds model's docstring) —
+        such a session is just as checkable as a freshly-online one, and
+        treating it as unverifiable gave a needless hard "sign in again" wall
+        to an account that had been confirmed online just hours or days
+        before.
 
         skip_if_verified_after leaves out sessions Keycloak has already
         confirmed since that moment. The caller passes the start of today, so
@@ -169,7 +185,6 @@ class SessionStore:
         db = SessionLocal()
         try:
             query = db.query(SessionRow).filter(
-                SessionRow.mode == "online",
                 SessionRow.refresh_token.isnot(None),
                 SessionRow.refresh_token != "",
             )
@@ -182,7 +197,13 @@ class SessionStore:
                 )
             rows = query.all()
             return [
-                {"token": r.token, "username": r.username, "refresh_token": r.refresh_token}
+                {
+                    "token": r.token,
+                    "username": r.username,
+                    "refresh_token": r.refresh_token,
+                    "keycloak_user_id": r.keycloak_user_id or "",
+                    "password_credential_created_at": r.password_credential_created_at,
+                }
                 for r in rows
             ]
         except Exception as exc:
@@ -192,13 +213,19 @@ class SessionStore:
             db.close()
 
     def unverifiable_sessions(self) -> List[dict]:
-        """Sessions that cannot be checked silently and are not already flagged.
+        """Sessions with no refresh token at all — genuinely never checkable.
 
-        An operator who signed in offline has no refresh token — Keycloak was
-        never contacted, so there is nothing to redeem. Such a session is not
-        wrong, but it has never been confirmed against Keycloak either. The
-        only way to confirm it is to ask the operator to sign in again, which
-        is worth doing once connectivity is actually back.
+        This is now a smaller, more honest bucket than "not mode == online":
+        a cached-hash login carries forward whatever refresh token this
+        device last obtained for the account (see
+        online_sessions_with_refresh_token), so those are handled there
+        instead, exactly like a freshly-online session. What actually lands
+        here is the fixed device credential (mode="offline-device", never
+        touches Keycloak by design) and a genuinely first-ever login on a
+        brand-new device with nothing cached yet. Neither has ever been
+        confirmed against Keycloak even once, so the only way to confirm
+        either is to ask the operator to sign in again — worth doing once
+        connectivity is actually back.
         """
         from app.models.schema import Session as SessionRow
 
@@ -207,7 +234,10 @@ class SessionStore:
             rows = (
                 db.query(SessionRow)
                 .filter(
-                    SessionRow.mode != "online",
+                    or_(
+                        SessionRow.refresh_token.is_(None),
+                        SessionRow.refresh_token == "",
+                    ),
                     SessionRow.needs_relogin.is_(False),
                 )
                 .all()
@@ -234,7 +264,13 @@ class SessionStore:
         finally:
             db.close()
 
-    def mark_verified(self, token: str, refresh_token: str = None):
+    def mark_verified(
+        self,
+        token: str,
+        refresh_token: str = None,
+        password_credential_created_at=None,
+        password_baseline_checked: bool = False,
+    ):
         """Record that Keycloak just confirmed this account is still good.
 
         Stores a fact, not a deadline: the session does not gain "more time"
@@ -244,6 +280,13 @@ class SessionStore:
 
         Keycloak issues a new refresh token on every use, so failing to store
         the new one would make tomorrow's check fail.
+
+        password_credential_created_at is only ever passed when the caller
+        actually asked the Admin API this time (password_baseline_checked
+        True) — a bare mark_verified (e.g. the Admin API was unreachable this
+        cycle) must never overwrite the stored baseline with None, or the very
+        next comparison would wrongly look like "no change" regardless of
+        what really happened.
         """
         from app.models.schema import Session as SessionRow
 
@@ -255,8 +298,13 @@ class SessionStore:
             row.last_verified_at = datetime.utcnow()
             if refresh_token:
                 row.refresh_token = refresh_token
-            # Clears any earlier flag: the account is demonstrably fine now.
+            if password_baseline_checked:
+                row.password_credential_created_at = password_credential_created_at
+            # Clears both flags: the account is demonstrably fine now, and a
+            # successful redemption means there is a live token again, so the
+            # banner asking for one has nothing left to ask for.
             row.needs_relogin = False
+            row.relogin_suggested = False
             db.commit()
             logger.info(
                 "[SESSION] Verified for %s — Keycloak confirmed the account is "
@@ -322,8 +370,10 @@ class SessionStore:
             row.first_name = claims.get("first_name", "") or row.first_name
             row.email = claims.get("email", "") or row.email
             row.roles = claims.get("roles", []) or row.roles
+            row.keycloak_user_id = claims.get("sub", "") or row.keycloak_user_id
             row.last_verified_at = datetime.utcnow()
             row.needs_relogin = False
+            row.relogin_suggested = False
             db.commit()
             logger.info(
                 "[SESSION] Promoted %s to a verified online session — Keycloak "
@@ -362,6 +412,78 @@ class SessionStore:
         except Exception as exc:
             db.rollback()
             logger.error("Could not flag session for re-login: %s", exc)
+        finally:
+            db.close()
+
+    def set_password_baseline(self, token: str, password_credential_created_at):
+        """Seed the password-credential timestamp right after a fresh online
+        login, instead of leaving it for the daily worker's first pass to
+        establish.
+
+        Deliberately its own method rather than folded into mark_verified:
+        this happens once, right after login, and is not itself a
+        confirmation that a day has passed and the account is still fine — it
+        only records what the password's timestamp was AT login, so the very
+        first real daily check afterward has something to compare against
+        instead of just planting a flag with nothing to compare it to. Touches
+        nothing else on the row — not last_verified_at, not needs_relogin.
+        """
+        from app.models.schema import Session as SessionRow
+
+        db = SessionLocal()
+        try:
+            row = db.query(SessionRow).filter(SessionRow.token == token).first()
+            if not row:
+                return
+            row.password_credential_created_at = password_credential_created_at
+            db.commit()
+            logger.info(
+                "[SESSION] Seeded the password baseline for %s at login time — "
+                "the next daily check can now actually detect a change instead "
+                "of just recording one for the first time.",
+                row.username,
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.error("Could not seed password baseline: %s", exc)
+        finally:
+            db.close()
+
+    def suggest_relogin(self, token: str, reason: str = "the offline token reached its idle limit"):
+        """Invite a re-login without demanding one.
+
+        Set when the stored offline token has aged out but Keycloak has
+        confirmed the account itself is still perfectly good — the operator's
+        credentials are not in question, there is simply no live token left to
+        confirm them silently with any more. Signing in again takes seconds
+        and restores that, but nothing is wrong if they carry on for now, so
+        the frontend shows a banner rather than the blocking dialog
+        needs_relogin gets.
+
+        Never set alongside needs_relogin: a session with a genuinely refused
+        account has a real problem, and softening that to a dismissible
+        banner would be wrong.
+        """
+        from app.models.schema import Session as SessionRow
+
+        db = SessionLocal()
+        try:
+            row = db.query(SessionRow).filter(SessionRow.token == token).first()
+            if not row or row.needs_relogin:
+                return
+            if row.relogin_suggested:
+                return  # already invited; nothing to say a second time
+            row.relogin_suggested = True
+            db.commit()
+            logger.info(
+                "[SESSION] Suggesting re-login for %s — %s. The account is "
+                "confirmed fine, so this is a banner on the Home screen only; "
+                "they can keep working and sign in whenever it suits them.",
+                row.username, reason,
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.error("Could not suggest re-login: %s", exc)
         finally:
             db.close()
 

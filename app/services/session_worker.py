@@ -8,21 +8,55 @@ no connectivity, and a login must not evaporate because of it.
 
 The cost of that is a session which knows nothing about the outside world. If
 an operator's Keycloak account is disabled, nothing here would notice. So
-whenever the device *does* have connectivity, this quietly redeems each
-session's stored refresh token once a day and acts on the answer:
+whenever the device *does* have connectivity, this quietly checks each
+session once a day, in two steps that each answer a different question:
 
-  * Keycloak confirms it      -> record that it was verified just now, and
+  1. Redeem the stored refresh token. This is what keeps the offline token's
+     own 30-day idle clock from running out, and Keycloak also refuses it
+     outright for a disabled/deleted account — a question a refresh grant
+     genuinely can answer. What it CANNOT answer is whether the password
+     itself changed: confirmed by direct test, an offline refresh token
+     survives a password change untouched, since redeeming one was never a
+     password check to begin with.
+  2. Ask Keycloak's Admin REST API directly whether the account is enabled
+     and when its password credential was last created
+     (`keycloak_service.fetch_account_status`). Comparing that timestamp to
+     what was recorded at login is what actually catches a password change —
+     authoritative, and it never needs or sees the password itself. Requires
+     the Keycloak client to have a service account with the realm-management
+     `view-users` role; if that hasn't been granted yet, this step simply
+     comes back inconclusive and step 1's result still stands on its own.
+
+  * Keycloak confirms both    -> record that it was verified just now, and
                                  store the rotated refresh token. The operator
                                  notices nothing and stays logged in.
-  * Keycloak explicitly says
-    no (account disabled or
-    deleted, offline token
-    idle past its window)     -> flag the session for re-login. It stays
-                                 usable; see below.
-  * Keycloak is unreachable   -> change nothing at all. An offline device must
+  * The account is genuinely
+    refused — disabled,
+    deleted, or its password
+    was changed               -> flag needs_relogin. The credentials on this
+                                 device are actually wrong now, so the
+                                 frontend blocks with a dialog. Still only at
+                                 the Home screen; see below.
+  * The token aged out but
+    the account is confirmed
+    fine                      -> flag relogin_suggested instead. Nothing is
+                                 wrong with the operator or their password —
+                                 the device was simply out of contact past the
+                                 realm's Offline Session Idle limit, so there
+                                 is no live token left to confirm them with
+                                 silently. The frontend shows a banner they
+                                 can ignore, not a wall. Signing in again
+                                 restores a fresh token; if they turn out to
+                                 still be offline, login just falls through to
+                                 the offline tiers and costs them nothing.
+  * Unreachable/inconclusive  -> change nothing at all. An offline device must
                                  never be punished for being offline, which is
                                  exactly the case this whole design exists to
-                                 support.
+                                 support. The one exception: if Keycloak
+                                 refused the token and the Admin API could not
+                                 then say why, that is flagged hard rather
+                                 than softened — an account that could not be
+                                 confirmed must not be waved through.
 
 A session that signed in offline has no refresh token, so none of the above
 can apply to it — there is nothing to redeem. It is left alone for as long as
@@ -83,9 +117,92 @@ def _start_of_today() -> datetime:
     return datetime(now.year, now.month, now.day)
 
 
+def _password_changed(stored, current) -> bool:
+    """Has the account's password been replaced since this session recorded it?
+
+    Only answerable when both timestamps exist. A missing stored value means
+    no baseline has been taken yet (the Admin API had never been reachable for
+    this session before), which is not evidence of a change.
+    """
+    return stored is not None and current is not None and stored != current
+
+
+def _handle_refresh_rejection(session: dict, summary: dict):
+    """Keycloak refused to redeem this session's refresh token. Work out which
+    of two very different reasons it was, and answer in kind.
+
+    The refusal itself is ambiguous — Keycloak returns invalid_grant for a
+    disabled account and for a token that simply sat unused past the realm's
+    Offline Session Idle limit alike, and the error_description wording is not
+    something to build behavior on. So rather than guess from the message, ask
+    the Admin API what is actually true of the account:
+
+      * account disabled/deleted, or its password changed -> the credentials
+        on this device are genuinely wrong now. Hard flag: a blocking dialog.
+      * account perfectly fine -> the token aged out while the device was out
+        of contact, which is nobody's fault and nothing is wrong with the
+        operator's credentials. Soft flag: a banner they can ignore.
+      * cannot tell -> assume the worse of the two. Quietly downgrading an
+        account we could not confirm to a dismissible banner is the one
+        mistake here with a real consequence.
+    """
+    status = None
+    if session["keycloak_user_id"]:
+        status = keycloak_service.fetch_account_status(session["keycloak_user_id"])
+
+    if status is None:
+        logger.warning(
+            "[REVALIDATE] Keycloak refused %s's token and the Admin API could not "
+            "say why — flagging for re-login rather than assuming the account is "
+            "fine.", session["username"],
+        )
+        session_store.flag_needs_relogin(
+            session["token"],
+            reason="Keycloak refused the token and the account could not be checked",
+        )
+        summary["flagged"] += 1
+        return
+
+    if not status["enabled"]:
+        logger.warning(
+            "[REVALIDATE] Keycloak refused %s's token because the account is "
+            "disabled or deleted — flagging for re-login.", session["username"],
+        )
+        session_store.flag_needs_relogin(
+            session["token"], reason="the account is disabled or deleted"
+        )
+        summary["flagged"] += 1
+        return
+
+    if _password_changed(
+        session["password_credential_created_at"], status["password_created_at"]
+    ):
+        logger.warning(
+            "[REVALIDATE] Keycloak refused %s's token and the account's password "
+            "has changed — flagging for re-login.", session["username"],
+        )
+        session_store.flag_needs_relogin(
+            session["token"], reason="the account's password was changed"
+        )
+        summary["flagged"] += 1
+        return
+
+    logger.info(
+        "[REVALIDATE] %s's offline token reached the realm's idle limit while this "
+        "device was out of contact, but the account itself is confirmed fine — "
+        "suggesting a re-login rather than forcing one.",
+        session["username"],
+    )
+    session_store.suggest_relogin(
+        session["token"],
+        reason="the offline token reached its idle limit while the device was offline",
+    )
+    summary["suggested"] += 1
+
+
 def _run_one_cycle() -> dict:
     """One revalidation pass. Runs in a worker thread."""
-    summary = {"checked": 0, "verified": 0, "flagged": 0, "unreachable": 0, "offline_flagged": 0}
+    summary = {"checked": 0, "verified": 0, "flagged": 0, "suggested": 0, "unreachable": 0, "offline_flagged": 0}
 
     # Skip anything Keycloak already confirmed today. One successful check a
     # day is the point; the repeated wake-ups exist only so a device that was
@@ -107,6 +224,10 @@ def _run_one_cycle() -> dict:
         )
 
     for session in sessions:
+        # Step 1: redeem the stored refresh token. Two jobs at once — this is
+        # what keeps the offline token's own 30-day idle clock from running
+        # out, and Keycloak also refuses this outright for a disabled/deleted
+        # account, which is a question a refresh grant CAN answer correctly.
         try:
             claims = keycloak_service.refresh(session["refresh_token"])
         except Exception as exc:
@@ -114,33 +235,79 @@ def _run_one_cycle() -> dict:
             summary["unreachable"] += 1
             continue
 
-        if claims:
-            session_store.mark_verified(
-                session["token"],
-                refresh_token=claims.get("refresh_token", ""),
-            )
+        if not claims:
+            if keycloak_service.last_refresh_was_explicit_rejection:
+                _handle_refresh_rejection(session, summary)
+            else:
+                # Unreachable. Explicitly a no-op: the session keeps its
+                # previous verification time and we try again next cycle.
+                logger.info(
+                    "[REVALIDATE] Could not reach Keycloak for %s — leaving the "
+                    "session untouched (an offline device must not be logged out). "
+                    "Will try again next cycle.",
+                    session["username"],
+                )
+                summary["unreachable"] += 1
+            continue
+
+        new_refresh_token = claims.get("refresh_token", "")
+
+        # Step 2: the refresh above only proves the account/session is still
+        # valid — it says nothing about whether the password itself changed.
+        # Confirmed by direct test: an offline refresh token survives a
+        # password change untouched, since redeeming one was never a password
+        # check to begin with. Ask Keycloak's Admin API directly instead,
+        # which answers that question authoritatively and never needs or sees
+        # the password.
+        status = None
+        if session["keycloak_user_id"]:
+            status = keycloak_service.fetch_account_status(session["keycloak_user_id"])
+
+        if status is None:
+            # Admin API unreachable, unconfigured, or not yet permitted on
+            # this realm (see fetch_account_status's docstring). The refresh
+            # above already proved the account/session are fine, so record
+            # that much; the password-change check is simply retried next
+            # cycle rather than blocking everything on it.
+            session_store.mark_verified(session["token"], refresh_token=new_refresh_token)
             summary["verified"] += 1
-        elif keycloak_service.last_refresh_was_explicit_rejection:
+            continue
+
+        if not status["enabled"]:
             logger.warning(
-                "[REVALIDATE] Keycloak REJECTED %s (account disabled/deleted, or the "
-                "token went unused too long) — flagging for re-login.",
+                "[REVALIDATE] Admin API reports %s is disabled — flagging for "
+                "re-login.", session["username"],
+            )
+            session_store.flag_needs_relogin(
+                session["token"], reason="Keycloak's Admin API reports the account is disabled"
+            )
+            summary["flagged"] += 1
+            continue
+
+        current_pw_ts = status["password_created_at"]
+        if _password_changed(session["password_credential_created_at"], current_pw_ts):
+            logger.warning(
+                "[REVALIDATE] %s's password was changed (Admin API password "
+                "credential timestamp no longer matches what was recorded at "
+                "login) — flagging for re-login.",
                 session["username"],
             )
             session_store.flag_needs_relogin(
-                session["token"],
-                reason="Keycloak rejected the account, or the token went unused too long",
+                session["token"], reason="the account's password was changed"
             )
             summary["flagged"] += 1
-        else:
-            # Unreachable. Explicitly a no-op: the session keeps its previous
-            # verification time and we try again next cycle.
-            logger.info(
-                "[REVALIDATE] Could not reach Keycloak for %s — leaving the session "
-                "untouched (an offline device must not be logged out). Will try again "
-                "next cycle.",
-                session["username"],
-            )
-            summary["unreachable"] += 1
+            continue
+
+        # Either unchanged, or this is the first check ever able to reach the
+        # Admin API for this session — either way, this timestamp becomes (or
+        # stays) the baseline the next check compares against.
+        session_store.mark_verified(
+            session["token"],
+            refresh_token=new_refresh_token,
+            password_credential_created_at=current_pw_ts,
+            password_baseline_checked=True,
+        )
+        summary["verified"] += 1
 
     _flag_offline_sessions_if_back_online(summary)
     return summary
@@ -192,7 +359,7 @@ def run_revalidation_now(trigger: str) -> dict:
     Returns an empty summary without doing anything if revalidation is off or
     the device is not on Keycloak, so callers need no guards of their own.
     """
-    empty = {"checked": 0, "verified": 0, "flagged": 0, "unreachable": 0, "offline_flagged": 0}
+    empty = {"checked": 0, "verified": 0, "flagged": 0, "suggested": 0, "unreachable": 0, "offline_flagged": 0}
     if not settings.SESSION_REVALIDATION_ENABLED or settings.AUTH_PROVIDER != "keycloak":
         return empty
 
@@ -223,10 +390,11 @@ async def session_revalidation_worker():
             if summary["checked"] or summary["offline_flagged"]:
                 logger.info(
                     "[REVALIDATE] Done: %s checked -> %s verified, %s flagged, "
-                    "%s unreachable; %s offline session(s) asked to sign in again.",
+                    "%s invited to sign in again, %s unreachable; %s offline "
+                    "session(s) asked to sign in again.",
                     summary["checked"], summary["verified"],
-                    summary["flagged"], summary["unreachable"],
-                    summary["offline_flagged"],
+                    summary["flagged"], summary["suggested"],
+                    summary["unreachable"], summary["offline_flagged"],
                 )
         except asyncio.CancelledError:
             logger.info("Session revalidation worker stopped.")

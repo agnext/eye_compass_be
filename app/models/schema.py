@@ -32,13 +32,30 @@ JSONType = JSON().with_variant(JSONB(), "postgresql")
 
 
 class Creds(Base):
-    """Cached operator credentials for offline login (legacy `creds`)."""
+    """Cached operator credentials for offline login (legacy `creds`).
+
+    One row, replaced whole on every successful online login — this is a
+    single shared kiosk device, not a per-operator store, so it only ever
+    remembers whoever most recently confirmed online.
+
+    keycloak_user_id and refresh_token ride along with the password hash for
+    exactly the same reason the hash itself is here: so a later offline
+    (cached-hash) login isn't treated as a total unknown. Without this, every
+    logout+offline-login cycle created a session with nothing to check against
+    Keycloak at all, even though this exact account had been confirmed online
+    just hours or days before — that got the same hard "sign in again" wall as
+    a genuinely disabled account, which was wrong. Carrying these forward lets
+    a cached-hash login attach the same still-good refresh token, so the daily
+    worker can revalidate it exactly like any online session.
+    """
 
     __tablename__ = "creds"
 
     id = Column(Integer, primary_key=True)
     user = Column(String(150), index=True)
     password = Column(String(255))
+    keycloak_user_id = Column(String(64), default="")
+    refresh_token = Column(Text)
 
 
 class Session(Base):
@@ -88,9 +105,34 @@ class Session(Base):
     last_verified_at = Column(DateTime, index=True)
     refresh_token = Column(Text)
     needs_relogin = Column(Boolean, default=False, nullable=False)
+    # The softer sibling of needs_relogin, and deliberately a separate column
+    # rather than another value in one field: the two mean different things to
+    # the operator and get different screens. needs_relogin means Keycloak
+    # actively refused this account (disabled, deleted, or the password was
+    # changed) — a blocking dialog, because the credentials on this device are
+    # genuinely wrong now. relogin_suggested means only that the stored offline
+    # token reached the realm's idle limit while the device was out of contact;
+    # the account itself is confirmed fine, so this is a banner they can
+    # ignore, not a wall.
+    relogin_suggested = Column(Boolean, default=False, nullable=False)
     first_name = Column(String(150), default="")
     email = Column(String(255), default="")
     roles = Column(JSONType, default=list)
+
+    # Keycloak's own internal user id (the JWT's "sub" claim) — captured for
+    # free at login, no extra network call. Lets the daily revalidation
+    # worker ask Keycloak's Admin API about this exact account later, without
+    # ever needing the operator's password again.
+    keycloak_user_id = Column(String(64), default="")
+    # The account's password credential's own createdDate, as Keycloak's Admin
+    # API reports it. A refresh-token grant proves the account/session is
+    # still valid, but not that the password is still the one the operator
+    # typed in — confirmed by direct test, an offline refresh token happily
+    # survives a password change. Comparing this timestamp on each daily
+    # check is what actually catches a change, without ever storing or
+    # resubmitting the password itself. Null until the worker's first
+    # successful Admin API check establishes a baseline.
+    password_credential_created_at = Column(DateTime, nullable=True)
 
 
 class ClientInfo(Base):

@@ -110,6 +110,11 @@ def migrate(sqlite_path, dry_run=False):
         # These are full replacements: they are a cache of the Qualix config,
         # so the legacy contents are the correct starting state.
         simple = [
+            # keycloak_user_id/refresh_token are deliberately left unset here:
+            # a legacy SQLite database predates Keycloak entirely, so there is
+            # no refresh token to carry over. The migrated row is correctly
+            # treated as "nothing cached from Keycloak yet" — the first login
+            # on this device goes through tier 1 fresh, same as any new one.
             ("creds", Creds, lambda r: Creds(user=r["user"], password=r["pass"])),
             (
                 "clientinfo",

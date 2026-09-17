@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.api import auth, batch, camera, config, conveyor, history, scan, xai
 from app.core.config import settings
@@ -14,6 +15,42 @@ from app.core.logging_setup import configure_logging
 
 configure_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _add_missing_columns():
+    """Add any model column that create_all() cannot: it only creates missing
+    TABLES, never new columns on one that already exists — and `sessions`/
+    `creds` already exist on every device that's ever logged in. No Alembic in
+    this project, so this stays a small, idempotent, targeted check rather
+    than pulling in a full migration framework for a handful of columns.
+
+    Safe to run on every startup: each column is only added if it is not
+    already there.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    per_table_additions = {
+        "sessions": {
+            "keycloak_user_id": "VARCHAR(64) DEFAULT ''",
+            "password_credential_created_at": "TIMESTAMP NULL",
+            "relogin_suggested": "BOOLEAN NOT NULL DEFAULT FALSE",
+        },
+        "creds": {
+            "keycloak_user_id": "VARCHAR(64) DEFAULT ''",
+            "refresh_token": "TEXT",
+        },
+    }
+    with engine.begin() as conn:
+        for table, additions in per_table_additions.items():
+            if table not in existing_tables:
+                continue  # a brand-new database — create_all() already made it right.
+            existing_columns = {col["name"] for col in inspector.get_columns(table)}
+            for column, ddl in additions.items():
+                if column in existing_columns:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+                logger.info("Added missing column %s.%s.", table, column)
 
 
 @asynccontextmanager
@@ -49,6 +86,7 @@ async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables verified.")
+        _add_missing_columns()
     except Exception as exc:
         logger.error(
             "FATAL: could not reach the database at %s — %s",

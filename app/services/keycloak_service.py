@@ -25,6 +25,7 @@ login_qualix's bool return.
 import base64
 import json
 import logging
+from datetime import datetime
 from typing import List, Optional
 
 import requests
@@ -53,6 +54,11 @@ def _decode_claims(token: str) -> dict:
             "first_name": claims.get("given_name", ""),
             "email": claims.get("email", ""),
             "roles": (claims.get("realm_access") or {}).get("roles", []),
+            # Keycloak's own internal user id. Already inside every token, so
+            # capturing it costs nothing — it's what lets the daily
+            # revalidation worker later ask the Admin API about this exact
+            # account without needing the operator's password again.
+            "sub": claims.get("sub", ""),
         }
     except Exception as exc:
         logger.warning("Could not decode Keycloak token claims: %s", exc)
@@ -62,6 +68,7 @@ def _decode_claims(token: str) -> dict:
 class KeycloakService:
     def __init__(self):
         self._service_token = ""
+        self._admin_token_cache = ""
         # Lets the revalidation worker tell "Keycloak rejected this account"
         # apart from "we could not reach Keycloak", which decide opposite
         # outcomes: end the session vs. leave it completely alone.
@@ -316,6 +323,132 @@ class KeycloakService:
             response.status_code, body,
         )
         return None
+
+    # ------------------------------------------------------------------
+    # Account status, straight from the source — used only by the daily
+    # revalidation worker. No password involved anywhere in this section.
+    # ------------------------------------------------------------------
+
+    def _admin_token(self) -> Optional[str]:
+        """Client-credentials token for Keycloak's own Admin REST API.
+
+        Distinct from every other token in this file: those are all ROPC
+        (grant_type=password), issued FOR an operator. This one authenticates
+        the client itself — no user, no password — which is what the Admin
+        API requires to look up an arbitrary account's status.
+
+        Requires KEYCLOAK_CLIENT_ID to have "Service Accounts" enabled, with
+        the realm-management client's `view-users` role assigned to that
+        service account. That is a Keycloak realm configuration change, not
+        something this code can do or verify — if it is missing, Keycloak
+        answers 400/403 and this simply returns None, same as "unreachable".
+        """
+        if self._admin_token_cache:
+            return self._admin_token_cache
+        if not settings.KEYCLOAK_CLIENT_SECRET:
+            return None
+
+        body = self._token_request(
+            {"grant_type": "client_credentials", "client_id": settings.KEYCLOAK_CLIENT_ID},
+            "admin token",
+        )
+        if not body or body.get("__rejected__"):
+            logger.warning(
+                "[REVALIDATE] Could not get an Admin API token — either "
+                "%s has no Service Account, or it lacks the realm-management "
+                "'view-users' role. Password-change detection is skipped "
+                "until this is granted; account-disabled detection via the "
+                "refresh token is unaffected.",
+                settings.KEYCLOAK_CLIENT_ID,
+            )
+            return None
+
+        self._admin_token_cache = body.get("access_token", "")
+        return self._admin_token_cache or None
+
+    def invalidate_admin_token(self):
+        self._admin_token_cache = ""
+
+    def fetch_account_status(self, keycloak_user_id: str) -> Optional[dict]:
+        """Ask Keycloak directly: is this account enabled, and when was its
+        password last set.
+
+        This is the piece a refresh-token grant cannot provide at all —
+        redeeming a refresh token only proves the session/account is still
+        valid, never that the password itself is unchanged (confirmed by
+        direct test: an offline refresh token survives a password change
+        untouched). Reading the password credential's own `createdDate` from
+        the Admin API is the direct, authoritative answer instead, and it
+        never needs or sees the actual password.
+
+        Returns {"enabled": bool, "password_created_at": datetime | None}, or
+        None if this cannot be determined right now (unreachable, not
+        configured, or not permitted) — callers must treat that exactly like
+        every other "inconclusive" result here: change nothing, try again
+        next time.
+        """
+        if not keycloak_user_id:
+            return None
+        token = self._admin_token()
+        if not token:
+            return None
+
+        base = (settings.KEYCLOAK_URL or "").rstrip("/")
+        admin_base = f"{base}/admin/realms/{settings.KEYCLOAK_REALM}/users/{keycloak_user_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            user_resp = requests.get(admin_base, headers=headers, timeout=15)
+        except Exception as exc:
+            logger.warning("[REVALIDATE] Admin API user lookup unreachable: %s", exc)
+            return None
+
+        if user_resp.status_code == 401:
+            # The cached admin token expired or was revoked — drop it so the
+            # next call gets a fresh one, and treat this attempt as
+            # inconclusive rather than guessing.
+            self.invalidate_admin_token()
+            return None
+        if user_resp.status_code == 404:
+            # The account itself is gone. Same verdict as "disabled".
+            return {"enabled": False, "password_created_at": None}
+        if user_resp.status_code != 200:
+            logger.warning(
+                "[REVALIDATE] Admin API user lookup returned HTTP %s — "
+                "treating as inconclusive.", user_resp.status_code,
+            )
+            return None
+
+        try:
+            enabled = bool(user_resp.json().get("enabled", True))
+        except Exception as exc:
+            logger.warning("Admin API user lookup returned a malformed body: %s", exc)
+            return None
+
+        password_created_at = None
+        try:
+            cred_resp = requests.get(
+                f"{admin_base}/credentials", headers=headers, timeout=15
+            )
+            if cred_resp.status_code == 200:
+                for cred in cred_resp.json():
+                    if cred.get("type") == "password" and cred.get("createdDate"):
+                        # Keycloak reports this as epoch milliseconds.
+                        password_created_at = datetime.utcfromtimestamp(
+                            cred["createdDate"] / 1000
+                        )
+                        break
+            else:
+                logger.warning(
+                    "[REVALIDATE] Admin API credentials lookup returned HTTP %s for "
+                    "%s — the account-enabled result above is still used, but the "
+                    "password-changed check is skipped this time.",
+                    cred_resp.status_code, keycloak_user_id,
+                )
+        except Exception as exc:
+            logger.warning("[REVALIDATE] Admin API credentials lookup unreachable: %s", exc)
+
+        return {"enabled": enabled, "password_created_at": password_created_at}
 
 
 keycloak_service = KeycloakService()

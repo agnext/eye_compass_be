@@ -63,11 +63,23 @@ def _qualix_username(username: str) -> str:
     return f"{username}{settings.QUALIX_USER_DOMAIN}"
 
 
-def _cache_credentials(db: Session, username: str, password: str):
-    """Port of write_creds (database.py:158-176) — one row, replaced each time."""
+def _cache_credentials(
+    db: Session, username: str, password: str,
+    keycloak_user_id: str = "", refresh_token: str = "",
+):
+    """Port of write_creds (database.py:158-176) — one row, replaced each time.
+
+    keycloak_user_id/refresh_token ride along whenever this follows a real
+    Keycloak login (tier 1) — see the Creds model's docstring for why. A
+    legacy-path caller passes neither, which is correct: that path has no
+    Keycloak identity to carry.
+    """
     try:
         db.query(Creds).delete()
-        db.add(Creds(user=username, password=_hash(password)))
+        db.add(Creds(
+            user=username, password=_hash(password),
+            keycloak_user_id=keycloak_user_id, refresh_token=refresh_token,
+        ))
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -80,6 +92,25 @@ def _check_cached(db: Session, username: str, password: str) -> bool:
     if not row or not row.password:
         return False
     return hmac.compare_digest(row.password, _hash(password))
+
+
+def _cached_keycloak_identity(db: Session, username: str) -> dict:
+    """The Keycloak identity riding along with the cached password, if any.
+
+    Called whenever a login is about to be accepted from the cached hash
+    (tier 2, or the fast path) rather than a fresh Keycloak call — so that
+    session starts out carrying whatever refresh token this device last
+    obtained for this exact account, instead of nothing at all. _check_cached
+    already guarantees the username matches this row (Creds is one row for
+    the whole device), so there is no ambiguity about whose identity this is.
+    """
+    row = db.query(Creds).filter(Creds.user == username).first()
+    if not row:
+        return {}
+    return {
+        "keycloak_user_id": row.keycloak_user_id or "",
+        "refresh_token": row.refresh_token or "",
+    }
 
 
 def _clear_cached_credentials(db: Session):
@@ -151,6 +182,10 @@ def _verify_cached_login_in_background(username: str, password: str, token: str)
                 "login was legitimate.", username,
             )
             session_store.promote_to_online(token, claims)
+            # Already running in the background here, so this is a direct
+            # call rather than another scheduled task — see
+            # _seed_password_baseline_in_background's docstring.
+            _seed_password_baseline_in_background(token, claims.get("sub", ""))
             sync_service.sync_commodity_config(db)
             return
 
@@ -178,6 +213,28 @@ def _verify_cached_login_in_background(username: str, password: str, token: str)
         logger.error("Background credential check failed for %s: %s", username, exc)
     finally:
         db.close()
+
+
+def _seed_password_baseline_in_background(token: str, keycloak_user_id: str):
+    """Right after a fresh tier-1 login, read today's password-credential
+    timestamp and store it as this session's baseline.
+
+    Runs in the background, after the login response is already sent — an
+    extra Admin API round trip has no business adding latency to a login that
+    already succeeded on its own terms. Best-effort: if the Admin API is
+    unreachable or not yet permitted, this simply does nothing and the
+    baseline is established later the normal way, by the daily worker's first
+    successful check instead. Nothing about login's own pass/fail behavior
+    depends on this succeeding.
+    """
+    if not keycloak_user_id:
+        return
+    try:
+        status = keycloak_service.fetch_account_status(keycloak_user_id)
+        if status:
+            session_store.set_password_baseline(token, status["password_created_at"])
+    except Exception as exc:
+        logger.error("Could not seed password baseline for token %s: %s", token, exc)
 
 
 def _sync_config_in_background(username: str = None, password: str = None):
@@ -216,7 +273,12 @@ def _offline_tiers(db: Session, username: str, password: str) -> dict:
             "(%s was unreachable or rejected it). Session mode=offline.",
             username, settings.AUTH_PROVIDER.upper(),
         )
-        token = session_store.create(username, mode="offline")
+        # Carries forward whatever refresh token this device last obtained
+        # for this account, so this session isn't a total unknown to the
+        # daily worker just because THIS login happened to go through the
+        # cached hash — see the Creds model's docstring.
+        identity = _cached_keycloak_identity(db, username)
+        token = session_store.create(username, mode="offline", **identity)
         return {
             "status": "success",
             "mode": "offline",
@@ -289,7 +351,15 @@ def _login_keycloak(
         # whether this device has a network. Settling that is the background
         # check's job, and until it does, the Home screen must not claim
         # either way.
-        token = session_store.create(username, mode="pending")
+        #
+        # The carried-forward refresh token is a safety net, not the normal
+        # path: _verify_cached_login_in_background below resolves this within
+        # seconds with a fresh one either way. It only matters if that
+        # background task never completes (e.g. the process dies first) —
+        # without it, a session stuck in "pending" would otherwise have
+        # nothing at all for the daily worker to check.
+        identity = _cached_keycloak_identity(db, username)
+        token = session_store.create(username, mode="pending", **identity)
         background_tasks.add_task(
             _verify_cached_login_in_background, username, password, token
         )
@@ -333,7 +403,11 @@ def _login_keycloak(
         # Cached under what the operator actually typed, not Keycloak's
         # canonical preferred_username: tier 2 looks the row up by whatever
         # they type at the offline login screen, and the two can differ.
-        _cache_credentials(db, username, password)
+        _cache_credentials(
+            db, username, password,
+            keycloak_user_id=claims.get("sub", ""),
+            refresh_token=claims.get("refresh_token", ""),
+        )
         # Same refresh legacy does on every login — without this a device
         # switched to Keycloak would keep whatever commodities, vendors and
         # brands it had at switchover, with nothing ever updating them. No
@@ -354,6 +428,13 @@ def _login_keycloak(
             roles=claims.get("roles", []),
             # Held for the daily revalidation worker; never sent to the client.
             refresh_token=claims.get("refresh_token", ""),
+            keycloak_user_id=claims.get("sub", ""),
+        )
+        # Seeds password_credential_created_at now, rather than leaving the
+        # daily worker's first pass to plant it with nothing to compare
+        # against. See _seed_password_baseline_in_background's docstring.
+        background_tasks.add_task(
+            _seed_password_baseline_in_background, token, claims.get("sub", "")
         )
         return {
             "status": "success",
@@ -448,10 +529,21 @@ def logout(request: Request):
 def me(session: dict = Depends(require_session)):
     """Current session.
 
-    needs_relogin is set by the revalidation worker when Keycloak reports the
-    account disabled or deleted. The session stays usable regardless — only
-    the Home screen acts on this, so an operator part-way through a batch is
-    never cut off mid-scan.
+    Two different re-login signals, and the difference matters to the operator:
+
+      needs_relogin      — Keycloak actively refused the account (disabled,
+                           deleted, or the password was changed). The
+                           credentials on this device are wrong now, so the
+                           Home screen blocks with a dialog.
+      relogin_suggested  — the stored offline token aged out while the device
+                           was out of contact, but the account itself is
+                           confirmed fine. Home shows a banner they can
+                           ignore; signing in again just restores a live
+                           token.
+
+    Either way the session stays usable, and either way only the Home screen
+    acts on it, so an operator part-way through a batch is never cut off
+    mid-scan.
     """
     return {
         "username": session.get("username"),
@@ -459,4 +551,5 @@ def me(session: dict = Depends(require_session)):
         "first_name": session.get("first_name", ""),
         "customer_name": session.get("customer_name", ""),
         "needs_relogin": bool(session.get("needs_relogin", False)),
+        "relogin_suggested": bool(session.get("relogin_suggested", False)),
     }
