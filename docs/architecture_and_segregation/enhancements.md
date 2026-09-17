@@ -108,7 +108,8 @@ them alongside further enhancements worth considering but not yet done.
 - **The Qualix bearer token is real.** Legacy issued the literal string
   `"dummy_offline_token"` for an offline login, which nothing downstream could
   actually authenticate with. The backend issues a real session token
-  (`SessionStore`, 45-day TTL) for both the online and offline login paths.
+  (`SessionStore`, with no time limit — a session ends only when Keycloak says
+  the account is no longer good) for both the online and offline login paths.
 - **The live `total_fo_detected` no longer counts detections that were
   suppressed from operator review.** Legacy's `handle_detection`
   (`main.py:2618-2622`) adds every new tracker id to `existing_track_ids`
@@ -149,8 +150,40 @@ them alongside further enhancements worth considering but not yet done.
   waits for an in-flight reclassify instead of persisting a half-applied one.
   Not a legacy concern at all — legacy has no reclassify path and is
   single-threaded Qt.
+- **Operator login can be pointed at Keycloak instead of Qualix**
+  (`AUTH_PROVIDER=keycloak`), reversing the "not moved to an external
+  identity provider" decision in `1 - strategy.md`. Keycloak already fronts
+  Qualix org-wide through the **Assurance** gateway and shares its userbase,
+  so this adopts existing infrastructure rather than introducing a new
+  dependency. The operator still types into the same login form — Keycloak is
+  reached by a direct grant (ROPC), not a hosted redirect page, specifically
+  so the password still reaches this backend and can be hashed for the
+  offline tier. A hosted-page flow would break that, and is only needed if
+  MFA is ever enforced. Defaults to `legacy`, so an un-switched device is
+  byte-for-byte unchanged. New `app/services/keycloak_service.py`; the login
+  cascade in `auth.py` splits into `_login_keycloak` / `_login_legacy` over a
+  shared `_offline_tiers`, so tiers 2 and 3 cannot drift apart between
+  providers.
+- **Operator login moved to Keycloak** (behind `AUTH_PROVIDER=legacy|keycloak`,
+  default `legacy`), with syncing moved off the operator's own identity onto a
+  fixed account routed through the Assurance gateway, sessions persisted to
+  Postgres instead of a process-local dict, and a daily worker that
+  re-confirms each session against Keycloak without ever cutting an operator
+  off mid-batch. Full detail, including why each of these was necessary and
+  how they were verified, is in
+  `docs/keycloak_integration/` (start at `1 - overview.md`) rather than
+  repeated here.
 
 ### Frontend
+- **The Home screen checks whether the backend has flagged the session for
+  re-login** (`needs_relogin` from `/auth/me`) and, if so, signs the operator
+  out with an explanatory notice on the login screen. Deliberately checked on
+  Home and nowhere else: the backend leaves a flagged session fully working
+  precisely so an operator part-way through a batch scan or data-collection
+  run is not cut off and does not lose it. Home is the only screen reachable
+  between tasks, which is what makes it the safe enforcement point. This also
+  put `useMeQuery` to use for the first time — it had been defined and
+  exported in `authApi.js` since the port but never called by anything.
 - **The live-scan page's in-app Back button is not shown at all for the
   whole time a batch is in progress**, stricter than legacy. Legacy has this
   same button (`pushButton_back_live`) and only disables (not hides) it once
@@ -398,7 +431,7 @@ them alongside further enhancements worth considering but not yet done.
   all**, for every status. Legacy has no manual resync concept in the first
   place (see the very next bullet); this port initially added a button for
   both a pending ('0') and a failed/rejected ('2') record, then removed both
-  on request: `sync_worker.py`'s own 15-minute retry already covers '0'
+  on request: `sync_worker.py`'s own periodic retry already covers '0'
   automatically, and a '2' record was rejected by Qualix outright (HTTP
   400) — resending the exact same payload changes nothing, so a retry button
   there never actually helped. `'2'`'s label was changed from "Sync Failed"
@@ -440,6 +473,37 @@ them alongside further enhancements worth considering but not yet done.
   matched explicitly rather than inherited from a shared button class,
   since they sit in the same header row on both History.jsx and
   ResultsViewer.jsx.
+- **Login page redesigned to match the organization's Keycloak login
+  screen** (`Login.jsx`/`Login.css`) — an "EYE COMPASS" wordmark, a card with
+  the app's own green accent (not Keycloak's blue) so it still reads as this
+  app, a password show/hide toggle for the touchscreen keyboard, and a
+  footer with the AgNext logo and a "Secured by Keycloak" mark. Forgot
+  Password/Signup/Register are deliberately absent — nothing on this kiosk
+  device can act on them (no email access, no self-registration flow), so
+  showing them would just be a dead end for the operator. No "Remember me"
+  either: sessions already stay logged in indefinitely by design (see
+  `docs/keycloak_integration/`), so there's nothing left for it to do.
+- **The email field validates format before any network call, and suggests
+  previously-used emails on this device.** `isValidEmail` rejects an
+  incomplete address (e.g. missing `@`/domain) immediately, instead of
+  waiting on a round trip just to get "Invalid credentials" back for
+  something that could never have been valid. Suggestions come from the
+  app's own `localStorage` (`config.js`'s `getRememberedEmails`/
+  `rememberEmail`/`forgetEmail`, last 5, most recent first, only ever added
+  after a successful login), rendered as a touch-sized dropdown in
+  `Login.jsx` — not the browser's native autocomplete/`<datalist>`, both of
+  which are switched off device-wide (see the kiosk lockdown below) and
+  whose rows are too small to tap reliably anyway. Passwords are
+  deliberately never remembered or suggested this way, in the app or the
+  browser: several operators share this one device, and the backend only
+  ever keeps a hash, so it couldn't supply one back even if asked.
+- **Kiosk browser hardening.** The Firefox instance this app runs in full
+  time on the device now ships a `policies.json` (password manager, other
+  autofill, `about:` pages, devtools, extension installs and auto-update all
+  disabled) and relaunches itself automatically if closed or crashed,
+  instead of leaving the bare desktop exposed. This is a device-hardening
+  change with no effect on the app's own behavior — full detail in `10 -
+  pwa_and_deployment_rollout.md`'s Kiosk browser section.
 
 ## Suggested future enhancements
 

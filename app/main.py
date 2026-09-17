@@ -10,10 +10,9 @@ from app.core.config import settings
 from app.core.database import Base, engine
 from app.models import schema  # noqa: F401  — registers the tables on Base.metadata
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-)
+from app.core.logging_setup import configure_logging
+
+configure_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +25,23 @@ async def lifespan(app: FastAPI):
     (start_background_threads, main.py:3112-3124).
     """
     logger.info("Eye Compass API starting up...")
+
+    # Which identity provider operator logins go to. Logged explicitly because
+    # it is otherwise invisible: a successful login looks identical in the
+    # access log either way, so without this line there is no way to tell from
+    # journalctl whether a device is on Keycloak or still on direct Qualix.
+    if settings.AUTH_PROVIDER == "keycloak":
+        logger.info(
+            "Auth provider: KEYCLOAK (%s, realm=%s, client=%s). Sync via Assurance: %s",
+            settings.KEYCLOAK_URL, settings.KEYCLOAK_REALM,
+            settings.KEYCLOAK_CLIENT_ID,
+            settings.ASSURANCE_API_URL or "NOT SET — syncing will fail",
+        )
+    else:
+        logger.info(
+            "Auth provider: QUALIX direct/legacy (%s). Set AUTH_PROVIDER=keycloak to switch.",
+            settings.QUALIX_API_URL,
+        )
 
     # 1. Schema. A failure here is fatal — the legacy app could not run without
     #    its database either, and starting anyway just moves the error to every
@@ -40,6 +56,22 @@ async def lifespan(app: FastAPI):
             exc,
         )
         raise
+
+    # Sessions used to live in memory, so every restart silently logged
+    # everybody out. Reporting the surviving count here makes that visible: a
+    # non-zero number after a restart is the proof that persistence works.
+    try:
+        from app.core.security import session_store
+
+        alive = len(session_store.active_sessions())
+        logger.info(
+            "[SESSION] %s session(s) restored from the database — operators stay "
+            "logged in across restarts.", alive
+        ) if alive else logger.info(
+            "[SESSION] No active sessions in the database; next login starts a new one."
+        )
+    except Exception as exc:
+        logger.warning("Could not read existing sessions at startup: %s", exc)
 
     # 2. Safety: the machine must never come up with the belt running.
     #    Legacy did this at main.py:505.
@@ -84,6 +116,19 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Unsynced-result retry worker started (every %s min).",
             settings.SYNC_RETRY_INTERVAL_MINUTES,
+        )
+
+    # Only meaningful under Keycloak: it revalidates sessions against the
+    # identity provider, and the legacy Qualix path has no equivalent notion.
+    if settings.SESSION_REVALIDATION_ENABLED and settings.AUTH_PROVIDER == "keycloak":
+        from app.services.session_worker import session_revalidation_worker
+
+        tasks.append(
+            asyncio.create_task(session_revalidation_worker(), name="session-revalidation")
+        )
+        logger.info(
+            "Session revalidation worker started (every %s h).",
+            settings.SESSION_REVALIDATION_INTERVAL_HOURS,
         )
 
     s3_task = None

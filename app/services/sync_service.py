@@ -48,17 +48,44 @@ class SyncService:
         self.first_name = ""
         self.customer_name = ""
 
-        base = settings.QUALIX_API_URL
+        # Under AUTH_PROVIDER=keycloak the same Qualix endpoints are reached
+        # through the Assurance gateway instead of directly: Assurance accepts
+        # a Keycloak token, adds whatever headers Qualix needs, and proxies on.
+        # The gateway also drops the "portal/" path prefix, so the paths differ
+        # as well as the host — hence the separate ASSURANCE_* URIs.
+        use_gateway = settings.AUTH_PROVIDER == "keycloak" and settings.ASSURANCE_API_URL
+        base = settings.ASSURANCE_API_URL if use_gateway else settings.QUALIX_API_URL
         if not base.endswith("/"):
             base += "/"
+
+        config_uri = settings.ASSURANCE_CONFIG_URI if use_gateway else settings.CONFIG_URI
+        analysis_uri = (
+            settings.ASSURANCE_ANALYSIS_POST_URI if use_gateway
+            else settings.ANALYSIS_POST_URI
+        )
+
+        # Only used on the legacy path — the gateway has no Qualix OAuth login
+        # to call, since Keycloak issues the token instead.
         self.oauth_uri_get = base + settings.OAUTH_URI_GET
         self.oauth_uri_post = base + settings.OAUTH_URI_POST
-        self.analysis_post_uri = base + settings.ANALYSIS_POST_URI
-        self.commodity_uri = base + settings.CONFIG_URI
+        self.analysis_post_uri = base + analysis_uri
+        self.commodity_uri = base + config_uri
 
     # ------------------------------------------------------------------
     @property
+    def _use_keycloak(self) -> bool:
+        return settings.AUTH_PROVIDER == "keycloak"
+
+    @property
     def is_authenticated(self) -> bool:
+        if self._use_keycloak:
+            # Syncing authenticates as its own fixed account, so it is
+            # "authenticated" whenever that account can get a token — never
+            # dependent on an operator having logged in, which matters because
+            # an operator who signed in offline has no Keycloak token at all.
+            from app.services.keycloak_service import keycloak_service
+
+            return bool(keycloak_service.service_token())
         return bool(self.access_token)
 
     def login_qualix(self, username: str, password: str) -> bool:
@@ -108,10 +135,15 @@ class SyncService:
             return False
 
     def _auth_headers(self, json_body: bool = False) -> dict:
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Cookie": self.cookie.get("JSESSIONID", ""),
-        }
+        if self._use_keycloak:
+            from app.services.keycloak_service import keycloak_service
+
+            headers = {"Authorization": f"Bearer {keycloak_service.service_token() or ''}"}
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+                "Cookie": self.cookie.get("JSESSIONID", ""),
+            }
         if json_body:
             headers["Content-Type"] = "application/json"
         return headers
@@ -124,7 +156,7 @@ class SyncService:
         """
         import json
 
-        if not self.access_token:
+        if not self.is_authenticated:
             return "0", "No_access_token"
 
         try:
@@ -135,6 +167,20 @@ class SyncService:
                 headers=self._auth_headers(json_body=True),
                 timeout=30,
             )
+            # The service token can expire between calls. Fetch a fresh one and
+            # retry once before treating this as a delivery failure, otherwise
+            # every record would sit pending until the next worker cycle.
+            if response.status_code == 401 and self._use_keycloak:
+                from app.services.keycloak_service import keycloak_service
+
+                logger.info("Assurance returned 401 — refreshing service token and retrying.")
+                keycloak_service.invalidate_service_token()
+                response = requests.post(
+                    self.analysis_post_uri,
+                    data=body,
+                    headers=self._auth_headers(json_body=True),
+                    timeout=30,
+                )
             if response.status_code == 200:
                 return "1", "ok"
             if response.status_code == 400:
@@ -149,7 +195,7 @@ class SyncService:
     # ------------------------------------------------------------------
     def fetch_config(self) -> Optional[dict]:
         """GET the icompass config. Port of api_handle.get_commodity (api_handle.py:104-115)."""
-        if not self.access_token:
+        if not self.is_authenticated:
             logger.warning("fetch_config called with no access token")
             return None
         try:
@@ -159,6 +205,17 @@ class SyncService:
                 headers=self._auth_headers(),
                 timeout=30,
             )
+            if response.status_code == 401 and self._use_keycloak:
+                from app.services.keycloak_service import keycloak_service
+
+                logger.info("Assurance returned 401 on config fetch — retrying with a fresh token.")
+                keycloak_service.invalidate_service_token()
+                response = requests.get(
+                    self.commodity_uri,
+                    params={"response_type": "code", "client_id": "client-mobile"},
+                    headers=self._auth_headers(),
+                    timeout=30,
+                )
             if response.status_code != 200:
                 logger.error("Config fetch failed: HTTP %s", response.status_code)
                 return None
@@ -180,6 +237,12 @@ class SyncService:
         failure mid-way left the device with no commodities at all.
         """
         if not self.is_authenticated:
+            # Under Keycloak, is_authenticated already obtained (or failed to
+            # obtain) the service token itself — there is no separate Qualix
+            # login to attempt, so a False here is terminal for this cycle.
+            if self._use_keycloak:
+                logger.warning("Cannot sync config — Keycloak service login failed.")
+                return False
             username = username or settings.QUALIX_USERNAME
             password = password or settings.QUALIX_PASSWORD
             if not self.login_qualix(username, password):

@@ -198,9 +198,21 @@ cat ~/.local/state/eye-compass-kiosk.log
 
 # Close it — the script now launches with --kiosk (full-screen, no title
 # bar/close button by request), so there is no on-screen way to close the
-# window; use Alt+F4, or from any terminal:
+# window; use Alt+F4, or from any terminal. The launch script relaunches
+# Firefox automatically if it closes or crashes (see below), so killing just
+# the browser process only closes it for ~3 seconds — stop the launch
+# script's own process too if you actually want it to stay closed:
+pkill -f eye-compass-kiosk.sh
 pkill -f "firefox --profile /home/nvidia/.local/opt/firefox-kiosk-profile"
 ```
+
+**The browser relaunches itself if closed or crashed.** `eye-compass-kiosk.sh`
+runs Firefox inside a `while true` loop (`sleep 3` between attempts) rather
+than a single launch, so the device recovers on its own from a crash or an
+operator somehow closing the window, instead of being left on the bare GNOME
+desktop with no keyboard to get back in with. See `10 -
+pwa_and_deployment_rollout.md`'s Kiosk browser section for the full reasoning
+and the Firefox `policies.json` lockdown that goes with it.
 At graphical login it starts on its own — no command needed, and no
 DISPLAY/XAUTHORITY to set manually either (the autostart entry already runs
 inside that graphical session) — via

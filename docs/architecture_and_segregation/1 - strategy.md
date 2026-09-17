@@ -62,13 +62,25 @@ this application depends on to run.
 
 ## What was explicitly *not* part of this project
 
-- Authentication was not moved to an external identity provider (Keycloak,
+- ~~Authentication was not moved to an external identity provider (Keycloak,
   OIDC, etc.). An earlier planning draft of this document proposed that; it
   was never built. The actual implementation is a simple server-side bearer
   token issued at login (`app/core/security.py`), matching the legacy app's
   own login flow (online-first against Qualix, offline fallback against a
   locally cached credentials table) rather than replacing it with something
-  new.
+  new.~~
+
+  **Reversed after the segregation work — see `enhancements.md`.** Kept above
+  rather than deleted, per this doc set's convention of recording reversed
+  decisions instead of erasing them. Operator login can now be pointed at this
+  organization's Keycloak instance via `AUTH_PROVIDER=keycloak`; the original
+  reasoning was sound at the time, but Keycloak turned out to already front
+  Qualix org-wide through the Assurance gateway, so this is adopting existing
+  infrastructure rather than introducing something new. The bearer-token
+  design above is unchanged and still what actually authorizes requests —
+  Keycloak only replaces *who verifies the password at login*. `AUTH_PROVIDER`
+  defaults to `legacy`, so a device that is not switched over behaves exactly
+  as this paragraph originally described.
 - No message broker (Redis Pub/Sub, RabbitMQ) was introduced to fan data out
   to other systems. The legacy app's own sync targets — Qualix, Google Sheets,
   S3 — were ported as backend background workers, nothing more.

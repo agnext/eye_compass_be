@@ -10,7 +10,18 @@ Three columns that the legacy code stored as stringified Python literals
     com_details.analysis, com_details.variety, result.result
 """
 
-from sqlalchemy import Column, Integer, String, Text, UniqueConstraint, Index
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import JSON
 
@@ -28,6 +39,58 @@ class Creds(Base):
     id = Column(Integer, primary_key=True)
     user = Column(String(150), index=True)
     password = Column(String(255))
+
+
+class Session(Base):
+    """An issued login session token.
+
+    No legacy counterpart — the legacy app was a single-process kiosk whose
+    login screen physically gated the page change, so there was nothing to
+    persist. This backend listens on a socket and issues bearer tokens.
+
+    These were held in a process-local dict until sessions had to survive a
+    restart: an operator was meant to stay logged in for weeks, but every
+    `systemctl restart` silently logged everyone back out. Persisting them here
+    makes the promise real.
+
+    There is no expiry column, and that is the point. A session is valid while
+    its row exists; the only thing that ends one is Keycloak saying the account
+    is no longer good, which sets needs_relogin. Elapsed time is never a
+    reason — a device that has been out of signal for months knows exactly as
+    much about its operator's account as it did on day one, so logging them out
+    would punish them for the network.
+
+    Two earlier designs are worth recording so they are not reintroduced. The
+    first stored an `expires_at` that the daily worker rewrote to "now + 45
+    days" on every check — a date that silently moved every day, so the row
+    could not tell you whether a session was an hour or a year old. The second
+    kept last_verified_at but still lapsed sessions after a fixed number of
+    unconfirmed days, which signed out offline operators who had done nothing
+    wrong and could not possibly have been checked.
+
+    last_verified_at survives both, as a record of when Keycloak last confirmed
+    the account. It is for diagnostics and log-reading only and decides nothing.
+
+    needs_relogin is set when Keycloak reports the account disabled or revoked,
+    and also when an operator who signed in offline can finally be checked
+    because connectivity has returned. It deliberately does NOT invalidate the
+    token: the operator may be mid-batch, and cutting them off there would lose
+    the scan. The frontend acts on it at a safe checkpoint instead (Home screen
+    only), where it prompts rather than yanking them out.
+    """
+
+    __tablename__ = "sessions"
+
+    token = Column(String(64), primary_key=True)
+    username = Column(String(150), index=True)
+    mode = Column(String(30))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_verified_at = Column(DateTime, index=True)
+    refresh_token = Column(Text)
+    needs_relogin = Column(Boolean, default=False, nullable=False)
+    first_name = Column(String(150), default="")
+    email = Column(String(255), default="")
+    roles = Column(JSONType, default=list)
 
 
 class ClientInfo(Base):
