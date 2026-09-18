@@ -669,3 +669,157 @@ JET-colormap-tinted background are both intentional, matching legacy exactly
 `xai_optimized.py`): a strongly-colored blob at a detection means high
 confidence; the red-dominant background is JET's "low activation" end,
 correctly recolored across the whole frame, not a residual color bug.
+
+## 7k. `create_results` counted every FM crop twice (wrong totals saved AND synced)
+
+Found from the History → record-view screen: batch `milind4550` showed
+`Total FO: 247` beside a gallery captioned `Captured objects (245)`. Both
+numbers are derived, and they disagreed by exactly 2.
+
+The stored record claims `FM: 4`; the batch folder holds exactly 2
+`FM_*.png` crops. Every other one of the 12 categories matched its file
+count exactly.
+
+`create_results` (`scan_session.py`) builds its match list as:
+
+```python
+params = list(self.analysis_parameters) + ["FM", "NON-FM"]
+```
+
+and then, for each file, increments `counter[key]` for every `key` in
+`params` the filename's stem starts with. **Most commodities already carry
+`"FM"` in their own analysis vocabulary** — Urad White's is `['Others',
+'Blower FO', 'Magnetic FO', 'Husk', 'FM', 'Metal Fragments', ...]` — so the
+hardcoded `+ ["FM", ...]` puts `"FM"` in the list **twice**, and with no
+`break` in the inner loop each FM crop is counted once per occurrence.
+2 crops × 2 = the stored `FM: 4`, and since `total_fo_detected` is summed
+straight from these values, 245 real crops became the stored 247. Replaying
+the exact pre-fix logic over that folder reproduces `FM: 4`/`total: 247`
+deterministically; the fixed version yields `FM: 2`/`total: 245`.
+
+**This is a porting bug, not legacy behavior.** Legacy does not iterate a
+list — it builds a dict first (`main.py:1443`):
+
+```python
+filename_mapping = {param: param.replace(" ", "_") for param in analysis_parameters}
+...
+for key, mapped_value in filename_mapping.items():
+    if file_name.startswith(key):
+        counter[key] += 1
+```
+
+A dict comprehension silently collapses the duplicate `"FM"` to one key, so
+legacy matches it once. The port swapped that dict for a plain list and
+reintroduced the duplicate. Fixed by deduplicating while preserving order
+(`dict.fromkeys(...)`), which restores legacy's own semantics exactly rather
+than changing them. The missing `break` is deliberately left as-is: legacy
+has no break either, so a genuine prefix-collision pair would double-count
+there too — no commodity's vocabulary currently contains such a pair.
+
+**Scope of the damage.** This affected the saved `result`/`total_fo_detected`
+for every batch that captured at least one crop labelled with the generic
+`FM` type, on any commodity whose vocabulary also lists `FM` — and those
+inflated numbers went into the Qualix datagram, so they were *synced*, not
+just displayed. Already-stored rows are not retroactively corrected by this
+fix; they keep the inflated values until someone decides whether to
+recompute and re-deliver them.
+
+## 7l. Every saved crop and raw frame had red and blue transposed
+
+Reported from the History → record-view gallery: the captured-object crops
+looked like XAI heatmaps rather than photographs — a red/brown field with
+blue blobs, which reads exactly like a JET colormap. Nothing from the XAI
+path was actually leaking into the gallery; the crops were simply being
+written with their red and blue channels swapped. The belt is a blue
+food-grade belt and the objects are cream/tan, so transposing R and B turns
+the belt brown and the grains blue, which is what made it look like a
+heatmap.
+
+Both codebases debayer identically — `cv2.COLOR_BAYER_RG2RGB`, legacy at
+`GrabImage.py:45`, this port at `camera_service.py:230`. Call that array
+`B`. Legacy then swaps the channels a **second** time before anything
+downstream sees the frame (`GrabImage.py:308`,
+`image_rgb = cv2.cvtColor(pic, cv2.COLOR_BGR2RGB)`), and it is that `img`
+copy which `emit_results` hands to the crop/save path and which the global
+`image` used by the XAI view points at. So:
+
+| | legacy | port (before) | port (after) |
+|---|---|---|---|
+| array reaching the save path | `S(B)` | `B` | `B` |
+| conversion at write time | `BGR2RGB` | `BGR2RGB` | none |
+| net | identity → `B` as BGR ✓ | one swap ✗ | identity → `B` as BGR ✓ |
+
+The port has no equivalent of that `GrabImage.py:308` conversion, so copying
+legacy's write-time conversion literally (`main.py:1361` for crops,
+`main.py:2464` for raw frames) left exactly one uncancelled swap. Dropping
+it at the three save sites in `scan_session.py` (`label_detection`,
+`save_unselected`, `save_raw_frame`) restores legacy's **net** behavior
+rather than changing it — see `_COLOR_ORDER_NOTE` at the top of that file.
+
+Verified three ways: legacy's own `output/` crops show a blue belt with
+cream rice grains; R/B-swapping one of this port's crops reproduces exactly
+that; and re-running the fixed save path over a recovered frame produces the
+blue belt/tan object directly.
+
+The live view was never affected and needed no change — `camera.py`'s
+`encode_display` hands the frame straight to `cv2.imencode` with no
+conversion, which is already the correct `B`-as-BGR reading. That is also
+why the discrepancy went unnoticed: the operator's screen was right while
+the files on disk were not.
+
+**The XAI view had the same defect, from the same misconception.**
+`xai.py` was converting `pending_frame` with `COLOR_RGB2BGR` before building
+the heatmap. Legacy hands its own array to Qt, whose `QImage` reads it as
+RGB; this port hands it to `cv2.imencode`, which reads it as BGR — so the
+photograph *underneath* the heatmap was swapped, while the JET colormap
+itself (produced by `applyColorMap` in OpenCV's own BGR order) came out
+correct. That combination is why §7j's earlier review concluded the
+red-dominant background was legitimate JET output: the colormap was right,
+but the belt beneath it was brown instead of blue and reinforced the
+impression. Now blended onto an unconverted `.copy()` — the copy also
+matters on its own, since `build_confidence_heatmap` blends into the array
+it is given, and passing `pending_frame` itself would burn the heatmap into
+the very frame every later crop is cut from.
+
+Already-saved crops are not rewritten by this fix; existing batches keep
+their swapped colors on disk and in S3.
+
+## 7m. The captured-object preview modal appeared to "blink" and Preview seemed dead
+
+Reported directly: double-tapping a thumbnail on ReclassifyObjects.jsx made
+the enlarged preview flash open and immediately close again, and the
+"Preview" button (jump-to-object-number) seemed to do nothing at all.
+
+The preview *was* opening correctly both times — it was being closed again
+instantly. The modal's backdrop (`reclassify-preview-overlay`/
+`results-preview-overlay`) covers the whole screen the moment it renders
+and closes the preview on any click. On this touchscreen, the **second tap**
+of a double-tap lands on that just-rendered backdrop and dismisses it before
+it can be seen, which reads as a blink. The same mechanism explains the
+Preview button: pressed twice in quick succession (as an operator retrying
+what looked like a dead button naturally would), the first tap opens the
+preview and the second immediately closes it.
+
+Fixed by timestamping when the preview last opened
+(`previewOpenedAtRef`/`handlePreviewBackdropClick` in both
+ReclassifyObjects.jsx and ResultsViewer.jsx) and ignoring a backdrop click
+within 400ms of that — comfortably inside a double-tap's timing, comfortably
+below any deliberate "tap to dismiss" gap. The modal's own ✕ close button is
+unaffected and still closes unconditionally on any single tap.
+
+## 7n. A "Change to" dropdown opened visually behind the preview modal it lives in
+
+Reported directly, with a screenshot: opening the "Change to" dropdown from
+inside the reclassify preview modal showed the option list rendering
+*underneath* the modal, so taps on any option landed on the modal instead
+and the operator couldn't select anything.
+
+`CustomSelect`'s option panel is portal-rendered onto `document.body`
+specifically so it can escape its trigger's own clipping ancestors (see
+`CustomSelect.jsx`'s own docstring), but that also means its stacking order
+is no longer determined by where it sits in the DOM tree — it needs its own
+`z-index` high enough to clear anything else on the page, including a modal
+the trigger happens to be inside. It was left at `z-index: 40`
+(`CustomSelect.css`) while both pages' preview-modal overlays are
+`z-index: 50` — so the panel was opening correctly, just one layer beneath
+the modal. Raised to `z-index: 60`, above every modal in the app.

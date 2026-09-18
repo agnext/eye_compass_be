@@ -163,6 +163,13 @@ sudo systemctl stop eye-compass-backend.service
 sudo docker compose down           # or: docker compose stop, to keep the containers
 ```
 
+**Restart after a backend code change** (`uvicorn` runs without `--reload`,
+so an edited file has no effect until the service is restarted):
+
+```bash
+sudo systemctl restart eye-compass-backend.service
+```
+
 **The backend surviving a reboot is already set up** on this dev unit —
 `eye-compass-backend.service` is installed at `/etc/systemd/system/` and
 `enable`d (`Restart=always` besides, so it also comes back after a crash, not

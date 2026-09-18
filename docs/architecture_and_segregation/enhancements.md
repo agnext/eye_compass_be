@@ -12,6 +12,33 @@ them alongside further enhancements worth considering but not yet done.
 ## Enhancements already made
 
 ### Backend
+- **Captured-object crops now have a 20px margin around the detection box,
+  not legacy's 10px.** Every saved crop (`scan_session.label_detection`/
+  `save_unselected`) is cut directly from the box in `self.pending`, which is
+  built by padding the model's raw detection box via `enlarge_bbox` before
+  it's ever stored — one enlarge, then a single slice, not crop-then-pad.
+  Legacy pads by exactly the same mechanism at the same call site
+  (`GrabImage.py:574-616`, `pad=10`), and the port matched that value
+  exactly until this was first raised: crops were reported as too tightly
+  cropped around the object to read clearly, especially on this device's
+  touchscreen where a technician is judging a small thumbnail, and it went
+  to 30. That overshot — measured on a real batch, a 30px pad left the
+  object filling only about a third of its own crop (a ~30px object in a
+  ~90px image, the rest bare belt), so it rendered small in the preview.
+  Settled at 20 on request. `enlarge_bbox(b, pad=20, ...)` in
+  `scan_session.py`'s `process_frame` — a deliberate deviation from legacy's
+  value, not a bug fix, and it also sets the tap-to-classify overlay box
+  shown live on the frozen frame (both draw from the same padded list),
+  which is an intended side effect, not a separate change.
+
+  Worth recording for the next time crop legibility comes up: **padding is
+  the only software lever on it.** The objects are ~30-55 real sensor pixels
+  in a 1920x1200 frame, so less padding makes an object render *bigger*, never
+  sharper. Upscaling the crop at save time was tried and measured against a
+  browser's own stretch of the same file — the two are visually
+  indistinguishable, so it was not adopted (it would have inflated every
+  stored crop ~9x for no visible gain). Anything beyond this needs more
+  optical resolution, not code.
 - **History's Re-sync has no legacy equivalent at all.** Legacy has no
   operator-facing way to force a resync — the only thing that ever re-sends
   a `sync_status='0'` record is the fully automatic
@@ -59,6 +86,20 @@ them alongside further enhancements worth considering but not yet done.
   blocked, an expected operating state) and `502` (real failure) with a
   message, so the frontend can show the operator what actually happened
   instead of a generic error or nothing.
+- **Data Collection's page shows a live camera preview immediately, not only
+  once recording starts.** Legacy only ever emits a preview frame from inside
+  `CollectionCameraThread.run()` (`GrabImage.py:733-826`), i.e. between
+  `start_dc`/`capture_image_dc` and `stop_dc` — the port matched that
+  exactly at first, so arriving at the page showed a grey placeholder until
+  Start was pressed. Reported as looking like a broken/frozen camera, not
+  "recording hasn't started yet" (worth noting: it wasn't actually a bug at
+  the time — this doc's own earlier text said so — just an unhelpful piece
+  of legacy fidelity). `data_collection_stream` (`app/api/camera.py`) now
+  grabs and sends a frame on every loop iteration regardless of
+  `_dc_recording`; only the disk write (the actual "data collection" part)
+  stays gated on it, matching Dashboard's own live-scan page
+  (`/ws/camera/stream`), which never had this restriction. A deliberate
+  deviation from legacy, not a bug fix.
 - **Data Collection's finish step cleans up unconditionally.** Legacy's
   `submit_dc`/`back_from_dc` just navigate away — if the operator forgot to
   press Stop first, the frame-recording thread and the belt both keep running
@@ -68,6 +109,46 @@ them alongside further enhancements worth considering but not yet done.
   `"dummy_offline_token"` for an offline login, which nothing downstream could
   actually authenticate with. The backend issues a real session token
   (`SessionStore`, 45-day TTL) for both the online and offline login paths.
+- **The live `total_fo_detected` no longer counts detections that were
+  suppressed from operator review.** Legacy's `handle_detection`
+  (`main.py:2618-2622`) adds every new tracker id to `existing_track_ids`
+  whether or not `has_similar_x_axis` decided it was the same physical object
+  already awaiting a label — so a re-identified duplicate inflates the count
+  as if it were a second object, and one that is never photographed, since
+  crops are only written for items that reach `self.pending`. `scan_session`
+  now keeps a second set, `counted_track_ids`, holding only ids actually
+  queued for review, and the live count reports that instead.
+  `existing_track_ids` is still accumulated unchanged, purely to keep a
+  suppressed duplicate from being re-evaluated on every subsequent frame.
+  Requested directly after the mismatch was noticed on screen. Note this only
+  moves the **live, in-progress** number shown during a scan: the saved
+  result's `total_fo_detected` is computed by `create_results()` counting crop
+  *files* on disk, which never included suppressed detections in the first
+  place. An earlier attempt at this was reverted (see
+  `9 - post_remediation_session_log.md` §7b) to preserve legacy parity for the
+  Qualix datagram — that reasoning still applies to the saved figure, which is
+  unchanged here.
+- **The reclassify endpoint is serialized against itself and against Save.**
+  `POST /api/scan/pending-crops/relabel` renames one crop, then re-counts the
+  entire batch folder and overwrites the module-level `_pending_submission`
+  with what it measured. Only the rename was locked. FastAPI runs plain `def`
+  endpoints on a threadpool, and the reclassify screen fires one request per
+  staged change (≈20 within a few seconds in a real batch), so a request that
+  measured the folder *before* a sibling's rename landed could finish last and
+  write its stale totals over the fresher ones — and whatever sits in that
+  slot when the operator presses Save is exactly what is persisted and synced
+  to Qualix. Reproduced with a threaded harness against the unlocked code (4
+  of 12 runs persisted counts that disagreed with the folder, e.g. a phantom
+  `FM: 1` alongside `Husk: 7` where disk held `Husk: 8`); 12 of 12 clean once
+  locked. Note this is a *latent* bug — it is NOT what corrupted batch
+  `milind4550` (see the `create_results` double-count in
+  `9 - post_remediation_session_log.md`), since a pure rename cannot change
+  the file total the way that record's did. A module-level
+  `_pending_lock` now spans the whole rename → recount → publish cycle, and
+  `/submit`, `/confirm`, `/discard` and `/pending-crops` take it too, so Save
+  waits for an in-flight reclassify instead of persisting a half-applied one.
+  Not a legacy concern at all — legacy has no reclassify path and is
+  single-threaded Qt.
 
 ### Frontend
 - **The live-scan page's in-app Back button is not shown at all for the
@@ -229,6 +310,136 @@ them alongside further enhancements worth considering but not yet done.
   instead of the clickable Item/Count one (there is nothing meaningful for
   clicking them to filter the gallery to, now that they can never be tapped
   during classification).
+
+- **Reclassify a captured object on the pre-Save review screen.** Genuinely
+  new — legacy has no equivalent at all: `ImageLabel.mousePressEvent`
+  (`main.py:219-246`) no-ops on a box that already has a label, and neither
+  `create_results` nor `submit_create_result`/`save_result` offer any
+  edit/undo path, even at Submit. Requested directly, not a legacy-parity
+  fix.
+
+  Classification is stored as the crop file's own filename prefix
+  (`{fm_name}_{epoch_ms}.png`, `scan_session.label_detection`), and
+  `create_results()` just counts files by that prefix — so reclassifying is
+  a rename, nothing more, and only meaningful before `/confirm` persists the
+  batch (after that, the crops may already be archived/synced). New backend
+  methods `scan_session.list_pending_crops()`/`relabel_crop()` and endpoints
+  `GET /api/scan/pending-crops` / `POST /api/scan/pending-crops/relabel`
+  (`app/api/scan.py`), gated on the same `_pending_submission` window
+  `/confirm` and `/discard` already use. A relabel re-runs `create_results()`
+  and `build_datagram()` so the counts stay correct, rewrites `result.json`,
+  and returns the same `{status, result, datagram}` shape `/submit` does, so
+  `ResultsViewer.jsx`'s pending screen just swaps in the new result rather
+  than re-fetching anything. Surfaced as a small gallery inside the pending
+  screen's existing breakdown panel — each captured object has a dropdown to
+  re-tap it to a different FM type (or back to `NON-FM`).
+
+  **Known limitation, not fixed here**: the S3 upload worker
+  (`s3_worker.py`, see `11 - data_folders_and_s3_upload.md`) sweeps
+  `output/`/`output_frame/` every 60s independent of whether a batch is
+  still pending, keyed by local filename with no rename-tracking. If a crop
+  is uploaded before it's reclassified, the rename leaves a stale orphan
+  object in S3 under the old name and a second upload under the new one —
+  local and S3 state diverge for that one file. Rare in practice (a
+  reclassify happens promptly, within the same short review window a
+  60-second sweep may or may not have already caught), but a real gap if it
+  does line up.
+- **XAI View is disabled on the live-scan page.** The button and its handler
+  (`Dashboard.jsx`'s `handleXaiToggle`/`xaiImage` state) are left in place
+  but commented out of the rendered header, on request, "until further
+  notice." Not a removal of the feature, just hidden.
+- **"Item" renamed to "FO Category"** in the breakdown table headers on both
+  the Save/Results-review screen and the History → record-view screen
+  (`ResultsViewer.jsx`), on request — purely a label change, the underlying
+  `item`/`itemRows` field names are untouched.
+- **A note on Blower FO / Magnetic FO** was added explaining they are typed
+  totals from other machine stages (the air blower, the magnetic separator),
+  not camera detections, and can't be reclassified like a captured crop —
+  shown only on the pending (not-yet-saved) results screen
+  (`showFoInfoNote`, gated to `isPending`), not on a saved History record.
+- **The reclassify screen's own staged-changes log is ordered by object
+  number, not by the order each change was staged.** Object 1's change (if
+  any) always appears above Object 5's, matching `objectNumberById`'s own
+  numbering, rather than reshuffling every time the operator reclassifies
+  something out of order.
+- **The live tap-to-classify FM overlay (Dashboard.jsx) has no Cancel
+  option.** Once the operator taps a detected box, they must pick an FM
+  type from the popup — there is no way to dismiss the picker without
+  labeling it, on request. (This also matches legacy, which never had a
+  Cancel/dismiss affordance on this exact overlay either — main.py's own
+  detection-review flow has no equivalent button.)
+- **FM type lists are alphabetized app-wide** (the Reclassify "Change to"
+  dropdown, Dashboard's tap-to-classify overlay, DetailsEntry's pre-scan FM
+  select, and the reclassify gallery's own type filter) — `NON-FM` (and, in
+  the FO Category table specifically, `Blower FO`/`Magnetic FO`) stay pinned
+  to a fixed position rather than sorting in alphabetically, since they
+  aren't real "found" FM types the way the rest are.
+- **`CustomSelect` (`src/components/CustomSelect.jsx`) and `ScrollFrame`
+  (`src/components/ScrollFrame.jsx`)** are new reusable components with no
+  legacy equivalent. A native `<select>`'s open dropdown draws its own
+  scrollbar at the OS/browser level, which can't be made to behave like the
+  rest of the app's always-visible ScrollFrame scrollbars (it flashes and
+  auto-hides), so `CustomSelect` renders its own option list (via
+  `ScrollFrame`) in a `document.body` portal instead — used for
+  ReclassifyObjects.jsx's "Change to" dropdown and both pages' "Filter by
+  type" gallery filter; not yet swapped in for every native `<select>` in
+  the app (kept scoped on request). `ScrollFrame` itself pairs a real,
+  always-visible native scrollbar with up/down nudge buttons, and is only
+  rendered when there is actual overflow to scroll.
+- **Tap-to-preview modal for captured-object crops**, on both
+  ReclassifyObjects.jsx and ResultsViewer.jsx — tapping a gallery thumbnail
+  opens an enlarged view with Previous/Next navigation (and, on the
+  reclassify page, a jump-to-object-number control); not a legacy feature.
+  Sized at `min(760px, 96vw)` / up to 70vh image height (enlarged from an
+  initial, smaller size on request — crop legibility is bounded by the
+  underlying ~30-55px of real sensor detail, see the crop-padding entry
+  above, so this is a genuine size increase, not a workaround for blur).
+- **History's Sync Status is a pill only, with no manual retry button at
+  all**, for every status. Legacy has no manual resync concept in the first
+  place (see the very next bullet); this port initially added a button for
+  both a pending ('0') and a failed/rejected ('2') record, then removed both
+  on request: `sync_worker.py`'s own 15-minute retry already covers '0'
+  automatically, and a '2' record was rejected by Qualix outright (HTTP
+  400) — resending the exact same payload changes nothing, so a retry button
+  there never actually helped. `'2'`'s label was changed from "Sync Failed"
+  to "Rejected" to stop implying a retry could fix it. Applied identically
+  on the History table and the ResultsViewer record-view header.
+- **History is sorted latest-first (by scan date/start_time), not by
+  legacy's commodity-name grouping.** Legacy's own `populate_history_table`
+  (`main.py:2100`) sorts rows by commodity name descending, then receiving
+  date descending within each commodity — reproduced exactly at first, then
+  changed to latest-first on request once it was confirmed this diverges
+  from legacy on purpose (see `history.py`'s own `get_history` docstring for
+  the full reasoning).
+- **The record-view gallery fetches every crop for the record in a single
+  request**, not paged 12/24 at a time. The gallery is now a single
+  scrollable grid (ScrollFrame provides the scrolling), not legacy's paged
+  previous/next viewer, so paging server-side only capped the grid at its
+  first page with nothing to reach the rest once the paged viewer's own
+  prev/next controls were removed. `get_result_images`'s `limit` cap was
+  raised from 200 to 2000 to match.
+- **Data Collection's live camera preview and the reclassify/record-view
+  crop previews had their own render/UX bugs found and fixed along the
+  way** — see `9 - post_remediation_session_log.md` §7m (preview closing
+  itself on a double-tap) and §7n (a portal-rendered dropdown opening
+  visually behind a modal).
+- **The saved/History-detail record-view screen (`ResultsViewer.jsx`,
+  `!isPending`) no longer has a docked, narrow enlarged-crop column.** It
+  originally mirrored the pending-review screen's own frame/breakdown
+  layout; on request this became first a full-width thumbnail gallery with
+  a "Filter by type" dropdown (tapping a thumbnail opens the same
+  tap-to-preview modal used elsewhere instead of an inline enlarged view),
+  then restructured again to match ReclassifyObjects.jsx's own layout
+  exactly — a gallery grid on the left, a fixed-width panel on the right
+  (the FO Category/Metric tables, in place of reclassify's staged-changes
+  log). The `isPending` (pre-save) screen's own layout from §7g is
+  untouched by any of this.
+- **Sync Status pill and the (now-removed) Sync Now button were sized to
+  match the Home button, and made uppercase.** Both were noticeably smaller
+  than the header's own Home button on this device's screen; sizing was
+  matched explicitly rather than inherited from a shared button class,
+  since they sit in the same header row on both History.jsx and
+  ResultsViewer.jsx.
 
 ## Suggested future enhancements
 

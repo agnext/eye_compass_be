@@ -94,7 +94,19 @@ def generate_heatmap(req: XAIRequest):
         # (camera.py:267) — so re-run it unconverted for identical results,
         # then convert to BGR only for the drawing/colormap step below.
         raw_frame = scan_session.pending_frame
-        img_bgr = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
+        # .copy(), and NOT through a channel swap. Legacy hands its own
+        # equivalent array to Qt, whose QImage reads it as RGB; this port
+        # hands it to cv2.imencode, which reads it as BGR — so keeping
+        # legacy's array-level conversion here left the photo underneath the
+        # heatmap with red and blue transposed (the JET colormap itself was
+        # unaffected, which is why it read as a plausible "red-dominant
+        # background" rather than an obvious bug). Same root cause as the
+        # saved-crop swap — see scan_session.py's _COLOR_ORDER_NOTE.
+        # The copy matters independently: build_confidence_heatmap blends
+        # into this array, and it must not be scan_session.pending_frame
+        # itself, or opening the XAI view would burn the heatmap into the
+        # frame every subsequent crop is cut from.
+        img_bgr = raw_frame.copy()
         detections, _ = _run_on_hw_thread(_run_inference, raw_frame)
         detections, _flag = apply_suppression_rules(detections, req.commodity, req.variety)
         used = "pending-frame-live-model"

@@ -26,7 +26,25 @@ from app.services.sync_service import sync_service
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# '2' means Qualix rejected the payload outright (HTTP 400) — a permanent,
+# data-shaped failure, not a transient one. Legacy's own retry worker only
+# ever queries sync_status == '0' (main.py:2891's get_unsynced_records), so
+# legacy never retried a '2' either; resending the exact same bytes would
+# just get rejected again. Labeled "Rejected" rather than "Sync Failed" (on
+# request) so it doesn't read as something a retry could fix.
 SYNC_LABELS = {"1": "Synced", "2": "Rejected", "0": "Pending"}
+
+
+def _strip_trailing_numeric_tokens(stem: str) -> list:
+    """Drop every trailing underscore-separated token that's purely digits
+    (a timestamp, a box index, or both) from a crop filename's stem (no
+    extension), leaving just the FM-type words. See get_result_images'
+    fm_type field below for why this can't assume exactly one such token.
+    """
+    parts = stem.split("_")
+    while len(parts) > 1 and parts[-1].isdigit():
+        parts.pop()
+    return parts
 
 
 def _row_to_summary(r: Result) -> dict:
@@ -66,21 +84,18 @@ def get_history(
 ):
     """Paged history.
 
-    Sort order matches legacy's populate_history_table (main.py:2100):
-    `sorted(list_of_lists, key=itemgetter(1, 2), reverse=True)`, where indexes
-    1 and 2 of that row tuple are Commodity and Receiving Date — i.e. sorted
-    by commodity name descending, then receiving date descending WITHIN each
-    commodity, as plain strings (not parsed as dates, same as legacy). Not
-    "most recent first" despite how that might read — confirmed against a
-    real legacy screenshot where rows were grouped/ordered by commodity name,
-    not by scan recency. (Briefly changed to sort by scan date/start_time
-    instead, then reverted back to this exact legacy match on request.)
+    Sorted latest-first by scan date/start_time (r.date, r.start_time — both
+    plain strings but written as "%Y-%m-%d"/"%H:%M:%S" by database_service.py,
+    so a string sort is chronological). This deviates from legacy's
+    populate_history_table (main.py:2100), which grouped rows by commodity
+    name (then receiving date) instead of scan recency — changed back to
+    latest-first on request.
     """
     try:
         rows = db.query(Result).all()
         summaries = [_row_to_summary(r) for r in rows]
         summaries.sort(
-            key=lambda s: (s["commodity"] or "", s["receiving_date"] or ""),
+            key=lambda s: (s["date"] or "", s["start_time"] or ""),
             reverse=True,
         )
         total = len(summaries)
@@ -136,13 +151,17 @@ def get_result_detail(result_id: int, db: Session = Depends(get_db)):
 def get_result_images(
     result_id: int,
     db: Session = Depends(get_db),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     item: str | None = Query(None),
 ):
     """The saved FO crops for a past scan.
 
-    Legacy paged through these with previous/next buttons (main.py:2204-2277).
+    The frontend's gallery is a single scrollable grid now (not legacy's
+    paged previous/next viewer), so it requests every crop in one call — the
+    le cap here just needs to comfortably exceed any real scan's crop count,
+    not stay small. Legacy paged through these with previous/next buttons
+    (main.py:2204-2277).
     Images are returned inline as data URIs so the browser needs no separate
     static mount, and the path is resolved from the stored image_unique_id
     rather than accepting one from the client.
@@ -196,8 +215,18 @@ def get_result_images(
                 {
                     "name": name,
                     # The FM type is the filename prefix — that is how results
-                    # are counted, so it is the label to show.
-                    "fm_type": name.rsplit("_", 1)[0].replace("_", " "),
+                    # are counted, so it is the label to show. A plain
+                    # rsplit("_", 1) assumed exactly one trailing numeric
+                    # token (a timestamp) — already wrong for NON-FM crops
+                    # (NON-FM_<ts>_<box index>.png has two), and now also for
+                    # labelled ones (scan_session.label_detection appends a
+                    # box index too, to make its object_id collision-proof).
+                    # Stripping every trailing all-digit token, not just the
+                    # last one, handles any of these regardless of how many
+                    # numeric suffixes a given crop's filename happens to have.
+                    "fm_type": " ".join(
+                        _strip_trailing_numeric_tokens(name.rsplit(".", 1)[0])
+                    ),
                     "data_uri": f"data:{mime};base64,{encoded}",
                 }
             )

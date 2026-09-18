@@ -26,6 +26,7 @@ unique track ids for the whole run (existing_track_ids) and produced the final
 per-FM breakdown by listing saved crop files. Both are reproduced here.
 """
 
+import base64
 import json
 import logging
 import os
@@ -45,6 +46,32 @@ from app.services.inference_service import apply_suppression_rules, enlarge_bbox
 from app.services.sort import ObjectTracker
 
 logger = logging.getLogger(__name__)
+
+# _COLOR_ORDER_NOTE — why the three save sites below write their frame/crop
+# as-is, dropping the cv2.COLOR_BGR2RGB conversion legacy applies at each of
+# its own (main.py:1361 submit_fm_type, main.py:2464 save_raw_image).
+#
+# Both pipelines debayer identically: cv2.COLOR_BAYER_RG2RGB, legacy at
+# GrabImage.py:45, this port at camera_service.py:230. But legacy then swaps
+# the channels a SECOND time before anything downstream sees the frame —
+# GrabImage.py:308's `image_rgb = cv2.cvtColor(pic, cv2.COLOR_BGR2RGB)`,
+# whose `img` copy is what emit_results hands to the crop/save path. So
+# legacy's saved files net TWO swaps (an identity), while this port, which
+# has no equivalent of that 308 conversion, netted only ONE — writing every
+# crop and raw frame with red and blue transposed.
+#
+# Visible as a JET-heatmap look that got mistaken for the XAI view leaking
+# into the gallery: the blue food-grade belt saved as brown, cream/tan
+# objects as blue. Confirmed against legacy's own output/ crops (a blue belt
+# with cream rice grains) and by R/B-swapping one of this port's crops, which
+# reproduces exactly that.
+#
+# Dropping the conversion here restores legacy's NET behavior rather than
+# changing it, and makes a saved crop match what the operator already sees
+# live — the stream encodes the same frame with no conversion either
+# (camera.py's encode_display), which is why the live view was always right
+# while the files were not. Inference is unaffected: it runs on the
+# unconverted frame in both codebases.
 
 
 def _slug(value: str) -> str:
@@ -75,8 +102,21 @@ class ScanSession:
         self.frame_count = 0
         self.saved_frame_count = 0
 
-        # Cumulative unique detections for the whole run (legacy existing_track_ids).
+        # Cumulative unique detections for the whole run (legacy existing_track_ids)
+        # — used only to dedupe the tracker's own ids frame to frame, so an
+        # x-axis-suppressed duplicate isn't re-evaluated (and re-logged) on
+        # every subsequent frame while it's still under the camera.
         self.existing_track_ids = set()
+        # Cumulative ids actually queued for operator review (a strict subset
+        # of existing_track_ids) — this, not existing_track_ids, is what
+        # total_fo_detected counts. Deliberate deviation from legacy on
+        # request: legacy's handle_detection (main.py:2618-2622) counts every
+        # new track id whether or not has_similar_x_axis suppressed it from
+        # review, which double-counts a duplicate detection of the same
+        # physical object as if it were a second one — never photographed,
+        # since save_unselected/label_detection only ever act on self.pending.
+        # See enhancements.md.
+        self.counted_track_ids = set()
         self.tracker = ObjectTracker(x_tolerance=10)
         self.tracker.update([[0, 0, 0, 0, 0, 0]], 0, (1200, 1920))
 
@@ -252,8 +292,10 @@ class ScanSession:
         """
         try:
             path = os.path.join(self.output_frame_folder, f"r_frame_{self.saved_frame_count}.jpg")
+            # As-is, not through legacy's cv2.COLOR_BGR2RGB (main.py:2464) —
+            # see _COLOR_ORDER_NOTE.
             encoded = cv2.imencode(
-                ".jpg", cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), [cv2.IMWRITE_JPEG_QUALITY, 95]
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
             )[1]
             with open(path, "wb") as fh:
                 fh.write(encoded.tobytes())
@@ -312,8 +354,21 @@ class ScanSession:
                 return self._snapshot(fm_detected=False)
 
             # 2. Pad boxes the way emit_results does before anything downstream
-            #    sees them (main.py / GrabImage.py:577).
-            boxes = [enlarge_bbox(b, pad=10, img_w=w, img_h=h) for b in detections]
+            #    sees them (main.py / GrabImage.py:577) — legacy uses pad=10,
+            #    but the saved crops (label_detection/save_unselected cut
+            #    directly from this same padded box, see their own comments)
+            #    were reported as too tightly cropped to read clearly, so this
+            #    was widened to 30. At 30 the object turned out to fill only
+            #    about a third of its own crop — a ~30px object in a ~90px
+            #    image, the rest belt — making it small and hard to read in
+            #    the preview. Settled at 20 on request: a deliberate deviation
+            #    from legacy's value in either direction, not a bug fix; see
+            #    enhancements.md. Note this is the ONLY lever on apparent crop
+            #    clarity — the object is only ~30-55 real sensor pixels, so
+            #    less padding makes it render bigger, never sharper.
+            #    Also sets the tap-to-classify overlay box shown live on the
+            #    frozen frame, since both draw from this same list.
+            boxes = [enlarge_bbox(b, pad=20, img_w=w, img_h=h) for b in detections]
 
             # 3. Track, then take only ids we have never seen in this run.
             self.tracker.update(detections, self.frame_count, (h, w))
@@ -336,18 +391,19 @@ class ScanSession:
             if new_ids and not self._has_similar_x_axis(boxes, x_threshold=10):
                 fm_detected = True
                 self._on_foreign_matter(frame, boxes)
+                # Only ids actually queued for review count toward
+                # total_fo_detected — see counted_track_ids' comment above.
+                self.counted_track_ids.update(new_ids)
             elif new_ids:
                 logger.info(
                     "FM detected but not queued for review (similar x-axis "
                     "already pending): %s", new_ids
                 )
 
-            # Accumulate every new id, queued for review or not — exactly as
-            # legacy's handle_detection does (main.py:2618-2622), because
-            # total_fo_detected feeds the Qualix datagram and has to stay
-            # comparable with what legacy reports for the same material.
-            # has_similar_x_axis only decides whether the operator is asked to
-            # classify it, not whether it was a real object.
+            # existing_track_ids still accumulates every new id regardless
+            # (queued or suppressed) — purely so a suppressed duplicate isn't
+            # treated as "new" again on the very next frame while the same
+            # physical object is still under the camera.
             self.existing_track_ids.update(track_ids)
 
             return self._snapshot(fm_detected=fm_detected)
@@ -426,10 +482,30 @@ class ScanSession:
 
             crop = self.pending_frame[y1:y2, x1:x2]
             safe_name = fm_name.replace(" ", "_")
-            filename = f"{safe_name}_{int(time.time() * 1000)}.png"
+            # Nanosecond timestamp AND the box's own index, not just a
+            # millisecond timestamp: confirmed live, two boxes on the same
+            # reviewed frame tapped in quick succession landed in the same
+            # millisecond, giving two different crops (different FM types,
+            # different files) the exact same timestamp suffix — and since
+            # that suffix is also this crop's own object_id (see
+            # _crop_object_id), the collision showed up as two entirely
+            # different objects both displaying as the same "Object N" in
+            # the reclassify gallery. Nanosecond resolution alone made a
+            # repeat far less likely but still isn't a real guarantee (clock
+            # resolution isn't specified/guaranteed by the platform); the
+            # box index costs nothing and rules it out deterministically,
+            # since two boxes from the very same label_detection pass always
+            # have distinct indices. history.py's get_result_images derives
+            # its own display fm_type generically (strips ALL trailing
+            # underscore-separated numeric tokens, not just one) specifically
+            # so this extra token doesn't need any matching change there.
+            filename = f"{safe_name}_{time.time_ns()}_{index}.png"
             path = os.path.join(self.output_folder, filename)
-            # Legacy writes the crop through a BGR->RGB conversion (main.py:1361).
-            cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            # Written as-is, NOT through the cv2.COLOR_BGR2RGB conversion
+            # legacy's submit_fm_type applies (main.py:1361) — see
+            # _COLOR_ORDER_NOTE above for why copying that line literally
+            # swapped red and blue in every saved crop.
+            cv2.imwrite(path, crop)
 
             self.labelled_indices.add(index)
             logger.info("Labelled detection %s as %r -> %s", index, fm_name, filename)
@@ -451,10 +527,16 @@ class ScanSession:
                 if x2 <= x1 or y2 <= y1:
                     continue
                 crop = self.pending_frame[y1:y2, x1:x2]
+                # Nanosecond, same reasoning as label_detection's own
+                # filename above — the box index already disambiguates
+                # different boxes from the same frame, but not two
+                # unclassified boxes across two frames swept within the
+                # same millisecond.
                 path = os.path.join(
-                    self.output_folder, f"NON-FM_{int(time.time() * 1000)}_{item['index']}.png"
+                    self.output_folder, f"NON-FM_{time.time_ns()}_{item['index']}.png"
                 )
-                cv2.imwrite(path, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                # As-is, same as label_detection — see _COLOR_ORDER_NOTE.
+                cv2.imwrite(path, crop)
                 saved += 1
             return saved
 
@@ -516,8 +598,28 @@ class ScanSession:
 
     def create_results(self, blower_fo: int, magnetic_fo: int) -> Dict[str, int]:
         """Count saved crops by filename prefix. Port of create_results
-        (main.py:1372-1452)."""
-        params = list(self.analysis_parameters) + ["FM", "NON-FM"]
+        (main.py:1372-1452).
+
+        dict.fromkeys, not a plain list: legacy iterates
+        `filename_mapping.items()`, a DICT comprehension over
+        `analysis_parameters` (main.py:1443-1457), so a name appearing twice
+        in that list collapses to one key and is matched once. This port
+        originally iterated the list itself, and since most commodities
+        already carry "FM" in their own analysis vocabulary, the hardcoded
+        + ["FM", ...] below made "FM" appear twice — counting every
+        FM-prefixed crop twice, inflating both that row and total_fo_detected
+        (which is summed from these values) in the saved record AND in the
+        Qualix datagram. Confirmed on batch milind4550: 2 FM crops on disk
+        stored as "FM": 4, total 247 against 245 real crops. Restores legacy's
+        own behavior rather than changing it.
+
+        The inner loop deliberately does NOT break on first match, matching
+        legacy exactly: if one param were a prefix of another, legacy counts
+        the file under both. No commodity's vocabulary currently has such a
+        pair, so this is theoretical — but it is legacy's semantics, so it is
+        left alone.
+        """
+        params = list(dict.fromkeys(list(self.analysis_parameters) + ["FM", "NON-FM"]))
         counter = Counter()
 
         if os.path.isdir(self.output_folder):
@@ -531,6 +633,119 @@ class ScanSession:
         counter["Blower FO"] = blower_fo
         counter["Magnetic FO"] = magnetic_fo
         return dict(counter)
+
+    def _crop_fm_type(self, name: str) -> str:
+        """Reverse create_results' own prefix match for one filename, so the
+        reclassify gallery can label each crop with the type it's currently
+        counted as — same stem-splitting logic, applied to one name instead
+        of a whole directory listing."""
+        params = sorted(list(self.analysis_parameters) + ["FM", "NON-FM"], key=len, reverse=True)
+        parts = name.split("_")
+        stem = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+        return next((key for key in params if stem.startswith(key)), "NON-FM")
+
+    def _crop_object_id(self, name: str) -> str:
+        """The part of a crop's filename that is NOT its FM-type prefix —
+        e.g. `1789033003109` for `Insect_1789033003109.png`, or
+        `1789033003109_0` for `NON-FM_1789033003109_0.png` (save_unselected
+        appends the box index too, to disambiguate multiple unclassified
+        boxes from the same frame). This is the one part of the filename
+        that's genuinely unique to this specific captured object — unlike
+        the FM-type prefix, which is exactly what a reclassify changes.
+        relabel_crop preserves it across a rename for that reason: it's the
+        closest thing this design has to a real, stable per-object name.
+        """
+        fm_type = self._crop_fm_type(name)
+        stem_no_ext = name.rsplit(".", 1)[0]
+        prefix = fm_type.replace(" ", "_") + "_"
+        if stem_no_ext.startswith(prefix):
+            return stem_no_ext[len(prefix):]
+        return stem_no_ext
+
+    def list_pending_crops(self) -> List[Dict]:
+        """Crops saved so far for the batch on the review screen — after
+        Submit, before Confirm/Discard — so the operator can reclassify one
+        before saving. Not a legacy feature (legacy has no reclassify path
+        at all, live or at submit); see enhancements.md.
+
+        Ordered by file mtime, EARLIEST captured first (on request — Object 1
+        is the first object identified this scan, Object N the most recent;
+        see ReclassifyObjects.jsx's own objectNumberById) — not by name:
+        relabel_crop renames the file (new FM-type prefix), and a plain
+        alphabetical `sorted(os.listdir(...))` would then reshuffle that
+        crop to wherever its new name happens to sort — confirmed live,
+        reported as objects visibly changing position on every reclassify.
+        os.rename() does not touch a file's mtime (only its ctime), so
+        sorting by mtime keeps every crop in its original capture order
+        regardless of how many times it's since been renamed.
+        """
+        with self._lock:
+            folder = self.output_folder
+            if not folder or not os.path.isdir(folder):
+                return []
+            crops = []
+            for name in os.listdir(folder):
+                if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                    continue
+                path = os.path.join(folder, name)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as fh:
+                    data = base64.b64encode(fh.read()).decode("ascii")
+                mime = "png" if name.lower().endswith(".png") else "jpeg"
+                crops.append({
+                    "name": name,
+                    "fm_type": self._crop_fm_type(name),
+                    "object_id": self._crop_object_id(name),
+                    "data_uri": f"data:image/{mime};base64,{data}",
+                    "_mtime": os.path.getmtime(path),
+                })
+            crops.sort(key=lambda c: c["_mtime"])
+            for crop in crops:
+                del crop["_mtime"]
+            return crops
+
+    def relabel_crop(self, name: str, fm_name: str) -> str:
+        """Reclassify one already-saved crop before the batch is confirmed.
+
+        The filename IS the classification record (see label_detection) —
+        create_results just re-counts the directory afterward, so renaming
+        the file is the whole operation. New to this port; legacy has no
+        equivalent (mousePressEvent, main.py:219-246, no-ops on an
+        already-labelled box and never revisits it, even at submit).
+
+        Keeps the SAME object_id suffix (see _crop_object_id) rather than
+        minting a fresh timestamp — confirmed live, the operator can tell a
+        crop's file has its own name (e.g. the `..._1789033003109_0.png` in
+        its path) and reasonably expects reclassifying it to change what
+        it's called, not what it IS. Only the FM-type prefix changes; the
+        part of the name that actually identifies this specific captured
+        object stays fixed, so it can be reclassified any number of times
+        and still be recognized as the same object throughout.
+        """
+        valid = set(self.analysis_parameters) | {"NON-FM"}
+        if fm_name not in valid:
+            raise ValueError(f"{fm_name!r} is not a valid FM type for this commodity")
+
+        with self._lock:
+            folder = self.output_folder
+            if not folder or not os.path.isdir(folder):
+                raise FileNotFoundError("No batch folder to reclassify in")
+            # Ignore any directory component a caller might pass — this must
+            # only ever touch a file directly inside output_folder.
+            safe_source = os.path.basename(name)
+            src = os.path.join(folder, safe_source)
+            if not os.path.isfile(src):
+                raise FileNotFoundError(f"No such crop: {name}")
+
+            object_id = self._crop_object_id(safe_source)
+            safe_name = fm_name.replace(" ", "_")
+            new_name = f"{safe_name}_{object_id}.png"
+            dest = os.path.join(folder, new_name)
+            if dest != src:
+                os.rename(src, dest)
+            logger.info("Reclassified crop %s -> %s (%s)", safe_source, new_name, fm_name)
+            return new_name
 
     def update_fm_count(self) -> Dict[str, float]:
         """The six looker_data metrics. Port of update_fm_count (main.py:1535-1563)."""
@@ -588,8 +803,10 @@ class ScanSession:
 
             self.active = False
             logger.info(
-                "Scan finished: sample=%s total_fo=%s unique_tracks=%s",
-                self.sample_id, total, len(self.existing_track_ids),
+                "Scan finished: sample=%s total_fo=%s reviewed_tracks=%s "
+                "unique_tracks=%s",
+                self.sample_id, total,
+                len(self.counted_track_ids), len(self.existing_track_ids),
             )
             return result_dict
 
@@ -616,7 +833,7 @@ class ScanSession:
             # total_fo_detected below, which legacy only ever uses for the
             # final saved result/looker_data, never shown on this label.
             "frame_fm_count": len(self.pending),
-            "total_fo_detected": len(self.existing_track_ids),
+            "total_fo_detected": len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "machine_start_locked": conveyor_service.machine_start_locked,
             "capture_paused": self.capture_paused,
@@ -641,7 +858,7 @@ class ScanSession:
             "start_time": self.start_time,
             "image_unique_id": self.folder_name,
             "output_folder": self.output_folder,
-            "total_fo_detected": len(self.existing_track_ids),
+            "total_fo_detected": len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "conveyor_stop_count": dict(self.conveyor_stop_count),
             "machine_start_locked": conveyor_service.machine_start_locked,
