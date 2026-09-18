@@ -33,11 +33,15 @@ def _run_one_cycle() -> dict:
             return summary
 
         if not sync_service.is_authenticated:
-            if not sync_service.login_qualix(
+            # Under AUTH_PROVIDER=keycloak, is_authenticated has already tried
+            # (and failed) to obtain the sync service token — there is no
+            # separate Qualix password login left to attempt.
+            authenticated = settings.AUTH_PROVIDER != "keycloak" and sync_service.login_qualix(
                 settings.QUALIX_USERNAME, settings.QUALIX_PASSWORD
-            ):
+            )
+            if not authenticated:
                 logger.warning(
-                    "Retry cycle: %s record(s) pending but Qualix login failed; "
+                    "Retry cycle: %s record(s) pending but sync login failed; "
                     "will try again next cycle.",
                     len(pending),
                 )
@@ -98,6 +102,18 @@ async def sync_retry_worker():
                     "Retry cycle: %s pending -> %s delivered, %s rejected, %s still pending",
                     summary["pending"], summary["delivered"],
                     summary["rejected"], summary["still_pending"],
+                )
+
+            # Anything delivered or rejected means a real answer came back from
+            # Qualix, so the network is up right now — a good moment to let the
+            # session check run, rather than waiting for its own timer. It is
+            # free when sessions were already confirmed today, and does nothing
+            # at all outside Keycloak mode.
+            if summary["delivered"] or summary["rejected"]:
+                from app.services.session_worker import run_revalidation_now
+
+                await asyncio.to_thread(
+                    run_revalidation_now, "a successful sync (so the network is up)"
                 )
         except asyncio.CancelledError:
             logger.info("Sync retry worker stopped.")

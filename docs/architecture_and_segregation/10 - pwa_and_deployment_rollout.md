@@ -132,6 +132,62 @@ Tying together `5 - infrastructure_and_deployment.md`'s hybrid split:
    DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority /home/nvidia/.local/bin/eye-compass-kiosk.sh
    ```
 
+4. **The browser relaunches itself if it ever closes or crashes.** The
+   launch script no longer `exec`s Firefox once — it runs it inside a
+   `while true` loop with a short `sleep 3` between attempts, and logs each
+   exit/relaunch to `~/.local/state/eye-compass-kiosk.log`. Without this, an
+   operator (or anything else) closing the window, or Firefox crashing,
+   would drop straight to the bare GNOME desktop with no way back in — the
+   device has no keyboard and the operator has no business reaching the
+   desktop at all. Killing the launch script's own process (not just
+   Firefox) is what actually stops the loop; see `5 -
+   infrastructure_and_deployment.md`'s Kiosk browser section for the exact
+   command.
+
+5. **Firefox enterprise policy lockdown (`~/.local/opt/firefox/distribution/
+   policies.json`).** `--kiosk` only removes Firefox's own window chrome
+   (address bar, tabs, title bar) — it does nothing about what's reachable
+   *from inside* the page itself. Confirmed by testing: the password-save
+   doorhanger and its "Manage passwords" link led straight to
+   `about:logins`, a full browser settings page with no way back out (no
+   title bar, no keyboard on the device to close/navigate away from it).
+   Firefox reads `policies.json` from the install directory at startup, and
+   it cannot be changed from within the browser itself, which is what makes
+   it suitable for this device. It currently:
+   - Disables the password manager entirely (`PasswordManagerEnabled`,
+     `OfferToSaveLogins*`), address/credit-card autofill, and form history —
+     so there is no save prompt and no `about:logins` to reach in the first
+     place.
+   - Blocks `about:config`, `about:addons`, `about:profiles`,
+     `about:support`, devtools, private browsing, safe mode, profile
+     import/refresh, Firefox Accounts, extension installation, and Firefox's
+     own auto-update.
+   - **A device-wide `WebsiteFilter` restricting navigation to just the
+     app's own origin was tried and reverted** — it broke the app itself
+     (Firefox's own "your organization has blocked access to this page"
+     screen appeared for `localhost:5173`), most likely because `ws://`
+     is not a valid scheme for that policy's match-pattern syntax, which
+     seems to have made the whole filter fail closed. Not reinstated:
+     `--kiosk` already removes the address bar, and this device has no
+     keyboard, so there is no input surface left for an operator to type a
+     different URL into regardless.
+   - The kiosk profile's own `user.js` mirrors the login-related prefs
+     directly (`signon.rememberSignons`, `signon.autofillForms`, etc.) and
+     turns off external protocol handlers, so nothing on this page can hand
+     off to a different application. The one login credential that had
+     already been saved to the profile's `logins.json` before this was
+     found was deleted as part of this change.
+   - **What this does *not* lock down, deliberately:** the GNOME window
+     manager underneath Firefox — Alt+Tab, the Super/Activities overview,
+     opening a terminal — is completely untouched by any of this. `--kiosk`
+     and `policies.json` only affect what's reachable *inside* the Firefox
+     window. A developer with a keyboard plugged into the device gets full
+     access to switch away, work elsewhere, and switch back; an operator
+     using only the touchscreen (the device has no keyboard at all) has no
+     way to trigger any of those shortcuts. That split is what makes this
+     acceptable as-is rather than something to additionally restrict at the
+     window-manager level.
+
 ## What's genuinely still open here
 
 - The manifest's icon and theme colors are still placeholders (see

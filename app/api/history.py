@@ -246,8 +246,9 @@ def get_result_images(
 def resync_result(result_id: int, db: Session = Depends(get_db)):
     """Manually re-deliver a stranded record.
 
-    The automatic worker retries '0' records every 15 minutes; this is the
-    operator-facing equivalent for when they do not want to wait.
+    The automatic worker retries '0' records every SYNC_RETRY_INTERVAL_MINUTES
+    (default 30); this is the operator-facing equivalent for when they do not
+    want to wait.
     """
     r = db.query(Result).filter(Result.id == result_id).first()
     if not r:

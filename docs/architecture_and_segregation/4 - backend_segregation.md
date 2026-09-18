@@ -93,7 +93,8 @@ FastAPI application that the frontend talks to over HTTP and one WebSocket.
 5. **Authentication (`app/api/auth.py`, `app/core/security.py`)** — online-first
    against Qualix, offline fallback against a locally cached, hashed
    credentials table, matching legacy exactly. Issues a real bearer token
-   (`SessionStore`, 45-day TTL) rather than the legacy code's literal
+   (`SessionStore`, no time limit — a session ends only when Keycloak says the
+   account is no longer good) rather than the legacy code's literal
    `"dummy_offline_token"` string.
 
 6. **Config sync (`app/services/sync_service.py`, `app/api/config.py`)** — on

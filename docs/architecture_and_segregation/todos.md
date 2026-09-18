@@ -104,6 +104,16 @@ for the hardware-QA-specific subset of this list.
      session to configure it now, reboot-test later) — need to confirm
      service startup ordering, the kiosk script's wait-and-retry actually
      works in practice, and recovery after a crash.
+   - **The kiosk browser now locks down what's reachable from inside the
+     Firefox window** (password manager, `about:` pages, devtools, extension
+     installs — see `10 - pwa_and_deployment_rollout.md`'s Kiosk browser
+     section) and relaunches itself if closed or crashed. **Sub-todo: the
+     launch script's own process still isn't supervised** — it currently
+     only starts via XDG autostart at graphical login, so if the script
+     process itself dies (not just Firefox), nothing brings it back until
+     the next login/reboot. Converting it to a systemd **user** service with
+     `Restart=always` would close that gap; not done yet, flagged rather
+     than done speculatively.
 
 ## Submit Batch is a two-step flow — a batch can be silently never saved
 
@@ -180,6 +190,32 @@ its own separate scheduled process, and would need to be pointed at the new
 `9 - post_remediation_session_log.md` §5) instead of the legacy
 `/home/nvidia/eye_compass/` tree, or it will keep uploading from — and only
 from — the old location.
+
+### `S3UploaderTask`'s cycle cost grows without bound
+
+`s3_worker.py`'s `_sync_directory` (see `S3UploaderTask._run_cycle`) has no
+memory of what it already confirmed uploaded. Every cycle — by default every
+`S3_UPLOAD_INTERVAL_SECONDS` (60s) — it walks the **entire** `output/` and
+`output_frame/` trees again, and for **every file that has ever existed there**
+makes an S3 request asking for its remote size, to decide whether to (re-)
+upload it.
+
+This means the per-cycle cost is proportional to the device's total scan
+history, not to what changed since the last cycle. A device running for
+months will eventually spend real time and S3 requests every 60 seconds just
+re-confirming thousands of already-uploaded files are still there, before it
+ever gets to anything new.
+
+**Two independent things worth doing, not a single fix:**
+1. **Widen `S3_UPLOAD_INTERVAL_SECONDS`** (e.g. to a few minutes) — a scan
+   image is not urgent to back up the instant it is written, so this buys
+   time without changing anything else. On its own this only slows down how
+   often the growing cost is paid, it does not stop the cost from growing.
+2. **Give the worker some memory of what it already uploaded** (a local flag
+   per file, or at least skip the S3 size lookup once a file is known to have
+   been handled), so a cycle only does real work on genuinely new files
+   instead of re-checking the whole history every time. This is the one that
+   actually fixes the unbounded growth; #1 alone does not.
 
 ### XAI View is broken in legacy — missing model file
 

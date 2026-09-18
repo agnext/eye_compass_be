@@ -164,6 +164,106 @@ class Settings:
     DEVICE_ID: str = _env("DEVICE_ID", section="CONFIG_SETTINGS", key="device_id", default="")
     LOCATION: str = _env("LOCATION", section="CONFIG_SETTINGS", key="location", default="")
 
+    # ---------------- Keycloak / Assurance ----------------
+    # "legacy" keeps today's direct-Qualix login untouched; "keycloak" switches
+    # operator login to Keycloak and routes syncing through the Assurance
+    # gateway. Defaults to legacy so this ships dormant and is enabled per
+    # device without a different build.
+    AUTH_PROVIDER: str = _env("AUTH_PROVIDER", default="legacy").strip().lower()
+
+    KEYCLOAK_URL: str = _env("KEYCLOAK_URL", default="https://dev.perfeqtfoods.com/keycloak")
+    KEYCLOAK_REALM: str = _env("KEYCLOAK_REALM", default="CentralIAM")
+    # Reusing Qualix's own backend client: creating a dedicated one would also
+    # require an Assurance-side change. Direct Access Grants (ROPC) is already
+    # enabled on it, which is what this integration needs.
+    KEYCLOAK_CLIENT_ID: str = _env("KEYCLOAK_CLIENT_ID", default="qualix-backend")
+    KEYCLOAK_CLIENT_SECRET: str = _env("KEYCLOAK_CLIENT_SECRET", default="")
+
+    # Space-separated scopes requested at login. Two are load-bearing:
+    #
+    #   offline_access
+    #     The realm caps a NORMAL refresh token at SSO Session Max (1 day),
+    #     which would force a fresh login daily regardless of how long a
+    #     session is otherwise allowed to stay unverified. This yields an
+    #     offline token governed by the Offline Session settings instead
+    #     (30-day idle, no absolute max), which is what makes staying logged
+    #     in indefinitely actually achievable.
+    #
+    #   qualix-application-permissions
+    #     Carries the audience mappers that put the Assurance gateway
+    #     (gateway-client / asu-be) into the token's `aud`. Without it the
+    #     gateway rejects every request with "Client is not within the token
+    #     audience", even though the login itself succeeded — the token is
+    #     simply not addressed to it. Only needed while borrowing a shared
+    #     client where this scope is attached as Optional; a dedicated client
+    #     would carry it as a Default scope and need nothing requested here.
+    #
+    # Requesting a scope the client does not have attached makes Keycloak
+    # reject the whole login with invalid_scope, so this must match what is
+    # actually configured on KEYCLOAK_CLIENT_ID.
+    KEYCLOAK_SCOPE: str = _env(
+        "KEYCLOAK_SCOPE",
+        "KEYCLOAK_OFFLINE_SCOPE",  # previous name
+        default="offline_access",
+    )
+
+    # Syncing authenticates as a fixed user account, never the logged-in
+    # operator — an operator who signed in offline has no Keycloak token at
+    # all, so sync can never depend on one. Defaults to the existing Qualix
+    # service credentials, which are the same account in Keycloak's userbase.
+    SYNC_SERVICE_USERNAME: str = _env("SYNC_SERVICE_USERNAME", default="") or QUALIX_USERNAME
+    SYNC_SERVICE_PASSWORD: str = _env("SYNC_SERVICE_PASSWORD", default="") or QUALIX_PASSWORD
+
+    # Assurance fronts the same Qualix endpoints and accepts a Keycloak token,
+    # adding whatever headers Qualix itself needs.
+    ASSURANCE_API_URL: str = _env("ASSURANCE_API_URL", default="")
+
+    # The gateway exposes those endpoints WITHOUT the "portal/" prefix that
+    # direct Qualix uses — verified against the live gateway, where
+    # portal/api/icompass/v1/config 404s and api/icompass/v1/config returns the
+    # real config. Kept as their own settings rather than stripping the prefix
+    # in code, so the two path sets stay independently correctable if either
+    # side ever moves.
+    ASSURANCE_CONFIG_URI: str = _env(
+        "ASSURANCE_CONFIG_URI", default="api/icompass/v1/config"
+    )
+    ASSURANCE_ANALYSIS_POST_URI: str = _env(
+        "ASSURANCE_ANALYSIS_POST_URI", default="api/scan/v2/post-visio"
+    )
+
+    # Called right after a successful Keycloak login, with the operator's own
+    # access token — the same endpoint Qualix's own web login calls to look up
+    # the account. This is the ONLY thing that confirms the person is an
+    # actual Qualix operator, as opposed to merely someone with valid
+    # credentials somewhere on the same shared Keycloak realm. See
+    # app/services/keycloak_service.py:fetch_qualix_profile.
+    ASSURANCE_KEYCLOAK_PROFILE_URI: str = _env(
+        "ASSURANCE_KEYCLOAK_PROFILE_URI", default="api/user/keycloak-profile"
+    )
+
+    # ---------------- Sessions ----------------
+    # Sessions never expire on their own — there is deliberately no lifetime
+    # setting here. A session ends only when Keycloak says the account is no
+    # longer good, which is what the worker below goes looking for. An operator
+    # on a device that is offline for months stays logged in, because nothing
+    # about the passage of time says anything about their account.
+    SESSION_REVALIDATION_ENABLED: bool = _as_bool(
+        os.getenv("SESSION_REVALIDATION_ENABLED"), True
+    )
+    # How often the worker WAKES UP, not how often it talks to Keycloak. A
+    # session that has already been confirmed today is skipped, so in practice
+    # each session is verified once a day; the extra wake-ups exist so that a
+    # device which was offline at the first attempt gets another chance the
+    # same day rather than waiting a full 24 hours.
+    SESSION_REVALIDATION_INTERVAL_HOURS: int = _as_int(
+        os.getenv("SESSION_REVALIDATION_INTERVAL_HOURS"), 6
+    )
+
+    # Frontend login-screen presentation only — no backend logic keys off this.
+    # "single_form" is today's Login.jsx. Future: "redirect" (Keycloak's hosted
+    # page online, our form offline) or "combined" (both on one screen).
+    LOGIN_UI_MODE: str = _env("LOGIN_UI_MODE", default="single_form")
+
     # ---------------- S3 ----------------
     # Accepts both the AWS_* names used in .env and the S3_*/COGNITO_* names the
     # code originally read, so neither spelling silently resolves to nothing.
@@ -200,7 +300,7 @@ class Settings:
 
     # ---------------- Background workers ----------------
     # Legacy retried unsynced records every 15 minutes (main.py:2828).
-    SYNC_RETRY_INTERVAL_MINUTES: int = _as_int(os.getenv("SYNC_RETRY_INTERVAL_MINUTES"), 15)
+    SYNC_RETRY_INTERVAL_MINUTES: int = _as_int(os.getenv("SYNC_RETRY_INTERVAL_MINUTES"), 30)
     SYNC_WORKER_ENABLED: bool = _as_bool(os.getenv("SYNC_WORKER_ENABLED"), True)
 
     # Legacy logged CPU/memory/disk every 300s (logger.py's ResourceMonitor).
