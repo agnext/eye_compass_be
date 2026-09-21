@@ -117,8 +117,14 @@ and print/log output are visible live instead of only in `journalctl`. There
 is no separate build/config for "debug backend" vs "production backend" —
 it's the identical `uvicorn app.main:app` command either way.
 
-**Debug mode** (developing/diagnosing — what this whole project has been run
-as so far):
+**Debug mode** (developing/diagnosing — local dev or Jetson debugging):
+
+Local development (with hot reload):
+```bash
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+Jetson / Remote device debug run:
 ```bash
 cd /home/nvidia/eye_compass_new/eye_compass_be
 /home/nvidia/.virtualenvs/eye_compass/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000

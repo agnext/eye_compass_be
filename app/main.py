@@ -53,6 +53,34 @@ def _add_missing_columns():
                 logger.info("Added missing column %s.%s.", table, column)
 
 
+def _add_missing_constraints():
+    """Same idea as _add_missing_columns, for constraints create_all() skips on
+    an existing table.
+
+    batch_details.batch_number carries a UNIQUE constraint in the model, but a
+    device that has already run without it keeps the plain index. That
+    constraint is the backstop that makes a duplicate batch number impossible
+    rather than merely unlikely (the id is clock-derived — see
+    api/batch.py's _generate_batch_number), so it has to reach existing
+    devices too, not just freshly created databases.
+
+    IF NOT EXISTS makes this idempotent. It will fail loudly if the table
+    somehow already contains duplicates, which is the correct outcome: they
+    have to be resolved by hand before uniqueness can be enforced.
+    """
+    inspector = inspect(engine)
+    if "batch_details" not in set(inspector.get_table_names()):
+        return  # brand-new database — create_all() already applied it.
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_details_batch_number "
+                "ON batch_details (batch_number)"
+            )
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle.
@@ -87,6 +115,7 @@ async def lifespan(app: FastAPI):
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables verified.")
         _add_missing_columns()
+        _add_missing_constraints()
     except Exception as exc:
         logger.error(
             "FATAL: could not reach the database at %s — %s",

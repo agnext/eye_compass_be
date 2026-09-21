@@ -13,13 +13,17 @@ all 12 fields from the Qualix payload.
 
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.schema import BatchDetails
 
@@ -28,8 +32,14 @@ router = APIRouter()
 
 
 class BatchCreate(BaseModel):
-    # No longer taken from the operator — see _generate_batch_number. Nothing
-    # in this request needs to supply one.
+    # Not typed by the operator — see _generate_batch_number. The form shows
+    # the id as soon as it opens, which means it has to be handed out before
+    # the batch is saved (GET /batch/next-number) and sent back here, so the
+    # number on screen is the number stored. It is still only a request: it's
+    # honoured when it's well-formed and free, and silently replaced with a
+    # freshly generated one otherwise, so a stale or tampered value can never
+    # produce a duplicate.
+    batch_number: Optional[str] = None
     po_number: Optional[str] = None
     manufacturing_date: Optional[str] = None
     vendor_name: Optional[str] = None
@@ -58,62 +68,148 @@ class BatchCreate(BaseModel):
         return cleaned
 
 
-def _slug(value: Optional[str], max_len: int = 12) -> str:
-    """Commodity/variety, as they appear in a batch number.
+# Epoch seconds is 10 digits from 2001 until 2286. Zero-padding to a fixed
+# width keeps every batch number the same length and makes them sort
+# lexicographically in true chronological order — which is what lets
+# _last_issued_ts below use a plain MAX() to find the newest one.
+_TS_WIDTH = 10
+_BATCH_NUMBER_LEN = 2 + _TS_WIDTH
 
-    Strips everything but letters/digits and uppercases what's left, so a
-    commodity like "Basmati Rice" becomes "BASMATIRICE" rather than embedding
-    spaces or punctuation into an id that gets used as a filename prefix and
-    an external reference elsewhere. Capped at max_len so one long commodity
-    name doesn't dominate the whole id — this is meant to be recognizable at
-    a glance, not a full transcription.
+
+def _device_code() -> str:
+    """The two-character device namespace, validated at the point of use.
+
+    Checked here rather than at import so a misconfigured device fails with a
+    clear error on the request that actually needs it, instead of refusing to
+    boot entirely — the rest of the app (viewing past results, retrying syncs)
+    still works without it.
     """
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
-    return cleaned[:max_len] or "NA"
+    code = settings.DEVICE_CODE
+    if not re.fullmatch(r"[A-Z0-9]{2}", code):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "DEVICE_CODE is not configured. Set it to a unique "
+                "2-character A-Z/0-9 code for this device before creating batches."
+            ),
+        )
+    return code
 
 
-def _generate_batch_number(commodity: Optional[str], variety: Optional[str], row_id: int) -> str:
-    """Auto-generated, guaranteed-unique batch number.
+def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
+    """The timestamp in the newest batch number this device has issued.
+
+    The LIKE pattern is anchored to the exact id length (one "_" per timestamp
+    character) so it can't match a batch number in the old
+    COMMODITY-VARIETY-DATE-SEQ format, which is always longer and could
+    otherwise share the same two leading characters as the device code.
+    """
+    pattern = device_code + "_" * _TS_WIDTH
+    newest = (
+        db.query(func.max(BatchDetails.batch_number))
+        .filter(BatchDetails.batch_number.like(pattern))
+        .scalar()
+    )
+    if not newest:
+        return None
+    try:
+        return int(newest[2:])
+    except ValueError:
+        # Something matched the shape but isn't numeric — ignore it rather than
+        # blocking batch creation; the unique constraint is still the backstop.
+        logger.warning("Ignoring unparseable batch number when picking next id: %s", newest)
+        return None
+
+
+def _generate_batch_number(db: Session, device_code: str) -> str:
+    """Auto-generated, unique batch number: device code + epoch seconds.
 
     Replaces what used to be a manually typed field with no uniqueness check
     at all (see git history/enhancements.md) — an operator could, and did,
-    type the same batch number twice. Built from:
-      - the commodity and variety, so it's recognizable at a glance rather
-        than an opaque number;
-      - today's date, so it's obvious which day a batch belongs to without
-        looking anything up;
-      - the row's own database id, zero-padded — this is what actually makes
-        it unique. It's a primary key, so it can never collide, and reusing
-        it means there's no separate counter to build or get out of sync.
+    type the same batch number twice. It then became the row's own primary
+    key, which is unique per device but restarts at 1 on every device, so two
+    machines reliably produced the same id and collided once their scans met
+    in Qualix. The device code is what namespaces them apart.
+
+    The timestamp alone is NOT a safe uniqueness guarantee here: these Jetsons
+    have no battery-backed RTC, so the clock can come up in the past after a
+    reboot and jump forward again once NTP syncs, re-issuing seconds it has
+    already used. Two batches saved within the same second would collide too,
+    which at one-second resolution is a realistic double-submit, not a
+    theoretical one. So the value is clamped to stay strictly above the newest
+    one this device has already issued — the id stays a real timestamp in
+    normal operation, and degrades to a monotonic counter if the clock
+    misbehaves rather than repeating itself.
     """
-    date_part = datetime.now().strftime("%Y%m%d")
-    return f"{_slug(commodity)}-{_slug(variety)}-{date_part}-{row_id:06d}"
+    now_ts = int(time.time())
+    last_ts = _last_issued_ts(db, device_code)
+    if last_ts is not None and now_ts <= last_ts:
+        logger.warning(
+            "Clock is not ahead of the last issued batch number (now=%d, last=%d) — "
+            "using last+1. Check this device's time sync.",
+            now_ts,
+            last_ts,
+        )
+        now_ts = last_ts + 1
+    return f"{device_code}{now_ts:0{_TS_WIDTH}d}"
+
+
+@router.get("/next-number")
+def next_batch_number(db: Session = Depends(get_db)):
+    """The batch number the new-batch form shows before anything is saved.
+
+    Nothing is reserved here — this only reads. The form sends the value back
+    with the batch it creates, and /new decides whether it can still be used.
+    """
+    return {"status": "success", "batch_number": _generate_batch_number(db, _device_code())}
 
 
 @router.post("/new")
 def create_new_batch(batch: BatchCreate, db: Session = Depends(get_db)):
-    try:
-        row = BatchDetails(
-            **batch.model_dump(),
-            created_at=datetime.now().isoformat(),
-        )
-        db.add(row)
-        db.commit()
-        db.refresh(row)  # row.id only exists after this — needed below.
+    device_code = _device_code()
+    fields = batch.model_dump()
+    # What the form displayed, if it got that far. Anything not matching this
+    # device's own id format is discarded rather than trusted — the shape is
+    # what /next-number handed out, so a value in any other form did not come
+    # from there.
+    requested = (fields.pop("batch_number", None) or "").strip().upper()
+    if requested and not re.fullmatch(rf"{device_code}\d{{{_TS_WIDTH}}}", requested):
+        logger.warning("Ignoring malformed batch number from client: %s", requested)
+        requested = ""
 
-        row.batch_number = _generate_batch_number(row.product_name, row.product_code, row.id)
-        db.commit()
+    # _generate_batch_number reads the newest existing id and steps past it,
+    # which two concurrent requests can both do before either commits. The
+    # unique constraint turns that race into an IntegrityError instead of a
+    # duplicate; retrying re-reads the now-committed newest id and drops the
+    # requested number, so a second attempt never reuses what just collided. A
+    # handful of attempts is far more than a single-operator device can need.
+    for attempt in range(5):
+        try:
+            row = BatchDetails(
+                **fields,
+                batch_number=requested or _generate_batch_number(db, device_code),
+                created_at=datetime.now().isoformat(),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)  # row.id only exists after this.
 
-        return {
-            "status": "success",
-            "message": "Batch details saved",
-            "id": row.id,
-            "batch_number": row.batch_number,
-        }
-    except Exception as exc:
-        db.rollback()
-        logger.error("Failed to save batch details: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Failed to save batch details: {exc}")
+            return {
+                "status": "success",
+                "message": "Batch details saved",
+                "id": row.id,
+                "batch_number": row.batch_number,
+            }
+        except IntegrityError:
+            db.rollback()
+            logger.warning("Batch number collided on attempt %d — regenerating.", attempt + 1)
+            requested = ""
+        except Exception as exc:
+            db.rollback()
+            logger.error("Failed to save batch details: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Failed to save batch details: {exc}")
+
+    raise HTTPException(status_code=500, detail="Could not allocate a unique batch number")
 
 
 @router.get("/{batch_id}")

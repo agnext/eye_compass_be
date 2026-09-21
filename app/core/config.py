@@ -164,6 +164,14 @@ class Settings:
     DEVICE_ID: str = _env("DEVICE_ID", section="CONFIG_SETTINGS", key="device_id", default="")
     LOCATION: str = _env("LOCATION", section="CONFIG_SETTINGS", key="location", default="")
 
+    # Two-character namespace prefixed to every batch number. This is the ONLY
+    # thing keeping batch numbers distinct between devices — the rest of the id
+    # is a timestamp, which two devices can produce identically. A blank or
+    # duplicated code silently reintroduces cross-device collisions that only
+    # surface later in Qualix, so batch creation refuses to run until it's set
+    # (see _device_code in api/batch.py). Must be unique per physical device.
+    DEVICE_CODE: str = _env("DEVICE_CODE", section="CONFIG_SETTINGS", key="device_code", default="").strip().upper()
+
     # ---------------- Keycloak / Assurance ----------------
     # "legacy" keeps today's direct-Qualix login untouched; "keycloak" switches
     # operator login to Keycloak and routes syncing through the Assurance

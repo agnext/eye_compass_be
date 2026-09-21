@@ -239,7 +239,11 @@ class BatchDetails(Base):
     __tablename__ = "batch_details"
 
     id = Column(Integer, primary_key=True)
-    batch_number = Column(String(150), index=True)
+    # unique: the id is generated from a clock, and a clock can repeat itself
+    # (no battery-backed RTC on these devices). api/batch.py already guards
+    # against that when generating; this is the backstop that makes a
+    # duplicate impossible rather than merely unlikely.
+    batch_number = Column(String(150), index=True, unique=True)
     po_number = Column(String(150))
     manufacturing_date = Column(String(50))
     vendor_name = Column(String(150))
