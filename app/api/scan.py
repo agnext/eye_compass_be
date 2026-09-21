@@ -219,6 +219,24 @@ def start_scan(req: ScanStartRequest, db: Session = Depends(get_db)):
     conveyor_service.send("camera_on")
     started = conveyor_service.send("machine_start")
 
+    # A silent "success" here is worse than no response at all: the operator
+    # sees a normal-looking live-scan screen with a belt that never actually
+    # moved, and has no way to tell short of watching it. conveyor_service
+    # already sent a fail-safe all_stop internally after exhausting its
+    # retries — this just makes sure that failure actually reaches the UI.
+    # Safe to raise after scan_session.start() already ran: it's idempotent
+    # (see its own docstring), so pressing Start again once the belt is fixed
+    # resumes the same session rather than needing any cleanup here.
+    if not started:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The belt did not respond to the start command. Check that the "
+                "conveyor controller is powered on and the serial cable is "
+                "connected, then try Start again."
+            ),
+        )
+
     return {"success": True, "conveyor_started": started, **status}
 
 
@@ -271,11 +289,26 @@ def forward_scan():
     # once the jog has re-locked (main.py:888), so the operator gets a fresh
     # frozen frame of whatever the nudge brought into view.
     scan_session.resume_capture()
-    conveyor_service.send("machine_start")
+    started = conveyor_service.send("machine_start")
     time.sleep(0.1)
-    conveyor_service.send("FM_detected")
+    detected = conveyor_service.send("FM_detected")
+    # Re-lock and re-pause regardless of the outcome above — this is the
+    # existing safe end-state either way (conveyor_service's own fail-safe
+    # all_stop already fired internally if either send() failed), it just
+    # must not be reported as a success the operator has no reason to
+    # question. Without this, the previous frozen frame's FM boxes were left
+    # on screen with no indication anything had gone wrong.
     conveyor_service.lock_machine_start(reason="forward jog re-lock")
     scan_session.pause_capture(delay_sec=1.0)
+    if not (started and detected):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The belt did not respond. Check that the conveyor controller "
+                "is powered on and the serial cable is connected, then try "
+                "Forward again."
+            ),
+        )
     return {"success": True, **scan_session.status()}
 
 

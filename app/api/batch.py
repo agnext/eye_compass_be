@@ -28,7 +28,8 @@ router = APIRouter()
 
 
 class BatchCreate(BaseModel):
-    batch_number: str
+    # No longer taken from the operator — see _generate_batch_number. Nothing
+    # in this request needs to supply one.
     po_number: Optional[str] = None
     manufacturing_date: Optional[str] = None
     vendor_name: Optional[str] = None
@@ -40,18 +41,6 @@ class BatchCreate(BaseModel):
     site_code: Optional[str] = None
     product_code: Optional[str] = None
     sorter_name: Optional[str] = None
-
-    @field_validator("batch_number")
-    @classmethod
-    def batch_number_must_be_alnum(cls, value: str) -> str:
-        # Legacy required a non-empty alphanumeric sample id before allowing
-        # the operator past the batch form (on_next_click, main.py:658-671).
-        cleaned = (value or "").strip()
-        if not cleaned:
-            raise ValueError("Batch number is required")
-        if not cleaned.isalnum():
-            raise ValueError("Batch number must be alphanumeric (no spaces or symbols)")
-        return cleaned
 
     @field_validator("sorting_quantity")
     @classmethod
@@ -69,6 +58,38 @@ class BatchCreate(BaseModel):
         return cleaned
 
 
+def _slug(value: Optional[str], max_len: int = 12) -> str:
+    """Commodity/variety, as they appear in a batch number.
+
+    Strips everything but letters/digits and uppercases what's left, so a
+    commodity like "Basmati Rice" becomes "BASMATIRICE" rather than embedding
+    spaces or punctuation into an id that gets used as a filename prefix and
+    an external reference elsewhere. Capped at max_len so one long commodity
+    name doesn't dominate the whole id — this is meant to be recognizable at
+    a glance, not a full transcription.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
+    return cleaned[:max_len] or "NA"
+
+
+def _generate_batch_number(commodity: Optional[str], variety: Optional[str], row_id: int) -> str:
+    """Auto-generated, guaranteed-unique batch number.
+
+    Replaces what used to be a manually typed field with no uniqueness check
+    at all (see git history/enhancements.md) — an operator could, and did,
+    type the same batch number twice. Built from:
+      - the commodity and variety, so it's recognizable at a glance rather
+        than an opaque number;
+      - today's date, so it's obvious which day a batch belongs to without
+        looking anything up;
+      - the row's own database id, zero-padded — this is what actually makes
+        it unique. It's a primary key, so it can never collide, and reusing
+        it means there's no separate counter to build or get out of sync.
+    """
+    date_part = datetime.now().strftime("%Y%m%d")
+    return f"{_slug(commodity)}-{_slug(variety)}-{date_part}-{row_id:06d}"
+
+
 @router.post("/new")
 def create_new_batch(batch: BatchCreate, db: Session = Depends(get_db)):
     try:
@@ -78,7 +99,11 @@ def create_new_batch(batch: BatchCreate, db: Session = Depends(get_db)):
         )
         db.add(row)
         db.commit()
-        db.refresh(row)
+        db.refresh(row)  # row.id only exists after this — needed below.
+
+        row.batch_number = _generate_batch_number(row.product_name, row.product_code, row.id)
+        db.commit()
+
         return {
             "status": "success",
             "message": "Batch details saved",

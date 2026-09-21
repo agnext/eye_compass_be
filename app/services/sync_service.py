@@ -279,9 +279,18 @@ class SyncService:
             db.query(SurveyorDetails).delete()
             for item in surveyors:
                 if isinstance(item, dict):
+                    # Qualix returns this field as camelCase ("surveyorId"),
+                    # not snake_case — confirmed against the prod config
+                    # response, where dev's had always been an empty list so
+                    # this mismatch never actually got exercised.
+                    surveyor_id = (
+                        item.get("surveyorId")
+                        or item.get("surveyor_id")
+                        or item.get("id", "")
+                    )
                     db.add(
                         SurveyorDetails(
-                            surveyor_id=str(item.get("surveyor_id", item.get("id", ""))),
+                            surveyor_id=str(surveyor_id),
                             name=item.get("name") or item.get("surveyor_name"),
                         )
                     )

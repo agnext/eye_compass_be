@@ -9,7 +9,7 @@ be free text and why vendor_code auto-fill was lost.
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
@@ -123,16 +123,29 @@ def get_all_config(db: Session = Depends(get_db)):
     }
 
 
-@router.post("/sync")
-def sync_config():
-    """Trigger a config refresh from Qualix.
-
-    Uses its own session rather than the request-scoped one so the transaction
-    boundary belongs to the sync, not to the HTTP response.
-    """
+def _sync_config_in_background():
+    """Runs after the response — see /sync below. Own session, since the
+    request-scoped one is closed by the time a BackgroundTask executes."""
     db = SessionLocal()
     try:
-        ok = sync_service.sync_commodity_config(db)
-        return {"status": "success" if ok else "failed"}
+        sync_service.sync_commodity_config(db)
+    except Exception:
+        logger.exception("Background config sync failed")
     finally:
         db.close()
+
+
+@router.post("/sync")
+def sync_config(background_tasks: BackgroundTasks):
+    """Queue a config refresh from Qualix — does not wait for it.
+
+    Called every time the operator opens New Batch, the same way login
+    already queues one (see auth.py's _sync_config_in_background). The
+    dropdowns show whatever is already cached in Postgres instantly; this
+    just kicks off getting a newer copy for *next* time. If there's no
+    internet or Qualix is unreachable, sync_commodity_config fails quietly
+    and the existing cached data is left untouched — never blocks or blanks
+    the form waiting on connectivity that may not be there.
+    """
+    background_tasks.add_task(_sync_config_in_background)
+    return {"status": "queued"}

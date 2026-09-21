@@ -74,9 +74,19 @@ def jog_forward(seconds: float = 2.0):
     """
     import time
 
-    conveyor_service.send("machine_start")
+    started = conveyor_service.send("machine_start")
     time.sleep(max(0.0, min(seconds, 10.0)))
-    conveyor_service.send("all_stop")
+    stopped = conveyor_service.send("all_stop")
+    # Same reasoning as /command: an unacknowledged command is a hardware
+    # fault, not something to report as a normal jog.
+    if not (started and stopped):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The belt did not respond. Check that the conveyor controller "
+                "is powered on and the serial cable is connected."
+            ),
+        )
     return {"success": True, "jogged_seconds": seconds}
 
 

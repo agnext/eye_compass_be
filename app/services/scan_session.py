@@ -27,6 +27,7 @@ per-FM breakdown by listing saved crop files. Both are reproduced here.
 """
 
 import base64
+import glob
 import json
 import logging
 import os
@@ -461,6 +462,17 @@ class ScanSession:
         Port of ImageLabel.mousePressEvent -> crop_and_save -> submit_fm_type
         (main.py:232-259, 141-147, 1343-1360). The saved filename IS the record:
         create_results counts files by their prefix.
+
+        Re-labeling an index already marked is allowed, on request — the
+        operator can change their mind about a box's FM type while still on
+        the same frozen frame, before Resume. legacy (and this port,
+        originally) refused a second tap on an already-labeled box outright.
+        The old crop is deleted first (matched by its filename's trailing
+        _<index>.png, which every crop for this index ends with regardless of
+        FM type or timestamp) so a changed mind doesn't leave the previous,
+        now-wrong classification also counted — counting is filename-prefix
+        based (create_results), so a stale file left behind would silently
+        double-count this one object under two different types.
         """
         with self._lock:
             if not self.active:
@@ -470,8 +482,25 @@ class ScanSession:
             item = next((p for p in self.pending if p["index"] == index), None)
             if item is None:
                 raise KeyError(f"No pending detection with index {index}")
-            if index in self.labelled_indices:
-                return {"already_labelled": True, **self.pending_status()}
+
+            relabelling = index in self.labelled_indices
+            if relabelling:
+                for old_path in glob.glob(
+                    os.path.join(self.output_folder, f"*_{index}.png")
+                ):
+                    try:
+                        os.remove(old_path)
+                        logger.info(
+                            "Re-labeling detection %s — removed its previous "
+                            "crop %s before saving the new one.",
+                            index, os.path.basename(old_path),
+                        )
+                    except OSError as exc:
+                        logger.error(
+                            "Could not remove previous crop %s while "
+                            "re-labeling detection %s: %s",
+                            old_path, index, exc,
+                        )
 
             x1, y1, x2, y2 = [int(round(v)) for v in item["box"]]
             h, w = self.pending_frame.shape[:2]
@@ -508,8 +537,11 @@ class ScanSession:
             cv2.imwrite(path, crop)
 
             self.labelled_indices.add(index)
-            logger.info("Labelled detection %s as %r -> %s", index, fm_name, filename)
-            return {"saved": filename, **self.pending_status()}
+            logger.info(
+                "%s detection %s as %r -> %s",
+                "Re-labelled" if relabelling else "Labelled", index, fm_name, filename,
+            )
+            return {"saved": filename, "relabelled": relabelling, **self.pending_status()}
 
     def save_unselected(self) -> int:
         """Boxes the operator did not classify are NON-FM (main.py:1325-1341)."""

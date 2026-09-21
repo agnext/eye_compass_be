@@ -2,9 +2,21 @@
 Conveyor / serial control.
 
 A faithful port of legacy `send_control_command` (main.py:2279-2378) plus the
-`machine_start_locked` interlock (main.py:105, 2288-2296, 2621-2623).
+`machine_start_locked` interlock (main.py:105, 2288-2296, 2621-2623), with one
+deliberate deviation from legacy: the serial port is opened ONCE and held
+open, instead of being reopened on every single write/retry.
 
-Everything here matters for physical safety, so none of it is optional:
+Why: this device's USB-serial adapter is a CH340 (idVendor=1a86, idProduct=
+7523). Like most USB-serial chips, it pulses the DTR line when the port is
+opened, which resets the conveyor controller board. Legacy (and this file,
+originally) reopened `serial.Serial(...)` on every attempt — verified live
+on-device: both legacy and this backend, with identical reopen-per-attempt
+logic, failed to get any acknowledgment from the belt, while CuteCom (which
+opens the port once and holds it for the whole session) worked immediately.
+Reopening on every retry never lets the board finish resetting/booting
+before the next open yanks DTR again. Holding the port open fixes that.
+
+Everything else here matters for physical safety, so none of it is optional:
 
   * Commands are whitelisted. Legacy refused anything not in `expected_acks`;
     without that check an arbitrary request body reaches the UART.
@@ -15,7 +27,7 @@ Everything here matters for physical safety, so none of it is optional:
     foreign matter being detected and the operator resolving it.
 
 Access is serialised behind a lock: unlike the legacy Qt main thread, several
-HTTP requests can arrive at once and must not open the port simultaneously.
+HTTP requests can arrive at once and must not touch the port simultaneously.
 """
 
 import logging
@@ -47,6 +59,8 @@ class ConveyorService:
         self._lock = threading.RLock()
         self._machine_start_locked = False
         self._last_error = ""
+        self._ser: serial.Serial | None = None
+        self._ser_port = None
 
     # ------------------------------------------------------------------
     # Interlock
@@ -71,6 +85,42 @@ class ConveyorService:
         if self._machine_start_locked:
             logger.info("machine_start UNLOCKED (%s)", reason)
         self._machine_start_locked = False
+
+    # ------------------------------------------------------------------
+    # Serial connection — opened once, held open (see module docstring)
+    # ------------------------------------------------------------------
+
+    def _get_connection(self, port: str, baud: int) -> serial.Serial:
+        """Return the held-open connection to `port`, opening it if needed.
+
+        Only actually opens (and resets the board via DTR) when there is no
+        connection yet, the port path changed, or the previous connection
+        died. A normal call reuses the same handle every time.
+        """
+        if self._ser is not None and self._ser_port != port:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+        if self._ser is None or not self._ser.is_open:
+            logger.info("Opening serial port %s (held open)", port)
+            self._ser = serial.Serial(port, baud, timeout=1)
+            self._ser_port = port
+            # Let the controller finish its DTR-triggered boot/reset before
+            # the first command is sent on a freshly opened connection.
+            time.sleep(2.0)
+
+        return self._ser
+
+    def _drop_connection(self):
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
 
     # ------------------------------------------------------------------
     # Command path
@@ -115,26 +165,30 @@ class ConveyorService:
             acknowledged = False
             for attempt in range(1, max_retries + 1):
                 try:
-                    with serial.Serial(port, baud, timeout=1) as ser:
-                        logger.info(
-                            "Attempt %s: sending %r to %s", attempt, cmd, port
-                        )
-                        ser.write((cmd + "\n").encode())
-                        ack = ser.readline().decode("utf-8", errors="replace").strip()
+                    ser = self._get_connection(port, baud)
+                    logger.info(
+                        "Attempt %s: sending %r to %s", attempt, cmd, port
+                    )
+                    ser.write((cmd + "\n").encode())
+                    ack = ser.readline().decode("utf-8", errors="replace").strip()
 
-                        # Legacy also accepts the all_stop ack for any command —
-                        # the controller reports a stop however it was reached.
-                        if ack == expected_ack or ack == EXPECTED_ACKS["all_stop"]:
-                            logger.info("Acknowledgment received: %s", ack)
-                            acknowledged = True
-                            break
-                        logger.warning(
-                            "Unexpected acknowledgment %r (wanted %r). Retrying...",
-                            ack,
-                            expected_ack,
-                        )
+                    # Legacy also accepts the all_stop ack for any command —
+                    # the controller reports a stop however it was reached.
+                    if ack == expected_ack or ack == EXPECTED_ACKS["all_stop"]:
+                        logger.info("Acknowledgment received: %s", ack)
+                        acknowledged = True
+                        break
+                    logger.warning(
+                        "Unexpected acknowledgment %r (wanted %r). Retrying...",
+                        ack,
+                        expected_ack,
+                    )
                 except Exception as exc:
                     logger.error("Serial error on attempt %s: %s", attempt, exc)
+                    # The held connection may be dead — drop it so the next
+                    # attempt reopens fresh rather than retrying on a broken
+                    # handle forever.
+                    self._drop_connection()
 
                 time.sleep(0.02)
 
@@ -151,10 +205,11 @@ class ConveyorService:
             self._last_error = f"No acknowledgment for {cmd} after {max_retries} retries"
             if cmd != "all_stop":
                 try:
-                    with serial.Serial(port, baud, timeout=1) as ser:
-                        ser.write(b"all_stop\n")
+                    ser = self._get_connection(port, baud)
+                    ser.write(b"all_stop\n")
                 except Exception as exc:
                     logger.error("Fail-safe all_stop could not be sent: %s", exc)
+                    self._drop_connection()
             return False
 
     def status(self) -> dict:
