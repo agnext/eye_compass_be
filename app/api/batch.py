@@ -54,17 +54,18 @@ class BatchCreate(BaseModel):
 
     @field_validator("sorting_quantity")
     @classmethod
-    def sorting_quantity_must_be_numeric(cls, value: Optional[str]) -> Optional[str]:
-        # NewBatch.jsx already strips anything but digits/a single "." as the
-        # operator types (it's a weight, e.g. "40.5") — this is the same
-        # check on the server side, since the frontend check alone can't be
-        # trusted for a request that didn't go through that form at all.
+    def sorting_quantity_must_be_a_positive_whole_number(cls, value: Optional[str]) -> Optional[str]:
+        # A count, not a weight — NewBatch.jsx already strips anything but
+        # digits as the operator types, so no "-" or "." can even reach here
+        # from the form. This is the same check on the server side, since the
+        # frontend check alone can't be trusted for a request that didn't go
+        # through that form at all.
         cleaned = (value or "").strip()
-        # \d+(\.\d+)? rather than a bare float() call, which would also accept
-        # forms the frontend's char-level filter can't even produce (e.g.
-        # "1e10", "inf", "nan").
-        if cleaned and not re.fullmatch(r"\d+(\.\d+)?", cleaned):
-            raise ValueError("Sorting quantity must be a number")
+        # [1-9]\d* rather than a bare int() call, which would also accept
+        # forms the frontend's filter can't produce (e.g. "-5", "1e10") and
+        # would accept "0", which is not positive.
+        if cleaned and not re.fullmatch(r"[1-9]\d*", cleaned):
+            raise ValueError("Sorting quantity must be a positive whole number")
         return cleaned
 
 
