@@ -155,11 +155,13 @@ checked `lineEdit_po_number` in both `.ui` files (`eye_compass_updated.ui:6196`,
 there is none anywhere in the file, and the widget has no input mask either,
 so legacy genuinely lets the operator type letters (or anything else) into
 PO Number, unlike Sorting Quantity which this port now restricts to digits
-(plus one decimal point) on request. This looks like it might just be an
-oversight in legacy rather than an intentional design choice — a PO number is
-usually numeric in practice — so **confirm with the team whether PO Number
-should be restricted the same way Sorting Quantity was**, or left as free
-text matching legacy's real (unvalidated) behavior.
+only — no decimal point either, since it was further tightened on request to
+a whole positive number (`[1-9]\d*`, rejecting `0` and decimals; see
+`enhancements.md`). This looks like it might just be an oversight in legacy
+rather than an intentional design choice — a PO number is usually numeric in
+practice — so **confirm with the team whether PO Number should be restricted
+the same way Sorting Quantity was**, or left as free text matching legacy's
+real (unvalidated) behavior.
 
 ### S3 upload paths (found while auditing "at what other points does it upload to S3?")
 

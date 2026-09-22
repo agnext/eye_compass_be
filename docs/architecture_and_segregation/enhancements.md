@@ -173,6 +173,39 @@ them alongside further enhancements worth considering but not yet done.
   how they were verified, is in
   `docs/keycloak_integration/` (start at `1 - overview.md`) rather than
   repeated here.
+- **Batch number auto-generation was reworked from a per-device row id to a
+  device-namespaced timestamp**, to fix a real cross-device collision, not a
+  hypothetical one: the first version built the id from commodity + variety +
+  date + the batch row's own primary key
+  (`{COMMODITY}-{VARIETY}-{YYYYMMDD}-{row_id:06d}`), and since every device's
+  primary key restarts at 1, two Jetsons reliably produced the identical id
+  once their scans reached the same place (Qualix / the shared spreadsheet).
+
+  Replaced with a 2-character `DEVICE_CODE` (new required setting, `.env`)
+  followed by 10-digit epoch seconds — e.g. `D11790014601` — so two devices
+  can never collide regardless of what either has scanned before. The
+  timestamp alone is not a safe uniqueness guarantee on this hardware: these
+  Jetsons have no battery-backed RTC, so the clock can come up in the past
+  after a reboot and re-issue a second it already used, and two batches saved
+  within the same second is a realistic double-submit at one-second
+  resolution, not just a theoretical one. `_generate_batch_number` in
+  `api/batch.py` guards against both — it reads the newest id this device has
+  already issued (`_last_issued_ts`, a `MAX()` scoped to this device's own
+  prefix) and clamps to `last + 1` whenever the clock is not strictly ahead,
+  logging a warning so a misbehaving clock is visible rather than silent. The
+  `batch_number` column itself also carries a `UNIQUE` constraint as the final
+  backstop (`_add_missing_constraints` in `main.py` applies it retroactively
+  via `CREATE UNIQUE INDEX IF NOT EXISTS`, since `create_all` never alters an
+  existing table), with the `/batch/new` endpoint retrying on the resulting
+  `IntegrityError` — three independent layers, not just the timestamp.
+
+  The id is now allocated *before* the batch is saved, not after: `GET
+  /batch/next-number` lets the New Batch form show the real id the moment it
+  opens (previously it showed a `NNNNNN` placeholder for the row-id suffix,
+  since that didn't exist until the row was inserted), and the id shown is
+  sent back on save and honored as-is if it's still well-formed and free —
+  falling back to a fresh one otherwise — so what the operator sees on screen
+  is what actually gets stored, not a preview that could drift from it.
 
 ### Frontend
 - **The Home screen checks whether the backend has flagged the session for
@@ -235,6 +268,14 @@ them alongside further enhancements worth considering but not yet done.
   let you type anything into Blower FO/Magnetic FO/Sorting Quantity and only
   complained once you pressed Submit; these fields now strip non-digit
   characters immediately.
+- **Sorting Quantity is a whole positive number, not a decimal weight.** It
+  briefly allowed one decimal point (`40.5`) on the assumption it recorded a
+  weight; on request it was tightened to a plain count instead. `handleNumericChange`
+  in `NewBatch.jsx` now strips everything but digits — `.` and `-` can no
+  longer be typed at all — and `BatchCreate.sorting_quantity_must_be_a_positive_whole_number`
+  in `api/batch.py` enforces `[1-9]\d*` server-side, rejecting `0` and a
+  leading-zero value like `007` as well as decimals, since a request that
+  skips the form entirely still has to pass the same rule.
 - **Confirmation before leaving an active scan.** Legacy has no protection at
   all against accidentally navigating away mid-scan — the desktop app simply
   doesn't have a "back" gesture in the same sense a browser does. The web
