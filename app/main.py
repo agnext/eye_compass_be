@@ -35,10 +35,19 @@ def _add_missing_columns():
             "keycloak_user_id": "VARCHAR(64) DEFAULT ''",
             "password_credential_created_at": "TIMESTAMP NULL",
             "relogin_suggested": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "operator_id": "VARCHAR(64) DEFAULT ''",
         },
         "creds": {
             "keycloak_user_id": "VARCHAR(64) DEFAULT ''",
             "refresh_token": "TEXT",
+            "operator_id": "VARCHAR(64) DEFAULT ''",
+        },
+        "result": {
+            "sync_error": "TEXT DEFAULT ''",
+            # No DEFAULT: existing rows must stay NULL. A default of '' would
+            # give every one of them the same value, and the unique index
+            # added in _add_missing_constraints would then refuse to build.
+            "client_request_id": "VARCHAR(64) NULL",
         },
     }
     with engine.begin() as conn:
@@ -69,16 +78,29 @@ def _add_missing_constraints():
     have to be resolved by hand before uniqueness can be enforced.
     """
     inspector = inspect(engine)
-    if "batch_details" not in set(inspector.get_table_names()):
-        return  # brand-new database — create_all() already applied it.
+    existing_tables = set(inspector.get_table_names())
 
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_details_batch_number "
-                "ON batch_details (batch_number)"
+    if "batch_details" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_details_batch_number "
+                    "ON batch_details (batch_number)"
+                )
             )
-        )
+
+    # The idempotency key that makes a retried /confirm a replay rather than a
+    # second scan record (see Result.client_request_id). Every pre-existing row
+    # is NULL here, which a unique index accepts any number of, so this applies
+    # cleanly to a device with history.
+    if "result" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_result_client_request_id "
+                    "ON result (client_request_id)"
+                )
+            )
 
 
 @asynccontextmanager

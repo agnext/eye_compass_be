@@ -74,23 +74,33 @@ class BatchCreate(BaseModel):
 # lexicographically in true chronological order — which is what lets
 # _last_issued_ts below use a plain MAX() to find the newest one.
 _TS_WIDTH = 10
-_BATCH_NUMBER_LEN = 2 + _TS_WIDTH
 
 
 def _device_code() -> str:
-    """The two-character device namespace, validated at the point of use.
+    """The device namespace prefixed to every batch number, validated at the
+    point of use.
+
+    Fixed 2 characters (A-Z/0-9), unique per physical device. Nothing
+    downstream depends on this being exactly 2 other than this check itself —
+    _last_issued_ts builds its LIKE pattern from whatever code is returned,
+    and create_new_batch validates against it — but 2 is what was actually
+    assigned across devices, so it's enforced here to catch a typo early.
+
+    Distinct from settings.DEVICE_CODE, which is what's sent as
+    device_serial_no to Qualix on the scan datagram (see datagram.py). The
+    two are set independently and neither is derived from the other.
 
     Checked here rather than at import so a misconfigured device fails with a
     clear error on the request that actually needs it, instead of refusing to
     boot entirely — the rest of the app (viewing past results, retrying syncs)
     still works without it.
     """
-    code = settings.DEVICE_CODE
+    code = settings.DEVICE_ID
     if not re.fullmatch(r"[A-Z0-9]{2}", code):
         raise HTTPException(
             status_code=500,
             detail=(
-                "DEVICE_CODE is not configured. Set it to a unique "
+                f"DEVICE_ID is not usable (currently {code!r}). Set it to a unique "
                 "2-character A-Z/0-9 code for this device before creating batches."
             ),
         )
@@ -103,7 +113,13 @@ def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
     The LIKE pattern is anchored to the exact id length (one "_" per timestamp
     character) so it can't match a batch number in the old
     COMMODITY-VARIETY-DATE-SEQ format, which is always longer and could
-    otherwise share the same two leading characters as the device code.
+    otherwise share the same leading characters as the device code.
+
+    The timestamp is taken by len(device_code), never a fixed offset: with a
+    code longer than two characters a hardcoded slice silently produced a
+    non-numeric string, so this returned None every time, the clock guard had
+    nothing to compare against, and a second batch created in the same second
+    regenerated an id that already existed.
     """
     pattern = device_code + "_" * _TS_WIDTH
     newest = (
@@ -114,7 +130,7 @@ def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
     if not newest:
         return None
     try:
-        return int(newest[2:])
+        return int(newest[len(device_code):])
     except ValueError:
         # Something matched the shape but isn't numeric — ignore it rather than
         # blocking batch creation; the unique constraint is still the backstop.

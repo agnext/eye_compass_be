@@ -181,9 +181,10 @@ them alongside further enhancements worth considering but not yet done.
   primary key restarts at 1, two Jetsons reliably produced the identical id
   once their scans reached the same place (Qualix / the shared spreadsheet).
 
-  Replaced with a 2-character `DEVICE_CODE` (new required setting, `.env`)
-  followed by 10-digit epoch seconds — e.g. `D11790014601` — so two devices
-  can never collide regardless of what either has scanned before. The
+  Replaced with a 2-character `DEVICE_ID` (`.env`, required before any batch
+  can be created) followed by 10-digit epoch seconds — e.g. `T11790153845` —
+  so two devices can never collide regardless of what either has scanned
+  before. The
   timestamp alone is not a safe uniqueness guarantee on this hardware: these
   Jetsons have no battery-backed RTC, so the clock can come up in the past
   after a reboot and re-issue a second it already used, and two batches saved
@@ -206,6 +207,295 @@ them alongside further enhancements worth considering but not yet done.
   sent back on save and honored as-is if it's still well-formed and free —
   falling back to a fresh one otherwise — so what the operator sees on screen
   is what actually gets stored, not a preview that could drift from it.
+
+  Two settings are involved and they are **not** interchangeable, which has
+  already caused one outage:
+
+  | Setting | Purpose | Shape |
+  | --- | --- | --- |
+  | `DEVICE_ID` | prefix on every batch number | exactly 2 chars, `A-Z`/`0-9` |
+  | `DEVICE_CODE` | sent as `device_serial_no` on the Qualix scan datagram | free-form, whatever Qualix has registered |
+
+  Neither is derived from the other and both are per physical device. They
+  were originally assigned the opposite way round; the swap is recorded below
+  under *Batch-id prefix and Qualix device serial swapped over*.
+
+  `_device_code()` validates the prefix at the point of use rather than at
+  import, so a misconfigured device still serves history and retries syncs
+  instead of refusing to boot — but note the failure mode this produced in
+  practice: the New Batch form showed "Generating…" forever, because the
+  frontend had no handling for `/batch/next-number` failing and simply never
+  replaced its loading text. Both halves were fixed (see *Batch-id prefix and
+  Qualix device serial swapped over*).
+- **Saving a scan is now idempotent, keyed on a client-generated UUID**, so a
+  retry over a dropping link cannot produce a second scan record.
+  `POST /api/scan/submit` mints a UUID and returns it; the frontend holds it
+  until the batch is saved or discarded and sends it back on
+  `POST /api/scan/confirm` as `client_request_id`. A request whose key is
+  already stored is answered with the original `result_id` instead of saving
+  the scan again.
+
+  The problem this solves was not hypothetical duplicate rows — `/confirm`
+  consumes a single in-memory pending slot, so a retry never actually
+  inserted twice. It was the *response*: the retry found the slot already
+  consumed and got `409 Nothing to confirm — submit a result first`, which
+  the operator reads as "the save failed" for a scan that had in fact been
+  saved and synced. The obvious next move — re-run the whole batch — is how
+  genuine duplicates got created, one screen further back. The key turns that
+  409 into the success it always was.
+
+  Three layers again, deliberately, matching the batch-number approach:
+  `confirm_scan` checks for the key before touching the pending slot; the
+  `client_request_id` column carries a `UNIQUE` index so two retries racing
+  past that check cannot both insert; and the resulting `IntegrityError` is
+  caught and resolved by returning the row that won. The column is nullable
+  and rows written before this feature (and any non-client writer) stay
+  `NULL`, which a unique index permits any number of — that is what lets the
+  index apply retroactively to a device with existing history.
+
+  A replay deliberately does **not** re-queue the Qualix/Sheets sync: the
+  first attempt already queued it and the 30-minute retry worker picks up
+  anything still pending, so posting again on a replay would risk a duplicate
+  reaching Qualix — the exact problem this is meant to prevent, one system
+  downstream.
+
+  Not to be confused with the `uuid` already inside the Qualix payload, which
+  is a different key with a different job — that one is legacy-inherited and
+  protects *Qualix* from recording a scan twice across delivery retries, and
+  never touches this device's own database. `../external_apis.md` has a table
+  comparing the two.
+
+  **Where the key is minted, and where it is kept, are both load-bearing.**
+  The first version generated it in the browser, on the results page, in a
+  React ref. That covered the common case — press Save, press Save again on
+  the same screen — but left a hole: the ref dies when the page unmounts, so
+  an operator who pressed Save, saw it time out, wandered back to Home and
+  returned would generate a *fresh* key, and the retry looked like a brand new
+  save and got the same misleading 409 all over again.
+
+  It is now minted by the backend at `/submit`, where it is tied to the
+  submission rather than to a screen, and held in `sessionStorage`
+  (`src/pendingSaveKey.js`) so it survives the results page unmounting and a
+  page reload. It is cleared on a successful save, on discard, and when a
+  batch is abandoned via the browser's Back button; a new `/submit` overwrites
+  it. `sessionStorage` and not `localStorage` deliberately — a key surviving
+  into another day could only ever cause a later save to be misread as a
+  replay of something long since finished.
+
+  Every `sessionStorage` access is wrapped in `try`/`catch`, because it throws
+  rather than returning `null` when site data is blocked. Losing replay
+  protection is acceptable; taking the Save button down with an exception is
+  not.
+
+  Generating it server-side also sidestepped a browser trap the first version
+  had to work around: `crypto.randomUUID()` is only exposed in a secure
+  context, and this app is routinely opened over plain `http` at the Jetson's
+  LAN address (see `CORS_ORIGINS`), where it is `undefined` and calling it
+  would have thrown inside the Save handler.
+- **Batch-id prefix and Qualix device serial swapped over.** `DEVICE_ID` had
+  been the value sent as `device_serial_no`, and `DEVICE_CODE` the batch-number
+  prefix; they now hold the opposite roles (table above). The swap was
+  requested to match how the fields are named and assigned on the Qualix side.
+
+  Worth recording because the transition surfaced two separate defects:
+
+  1. `DEVICE_CODE` had been relaxed from 2 characters to 2–6 to accommodate a
+     4-character value (`CGI2`) that was really a device *serial*, not a batch
+     prefix. That relaxation then exposed a latent bug: `_last_issued_ts`
+     extracted the timestamp with a hardcoded `newest[2:]` slice, which for
+     any prefix longer than 2 produced a non-numeric string — so it returned
+     `None` every time, the monotonic clock guard had nothing to compare
+     against, and a second batch created within the same second regenerated
+     an id that already existed, hitting the `UNIQUE` constraint. Now sliced
+     by `len(device_code)`. With the swap the prefix is back to a strict 2
+     characters, but the slice fix stands on its own.
+  2. A `DEVICE_CODE` that failed validation returned HTTP 500 from
+     `/batch/next-number`, and the New Batch form showed **"Generating…"
+     indefinitely** with no error and a still-clickable Start Batch button.
+     The form now renders the backend's actual message in place of the id and
+     disables Start Batch while there is no valid id.
+
+  Note for a device with existing batches: changing the prefix does not
+  invalidate anything. `_last_issued_ts` scopes its `MAX()` to the current
+  prefix via a length-anchored `LIKE`, so old rows under the previous prefix
+  are simply not consulted, and cannot collide with new ones precisely
+  because the prefix differs.
+- **Qualix is now told the device, operator and warehouse explicitly, instead
+  of having to infer them from whichever account authenticated the post.**
+  Every scan datagram carries a trio of new fields: `device_serial_no`
+  (`DEVICE_CODE`), `warehouse_name` (`WAREHOUSE_NAME`) and `operator_id`.
+
+  This replaces an approach that was started and then abandoned. Qualix maps a
+  scan's location from the email of the account that posted it, so the obvious
+  reading was that each sync should authenticate *as the operator who ran the
+  batch*. That cannot work here, and the reason is structural rather than
+  incidental: an operator who signed in offline (tier 2, cached password hash)
+  or via the device fallback (tier 3) has no Keycloak token at all, and never
+  will until they next log in online — so a sync that depended on their
+  identity could never run for them. Syncing therefore stays on the fixed
+  service account, and the identity that *matters* travels in the payload
+  where it is always available. Qualix already accepts these fields.
+
+  `operator_id` is Qualix's own `user.user_id`, read from its
+  `/user/keycloak-profile` response at login. It is refreshed **only on a
+  fresh online login** and otherwise carried forward unchanged from the
+  `creds` row, so an offline login keeps posting the correct operator rather
+  than blanking the field. A value that differs from the cached one is logged
+  at WARNING before being stored, so a reassignment is visible rather than
+  silent. Stored on both `sessions` and `creds`.
+
+  `current_operator_id()` (`core/security.py`) reads it for the scan
+  endpoints and is deliberately *soft* — it returns `""` rather than raising
+  when there is no session, because `scan.py` enforces no authentication
+  today and reading this must not become a new way for a scan to be rejected.
+
+  Naming trap, documented because it has already misled once: the datagram
+  also has a long-standing `device_id` field, which is the machine's own
+  `/etc/machine-id` fingerprint via `get_device_id()` — unrelated to both the
+  `DEVICE_ID` and `DEVICE_CODE` settings.
+- **A rejected Qualix post no longer gets written to Google Sheets.** When
+  Qualix rejects a payload outright (HTTP 400 — e.g. `{"error-code":"12092",
+  "error-message":"Device does not exist"}`), that record is terminal and is
+  not retried; sending it to Sheets anyway put a row there for a scan Qualix
+  had explicitly refused, so the two systems disagreed about what existed.
+
+  The cause was one call site out of three: `sync_result_to_cloud` in
+  `scan.py` posted to Sheets unconditionally, while the retry worker and the
+  manual resync path both already gated on success. Fixing it closed a second
+  bug nobody had reported — pending (`'0'`) records were reaching Sheets on
+  the first attempt *and* again on every subsequent retry, duplicating rows.
+- **A rejection reason is now stored and shown, instead of living only in the
+  backend log.** A `'2'` (rejected) record was previously a dead end on
+  screen: the operator saw "Rejected" with no way to find out why. Qualix's
+  reason is now parsed out of the response body (`_readable_qualix_error`
+  handles its `error-code`/`error-message` shape, falling back to raw
+  truncated text), stored on `result.sync_error`, and surfaced both in the
+  History list and on the record detail page. `post_analysis_data` returns a
+  3-tuple `(status, error_code, error_detail)`; all three call sites pass the
+  detail through to `set_sync_status`, which clears it on a successful sync so
+  a stale reason can never outlive the failure it described.
+- **The sync identity and the emergency device login are now two separate
+  accounts.** `QUALIX_USERNAME`/`QUALIX_PASSWORD` was doing both jobs at once:
+  authenticating every outbound sync, *and* serving as the tier-3 credentials
+  that unlock the device when Keycloak is unreachable and no cached password
+  exists.
+
+  That is wrong in both directions. The emergency credentials have to be
+  shareable with whoever might need to recover a device in the field — so
+  making them the same secret as the sync account means everyone holding the
+  door key also holds the identity that posts every scan. And in the other
+  direction it caused a real outage: the shared account existed in Qualix but
+  not in Keycloak, so every sync failed with "Invalid user credentials" and
+  nothing explained why.
+
+  Now:
+
+  | Setting | Job | Checked where |
+  | --- | --- | --- |
+  | `SYNC_SERVICE_USERNAME` / `_PASSWORD` | authenticates the scan POST and config fetch, under **both** providers | Keycloak, or Qualix on the legacy path |
+  | `EMERGENCY_LOGIN_USERNAME` / `_PASSWORD` | tier-3 unlock only | entirely on-device, no network call |
+
+  The emergency account need not exist in Keycloak or Qualix at all — it
+  decides who gets *in*, never what anything is sent *as*.
+
+  Two details worth knowing. **Syncing now uses `SYNC_SERVICE_*` on the legacy
+  path too** (`sync_worker.py`, `history.py`, `sync_service.py` previously read
+  `QUALIX_*` there); one setting means one account, whichever provider is
+  selected. And **`SYNC_SERVICE_*` has no fallback on purpose** — quietly
+  borrowing another account is precisely how the outage above went unnoticed,
+  so a blank value now fails loudly and logs what to set.
+  `QUALIX_USERNAME`/`QUALIX_PASSWORD` were then **removed as settings
+  entirely** — nothing reads them as such. They survive only as deprecated
+  *aliases* when resolving `EMERGENCY_LOGIN_*`, alongside legacy's
+  `config.INI`, which is the step that actually matters: on a real device the
+  credentials live in `config.INI` (`[CONFIG_SETTINGS] username`/`password`),
+  not necessarily in `.env` at all. Dropping those reads would have silently
+  taken away the emergency login on upgrade — the one path whose entire
+  purpose is to work when everything else has failed. A startup warning names
+  whichever old source is still supplying the value, so it is visible when a
+  device has been migrated and the old entries can go.
+
+- **The same scan can no longer be delivered twice at once.** Three things
+  deliver to Qualix — the post right after a batch is saved, the retry worker,
+  and History's manual re-sync — and nothing stopped two of them working on
+  the same record concurrently.
+
+  This needed no operator action to happen. A record stays at
+  `sync_status='0'` for the *whole* duration of its POST, and that POST is
+  slow (the endpoint averages ~30s). So a batch saved shortly before the retry
+  worker's tick is still listed as unsent when the worker asks what needs
+  sending, and both post it. A manual re-sync click during that window is
+  simply a third way in, as is double-tapping the button.
+
+  **What actually broke was Google Sheets, not Qualix.** Qualix recognises the
+  repeat by `sample_id` and answers `12063`, which is handled. But
+  `post_to_sheets` checks `already_in_sheet` and *then* appends — two
+  deliveries interleaving between those two steps both see "not present" and
+  both append, putting two rows in the sheet for one scan.
+
+  `services/sync_lock.py` holds a per-result-id claim (`claim_result`, a
+  context manager yielding whether the claim was granted). All three
+  deliverers take it: the background post returns early if it cannot get it,
+  the worker skips the record and looks again next cycle, and the manual
+  re-sync answers **409** with a message telling the operator it is already
+  being sent and will update on its own. Claims are per record — two
+  *different* records syncing at once is normal — and are released even when a
+  delivery raises. In-process only, which is all that is needed: one backend
+  process owns this device, the same assumption behind the single-slot pending
+  submission in `api/scan.py`.
+
+  Worth knowing for whoever re-adds a Sync button: **there is currently no UI
+  caller for re-sync at all.** It was removed from History on request, and
+  `History.jsx`'s comment claiming `ResultsViewer.jsx` still uses it is stale —
+  nothing does. The endpoint and its RTK Query mutation remain, so this guard
+  is in place ahead of the button coming back.
+
+- **`Sample ID already exists` from Qualix is now recorded as delivered, not
+  rejected, and the scan POST waits 90s instead of 30.** These are one finding:
+  a real scan was filed as failed when Qualix had actually stored it.
+
+  The POST had a 30s read timeout. A live measurement against the dev gateway
+  answered in **28.7s** — so the limit sat right on top of the endpoint's real
+  response time, and requests that crossed it were recorded as undelivered
+  even though Qualix had received and stored them. The retry then came back
+  `400 {"error-code":"12063","error-message":"Sample ID already exists"}`,
+  which was filed as `'2'` (Rejected) — terminal, so it would have sat on the
+  History screen looking like lost data forever, while the scan was safe in
+  Qualix the whole time.
+
+  Both halves are fixed: `12063` maps to `'1'` (delivered) with the stored
+  error cleared, and `_POST_TIMEOUT_SECONDS` is 90. Nothing waits on this call
+  — the post after a batch is a background task and the worker has no user
+  attached — so a longer wait costs nothing, while giving up early costs a
+  scan that looks lost. The config `GET` stays at 30s: no evidence it is slow,
+  and it *is* on the login path.
+
+  Treating a duplicate as success is only safe because **batch numbers are
+  globally unique** (device code + epoch, `UNIQUE` constraint), so a
+  `sample_id` can only already exist at Qualix if this same scan reached them
+  before. Two devices sharing a `DEVICE_ID` would break that assumption — the
+  reason the acceptance is logged at WARNING rather than silently.
+
+  The check is in `post_analysis_data`, so the immediate post, the retry
+  worker and the manual re-sync all inherit it. Raising the timeout makes the
+  case rarer but cannot remove it: no timeout distinguishes "still working"
+  from "never going to answer".
+- **`resync_result` no longer falls back to a direct Qualix login when
+  `AUTH_PROVIDER=keycloak`.** Found while auditing the above for similar
+  cases. The fallback was pointless in that mode — `_auth_headers()` ignores
+  the resulting `access_token` entirely and uses the gateway's own token — so
+  a failure surfaced as a confusing Qualix login error rather than the real
+  one. It now raises `502` directly, matching the guard the sync worker
+  already had.
+- **Config-fetch failures now log the URL and the response body**, not just a
+  bare status code. A `Config fetch failed` line reporting only HTTP 500/503
+  gave nothing to act on; both the non-200 branch and the exception branch now
+  include where the call went and what came back (truncated).
+- **`POST /api/config/sync` reports real completion.** It previously handed
+  the work to a `BackgroundTasks` job and returned success immediately —
+  meaning "accepted", not "done" — so a caller could not tell a finished sync
+  from a failed one, and the frontend had no moment at which to refresh. It
+  now runs inline and returns `{"status": ..., "synced": bool}`.
 
 ### Frontend
 - **The Home screen checks whether the backend has flagged the session for
@@ -545,6 +835,92 @@ them alongside further enhancements worth considering but not yet done.
   instead of leaving the bare desktop exposed. This is a device-hardening
   change with no effect on the app's own behavior — full detail in `10 -
   pwa_and_deployment_rollout.md`'s Kiosk browser section.
+- **Fixed a silently-ignored RTK Query option that made freshly synced config
+  invisible.** Reported as: a surveyor synced from Qualix (the backend log
+  confirming `1 surveyors`, and the row present in Postgres) never appeared in
+  the New Batch dropdown — not on revisiting the page, not until a full logout
+  and login.
+
+  The cause was a genuine API misuse rather than a caching-policy choice:
+  `refetchOnMountOrArgChange` was set inside each `builder.query({...})`
+  definition in `configApi.js`. It is not a valid endpoint-level option — it
+  belongs on the `createApi` root (or on an individual hook call) — and RTK
+  Query neither applies nor warns about it there. It was moved to the root,
+  so mounting New Batch now genuinely refetches. `syncConfig` additionally
+  declares `invalidatesTags: ['Config']`, which (together with the backend's
+  `/config/sync` now completing inline rather than returning early) makes a
+  sync update open screens immediately, without needing a remount at all.
+
+  Worth flagging for future work in this codebase: an unrecognised key in an
+  endpoint definition is accepted in silence, so this class of bug does not
+  announce itself. The first diagnosis here was wrong for exactly that reason
+  — the behavior looked like a stale-cache timing issue, and was only
+  identified correctly after the reported "reopening the page doesn't help"
+  ruled that out.
+- **Screens re-read the backend on every visit, because the kiosk has no
+  reload button.** This is a device constraint the web architecture does not
+  otherwise account for: the Jetson runs a single full-screen browser with no
+  address bar and no F5, so whatever RTK Query has cached is simply what the
+  operator sees. There is no user-accessible way to force a refresh.
+
+  `refetchOnMountOrArgChange: true` now sits on `historyApi` and `scanApi`
+  (it was already on `configApi`), so every visit to History, a record, or
+  Reclassify Objects reads the database rather than replaying the previous
+  visit's response. Without it, re-opening History inside
+  `keepUnusedDataFor` — 60s after the last subscriber goes away — showed the
+  earlier rows, including sync statuses for batches that had since been
+  delivered.
+
+  It has to be set on `createApi`, never inside `builder.query()`: it is a
+  CreateApiOptions/hook option and RTK Query **silently ignores it** on an
+  endpoint definition. In plain JS nothing flags that, which is exactly how
+  the same mistake went unnoticed in `configApi.js` (symptom: a synced
+  surveyor that never appeared in a dropdown). An audit script now confirms no
+  slice has it misplaced.
+
+  The remaining slices are deliberate, not oversights: `authApi`'s `me` and
+  `batchApi`'s `next-number` are passed the same option **hook-side** by
+  `Home.jsx` and `NewBatch.jsx`, which is equally valid; `batchApi.getBatch`,
+  `cameraApi.getCameraStatus` and `conveyorApi.getConveyorStatus` have no
+  callers at all.
+
+- **History and an unsettled record poll, so a sync status changes on screen
+  rather than only on re-entry.** Refetching on mount fixes opening a screen;
+  it does nothing for one already open. A row's Sync Status is *not* settled
+  when it first appears — the Qualix post runs as a background task against an
+  endpoint averaging ~30s, and the retry worker changes statuses long
+  afterwards with nothing on screen to trigger a re-read. On a desktop the
+  operator would press F5; here a batch shown as "Pending" would stay
+  "Pending" until they navigated away and back, which looks exactly like a
+  sync that never completed.
+
+  The History list polls every 15s while open. A record page polls every 10s
+  **only while its own `sync_status` is `'0'`** — an accepted or rejected
+  record cannot change again on its own, and this device leaves screens open
+  for long stretches, so there is no reason to keep asking about a settled
+  one.
+
+  Implementation note, since the obvious version does not compile: the polling
+  interval cannot be derived inline from the query's own result, because that
+  result is declared by the very call being configured (a temporal dead zone
+  error). It is held in state and updated with React's documented "adjusting
+  state during render" pattern rather than an effect — one guarded assignment,
+  which settles immediately instead of painting once with the stale value.
+
+- **Sorting Quantity accepts positive whole numbers only.** It is a count, not
+  a weight, but previously took decimals and negatives. The field now strips
+  everything but digits as the operator types (`value.replace(/\D/g, '')`, so
+  `.` and `-` cannot be entered at all), and `BatchCreate` enforces the same
+  rule server-side with `re.fullmatch(r"[1-9]\d*", ...)` — deliberately a
+  regex and not a bare `int()` call, which would also accept `-5`, `1e10` and
+  `0`. Both halves are needed: the frontend filter is the usable one, the
+  backend check is the one that holds for a request that never went through
+  the form.
+- **The sync outcome is visible where the records are.** The History list
+  shows the rejection reason beneath the status pill (clamped to two lines,
+  full text on hover), and the record detail page shows it as a banner —
+  red for rejected, amber for still pending. Both read `sync_error` from the
+  API described in the backend section above.
 
 ## Suggested future enhancements
 

@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.models.schema import Result
 from app.services.database_service import DatabaseService
+from app.services.sync_lock import claim_result
 from app.services.sync_service import sync_service
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ def _row_to_summary(r: Result) -> dict:
         "stop_time": r.stop_time,
         "sync_status": r.sync_status,
         "sync_label": SYNC_LABELS.get(r.sync_status, "Unknown"),
+        "sync_error": r.sync_error or "",
         # Legacy history columns
         "receiving_date": scan_data.get("receiving_date", ""),
         "vendor_name": scan_data.get("vendor_name", ""),
@@ -249,6 +251,14 @@ def resync_result(result_id: int, db: Session = Depends(get_db)):
     The automatic worker retries '0' records every SYNC_RETRY_INTERVAL_MINUTES
     (default 30); this is the operator-facing equivalent for when they do not
     want to wait.
+
+    Answers 409 if that record is already being delivered — by the post that
+    followed the batch, by the worker, or by an earlier click of this same
+    button. Pressing it during the (roughly half-minute) window one of those is
+    open would otherwise send the scan twice in parallel, which Qualix shrugs
+    off but Google Sheets does not: post_to_sheets checks for an existing row
+    and then appends, so two deliveries interleaving between those steps both
+    append. See sync_lock.
     """
     r = db.query(Result).filter(Result.id == result_id).first()
     if not r:
@@ -257,22 +267,40 @@ def resync_result(result_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=422, detail="Stored payload is not a JSON object")
 
     if not sync_service.is_authenticated:
-        if not sync_service.login_qualix(
-            settings.QUALIX_USERNAME, settings.QUALIX_PASSWORD
+        # Under AUTH_PROVIDER=keycloak, is_authenticated has already tried (and
+        # failed) to get the sync service token, and there is no separate
+        # Qualix password login left to attempt — the same guard the retry
+        # worker uses. Without it this fell back to a direct legacy Qualix
+        # login even in Keycloak mode, which could not help either way:
+        # _auth_headers() ignores self.access_token there and sends the
+        # Keycloak service token regardless.
+        if settings.AUTH_PROVIDER == "keycloak" or not sync_service.login_qualix(
+            settings.SYNC_SERVICE_USERNAME, settings.SYNC_SERVICE_PASSWORD
         ):
             raise HTTPException(status_code=502, detail="Could not authenticate with Qualix")
 
-    status, error_code = sync_service.post_analysis_data(r.result)
-    if status == "1":
-        try:
-            sync_service.post_to_sheets(r.result)
-        except Exception as exc:
-            logger.error("Sheets resync failed: %s", exc)
+    with claim_result(result_id) as granted:
+        if not granted:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This record is already being sent. Give it a moment — the "
+                    "status updates on its own."
+                ),
+            )
 
-    DatabaseService(db).set_sync_status(result_id, status)
-    return {
-        "status": "success" if status == "1" else "failed",
-        "sync_status": status,
-        "sync_label": SYNC_LABELS.get(status, "Unknown"),
-        "error_code": error_code,
-    }
+        status, error_code, error_detail = sync_service.post_analysis_data(r.result)
+        if status == "1":
+            try:
+                sync_service.post_to_sheets(r.result)
+            except Exception as exc:
+                logger.error("Sheets resync failed: %s", exc)
+
+        DatabaseService(db).set_sync_status(result_id, status, error_detail)
+        return {
+            "status": "success" if status == "1" else "failed",
+            "sync_status": status,
+            "sync_label": SYNC_LABELS.get(status, "Unknown"),
+            "error_code": error_code,
+            "sync_error": error_detail,
+        }

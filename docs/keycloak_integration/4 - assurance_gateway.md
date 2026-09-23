@@ -56,9 +56,14 @@ This applies to all three places that send data:
 
 Three reasons, the last one decisive:
 
-1. **The data does not record who sent it.** The information posted to Qualix
-   contains no "submitted by" field — only a `surveyor_name` that the operator
-   types in manually per batch. So nothing is lost by not using their identity.
+1. **Identity travels in the payload instead, so authentication does not have
+   to carry it.** The datagram names the operator outright, in an `operator_id`
+   field (alongside `device_serial_no` and `warehouse_name`) — so Qualix does
+   not have to infer who or where from the account that posted. Nothing is lost
+   by authenticating as someone else. *This was not always true: the payload
+   originally had no "submitted by" field at all, only a manually typed
+   `surveyor_name`, and the trio was added specifically so that the decision
+   below would not cost Qualix the mapping it needs.*
 2. **The retry worker runs unattended** — overnight, or right after a reboot,
    when nobody is logged in at all. It cannot depend on somebody's session
    existing.
@@ -70,6 +75,24 @@ Three reasons, the last one decisive:
 The result is simpler than what came before: syncing no longer depends on anyone
 being logged in, and behaves identically whether the operator signed in online,
 offline, or with device credentials.
+
+### Where `operator_id` comes from
+
+It is Qualix's own `user.user_id`, taken from the `/user/keycloak-profile`
+response at login (the same call described in the next section) and stored on
+both the `sessions` and `creds` rows.
+
+It is refreshed **only on a fresh online login**. An offline or cached login
+carries the stored value forward unchanged rather than overwriting it with a
+blank — which is what makes the field reliable on exactly the devices that need
+it most, the ones that go weeks without a network. A fresh value that differs
+from the stored one is logged at WARNING before being saved, so an operator
+being reassigned is visible rather than silent.
+
+`current_operator_id()` in `core/security.py` reads it for the scan endpoints,
+and returns `""` rather than raising when there is no session — `scan.py`
+enforces no authentication today, and reading this must not become a new way
+for a scan to be rejected.
 
 ---
 

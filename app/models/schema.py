@@ -56,6 +56,13 @@ class Creds(Base):
     password = Column(String(255))
     keycloak_user_id = Column(String(64), default="")
     refresh_token = Column(Text)
+    # Qualix's own user_id (the `user.user_id` field of /user/keycloak-profile,
+    # or the equivalent from legacy's direct Qualix login) — what Qualix's
+    # location-mapping actually keys off, sent as `operator_id` on every scan
+    # datagram. Rides along with the rest of this row for exactly the same
+    # reason: refreshed on every online login, carried forward unchanged on a
+    # later offline (cached-hash) one.
+    operator_id = Column(String(64), default="")
 
 
 class Session(Base):
@@ -124,6 +131,11 @@ class Session(Base):
     # worker ask Keycloak's Admin API about this exact account later, without
     # ever needing the operator's password again.
     keycloak_user_id = Column(String(64), default="")
+    # Qualix's own user_id — see Creds.operator_id for what it's for and where
+    # it comes from. Copied onto every session (online or offline) the same
+    # way keycloak_user_id/refresh_token already are, so /scan/submit can read
+    # it straight off the caller's session without a fresh Qualix call.
+    operator_id = Column(String(64), default="")
     # The account's password credential's own createdDate, as Keycloak's Admin
     # API reports it. A refresh-token grant proves the account/session is
     # still valid, but not that the password is still the one the operator
@@ -221,10 +233,31 @@ class Result(Base):
     start_time = Column(String(50))
     stop_time = Column(String(50))
     sync_status = Column(String(20), index=True, default="0")
+    # Why the last delivery attempt failed, verbatim from Qualix where it said
+    # so (e.g. {"error-code":"12092","error-message":"Device does not exist"}).
+    # Without this a '2' was a dead end on screen: the operator saw "Rejected"
+    # with no way to find out why, and the reason existed only in the backend
+    # log. Cleared on a successful sync so a stale reason can't outlive it.
+    sync_error = Column(Text, default="")
+    # Idempotency key: the UUID the client minted for this save, before it ever
+    # sent the request. On a flaky link the browser can time out waiting for
+    # /confirm that in fact succeeded, and the operator retries; the retry
+    # carries the SAME uuid, so it is recognised as a replay and answered with
+    # the id already stored instead of saving the scan a second time.
+    #
+    # Nullable and unique together: rows written before this existed (and any
+    # future non-client writer) carry NULL, and Postgres permits any number of
+    # NULLs under a unique index while still rejecting a repeated real value.
+    client_request_id = Column(String(64), nullable=True)
 
     __table_args__ = (
         # Legacy identified a record by this 4-tuple (database.py:433-445).
         Index("ix_result_identity", "sample_id", "date", "start_time", "stop_time"),
+        # The constraint — not the SELECT in confirm_scan — is what actually
+        # makes a replay impossible: two retries arriving at once both find no
+        # existing row, and this turns the second INSERT into an IntegrityError
+        # that confirm_scan resolves by returning the winner's id.
+        Index("uq_result_client_request_id", "client_request_id", unique=True),
     )
 
 

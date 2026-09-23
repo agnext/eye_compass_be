@@ -10,13 +10,36 @@ deploying to a device, and before any database backup/restore work.
 | Change | Detail |
 |---|---|
 | **New table** | `sessions` |
-| Tables changed | **None** — no existing table was altered |
 | Tables removed | **None** |
-| Columns added to existing tables | **None** |
-| Data migration needed | **None** |
-| Manual SQL needed | **None** — the table is created automatically at startup |
+| Columns added to existing tables | `creds.operator_id`, `result.sync_error`, `result.client_request_id` (plus several on `sessions` itself as the work progressed) |
+| Indexes added to existing tables | `uq_batch_details_batch_number`, `uq_result_client_request_id` — both `UNIQUE` |
+| Data migration needed | **None** — every added column is nullable or defaulted, and existing rows are valid as they stand |
+| Manual SQL needed | **None** — applied automatically at startup, see below |
 
-Nothing existing was touched. The only change is one new table.
+No existing column was altered or dropped; the changes are one new table, some
+added columns, and two unique indexes.
+
+### How added columns and indexes reach a device that already has data
+
+There is no Alembic in this project, and SQLAlchemy's `create_all()` only
+creates missing *tables* — it will not add a column to a table that already
+exists, nor add a constraint to one. Two idempotent startup steps in
+`app/main.py` cover that gap, both safe to run on every boot:
+
+- `_add_missing_columns()` — compares each table's live columns against a
+  small explicit map and issues `ALTER TABLE ... ADD COLUMN` for anything
+  absent.
+- `_add_missing_constraints()` — issues `CREATE UNIQUE INDEX IF NOT EXISTS`
+  for the two unique indexes above.
+
+Two details worth knowing before a deploy:
+
+- `result.client_request_id` is added **without** a `DEFAULT`. Existing rows
+  must stay `NULL`, because a unique index permits any number of `NULL`s but
+  would refuse to build if every pre-existing row shared a `''` default.
+- `_add_missing_constraints()` will fail loudly if `batch_details` already
+  contains duplicate batch numbers. That is the intended outcome — they have
+  to be resolved by hand before uniqueness can be enforced.
 
 ---
 
@@ -36,6 +59,10 @@ Defined in `app/models/schema.py`, used by `app/core/security.py`.
 | `first_name` | String(150) | From Keycloak, for display |
 | `email` | String(255) | From Keycloak |
 | `roles` | JSON | The user's roles from Keycloak |
+| `keycloak_user_id` | String(64) | Keycloak's own subject id for this account |
+| `password_credential_created_at` | DateTime, nullable | When the Keycloak-side password credential was created — used to spot a password change |
+| `relogin_suggested` | Boolean | Softer than `needs_relogin`: ask again at Home, do not cut the operator off |
+| `operator_id` | String(64) | Qualix's own `user.user_id`, sent on the scan datagram so Qualix knows who ran the batch — see `11 - user_flows.md` |
 
 ### How it gets created
 
@@ -229,11 +256,20 @@ straight back in.
 
 ---
 
-## Existing tables — unchanged but worth noting
+## Existing tables — how they changed
 
 **`creds`** — stores the hashed password used for the fast path and for offline
-login. Its shape is unchanged: a plain `(username, hashed password)` row that
-does not care which system verified the password.
+login. Still a single row keyed on the username, and still indifferent to which
+system verified the password; it has since gained `keycloak_user_id`,
+`refresh_token` and `operator_id` columns.
+
+`operator_id` deserves a note, because how it is *maintained* is the point of
+it. It is refreshed **only on a fresh online login**, where Qualix's
+`/user/keycloak-profile` response supplies it. On an offline or cached login it
+is carried forward unchanged rather than overwritten, so a device that has been
+off the network for weeks still posts scans under the correct operator. A fresh
+value that differs from the stored one is logged at WARNING before being saved,
+so a reassignment is visible rather than silent.
 
 Three behaviours worth knowing about:
 

@@ -145,12 +145,6 @@ class Settings:
     QUALIX_API_URL: str = _env(
         "QUALIX_API_URL", section="API_ENV", key=QUALIX_RUN_ENV, default="https://assaying.qualix.ai/"
     )
-    QUALIX_USERNAME: str = _env(
-        "QUALIX_USERNAME", section="CONFIG_SETTINGS", key="username", default=""
-    )
-    QUALIX_PASSWORD: str = _env(
-        "QUALIX_PASSWORD", section="CONFIG_SETTINGS", key="password", default=""
-    )
     # Legacy appends this to the bare username before authenticating (main.py:598).
     QUALIX_USER_DOMAIN: str = _env("QUALIX_USER_DOMAIN", default="@agnext.in")
 
@@ -161,16 +155,25 @@ class Settings:
         "ANALYSIS_POST_URI", section="API_URI", key="analysis_post_uri", default="portal/api/scan/v2/post-visio"
     )
 
-    DEVICE_ID: str = _env("DEVICE_ID", section="CONFIG_SETTINGS", key="device_id", default="")
+    # Fixed 2-character namespace prefixed to every batch number. This is the
+    # ONLY thing keeping batch numbers distinct between devices — the rest of
+    # the id is a timestamp, which two devices can produce identically. A
+    # blank, wrong-length, or duplicated code silently reintroduces
+    # cross-device collisions that only surface later in Qualix, so batch
+    # creation refuses to run until it's set (see _device_code in
+    # api/batch.py). Must be unique per physical device. Unrelated to
+    # DEVICE_CODE below — neither is derived from the other.
+    DEVICE_ID: str = _env("DEVICE_ID", section="CONFIG_SETTINGS", key="device_id", default="").strip().upper()
     LOCATION: str = _env("LOCATION", section="CONFIG_SETTINGS", key="location", default="")
 
-    # Two-character namespace prefixed to every batch number. This is the ONLY
-    # thing keeping batch numbers distinct between devices — the rest of the id
-    # is a timestamp, which two devices can produce identically. A blank or
-    # duplicated code silently reintroduces cross-device collisions that only
-    # surface later in Qualix, so batch creation refuses to run until it's set
-    # (see _device_code in api/batch.py). Must be unique per physical device.
+    # Sent as `device_serial_no` on every scan datagram, alongside operator_id
+    # and warehouse_name below — this trio is what lets Qualix map location
+    # explicitly from the payload instead of inferring it from whichever
+    # account authenticated the post. Fixed per physical device, same as
+    # DEVICE_ID.
     DEVICE_CODE: str = _env("DEVICE_CODE", section="CONFIG_SETTINGS", key="device_code", default="").strip().upper()
+
+    WAREHOUSE_NAME: str = _env("WAREHOUSE_NAME", default="")
 
     # ---------------- Keycloak / Assurance ----------------
     # "legacy" keeps today's direct-Qualix login untouched; "keycloak" switches
@@ -215,12 +218,62 @@ class Settings:
         default="offline_access",
     )
 
-    # Syncing authenticates as a fixed user account, never the logged-in
-    # operator — an operator who signed in offline has no Keycloak token at
-    # all, so sync can never depend on one. Defaults to the existing Qualix
-    # service credentials, which are the same account in Keycloak's userbase.
-    SYNC_SERVICE_USERNAME: str = _env("SYNC_SERVICE_USERNAME", default="") or QUALIX_USERNAME
-    SYNC_SERVICE_PASSWORD: str = _env("SYNC_SERVICE_PASSWORD", default="") or QUALIX_PASSWORD
+    # ---- Two accounts, two jobs, deliberately not shared ----------------
+    #
+    # These were both QUALIX_USERNAME/PASSWORD, one pair doing two unrelated
+    # things: authenticating every outbound sync, AND unlocking the device at
+    # tier 3. That is wrong on both sides. It made the emergency door key and
+    # the sync identity the same secret, so an operator password that has to
+    # be shared for syncing also lets anyone into the device; and it caused a
+    # real outage, when the account here existed in Qualix but not in
+    # Keycloak and every sync failed with "Invalid user credentials".
+
+    # WHO SYNCS. The fixed account every outbound delivery authenticates as —
+    # the scan POST and the config fetch, under BOTH auth providers. Never the
+    # logged-in operator: someone who signed in offline has no token at all,
+    # so syncing could never depend on one.
+    #
+    # No fallback, on purpose. A blank value here fails loudly and says what
+    # to set; quietly borrowing some other account is exactly how the outage
+    # above went unnoticed. Under AUTH_PROVIDER=keycloak this must be a real
+    # KEYCLOAK account, which the tier-3/emergency login below need not be.
+    SYNC_SERVICE_USERNAME: str = _env("SYNC_SERVICE_USERNAME", default="")
+    SYNC_SERVICE_PASSWORD: str = _env("SYNC_SERVICE_PASSWORD", default="")
+
+    # WHO CAN GET IN WHEN NOTHING ELSE WORKS. Tier 3: the credentials that
+    # unlock the device when Keycloak is unreachable AND no cached password
+    # exists — a brand-new device, or one whose operator has never logged in
+    # online here. Checked entirely locally (api/auth.py), against this value;
+    # no network call, and no bearing on who anything is sent as.
+    #
+    # Resolved in three steps, and the last one is why this is not simply an
+    # env var: on a real device the credentials live in legacy's config.INI
+    # (CONFIG_SETTINGS username/password), not necessarily in .env at all.
+    #
+    #   1. EMERGENCY_LOGIN_USERNAME  — what to set from now on
+    #   2. QUALIX_USERNAME           — DEPRECATED alias, for devices already
+    #                                  deployed with the old name
+    #   3. config.INI                — legacy's own location
+    #
+    # Steps 2 and 3 exist so that deploying this change cannot silently take
+    # away a device's emergency login — the one path whose whole purpose is to
+    # work when everything else has failed. _resolved_from_deprecated_source()
+    # below warns at startup while either is still doing the work, so it is
+    # visible when they can be cleaned up.
+    EMERGENCY_LOGIN_USERNAME: str = _env(
+        "EMERGENCY_LOGIN_USERNAME",
+        "QUALIX_USERNAME",
+        section="CONFIG_SETTINGS",
+        key="username",
+        default="",
+    )
+    EMERGENCY_LOGIN_PASSWORD: str = _env(
+        "EMERGENCY_LOGIN_PASSWORD",
+        "QUALIX_PASSWORD",
+        section="CONFIG_SETTINGS",
+        key="password",
+        default="",
+    )
 
     # Assurance fronts the same Qualix endpoints and accepts a Keycloak token,
     # adding whatever headers Qualix itself needs.
@@ -351,3 +404,30 @@ class Settings:
 
 
 settings = Settings()
+
+
+def _warn_if_emergency_login_is_deprecated():
+    """Say so, at startup, while the emergency login still comes from an old
+    source — so nobody has to guess whether QUALIX_* is safe to delete.
+
+    Silent when EMERGENCY_LOGIN_* is set properly, and silent when no
+    emergency login is configured at all (that is a separate concern).
+    """
+    if os.getenv("EMERGENCY_LOGIN_USERNAME"):
+        return
+    if os.getenv("QUALIX_USERNAME"):
+        source = "the deprecated QUALIX_USERNAME/PASSWORD environment variables"
+    elif settings.EMERGENCY_LOGIN_USERNAME:
+        source = f"legacy config.INI ({_ini_path})"
+    else:
+        return
+    logger.warning(
+        "The tier-3 emergency login is still being read from %s. Set "
+        "EMERGENCY_LOGIN_USERNAME / EMERGENCY_LOGIN_PASSWORD instead — they are "
+        "the device's recovery key and should not be the account that syncs "
+        "(SYNC_SERVICE_USERNAME).",
+        source,
+    )
+
+
+_warn_if_emergency_login_is_deprecated()

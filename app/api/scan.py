@@ -33,18 +33,22 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
-from app.models.schema import BatchDetails
+from app.core.security import current_operator_id
+from app.models.schema import BatchDetails, Result
 from app.services.conveyor_service import conveyor_service
 from app.services.database_service import DatabaseService
 from app.services.datagram import build_datagram
 from app.services.scan_session import scan_session
+from app.services.sync_lock import claim_result
 from app.services.sync_service import sync_service
 
 logger = logging.getLogger(__name__)
@@ -97,6 +101,26 @@ class SubmitRequest(BaseModel):
     surveyor_name: str = ""
 
 
+class ConfirmRequest(BaseModel):
+    """Body of /confirm.
+
+    `client_request_id` is a UUID the browser mints once, before its first
+    attempt, and reuses on every retry of that same save. This device runs on
+    a warehouse link that drops: a POST can succeed server-side and still time
+    out before the response gets home, and the operator then presses Save
+    again. Without the key the second press was answered "Nothing to confirm —
+    submit a result first" (the pending slot having already been consumed),
+    which reads as a failure for a scan that was in fact saved — the operator's
+    reasonable next move being to re-run the whole batch. With it, the retry
+    returns the id from the first attempt.
+
+    Optional so an older frontend, or curl, still works unchanged — it simply
+    gets no replay protection.
+    """
+
+    client_request_id: str = ""
+
+
 class RelabelCropRequest(BaseModel):
     name: str
     fm_name: str
@@ -112,14 +136,28 @@ def sync_result_to_cloud(result_id: int, datagram: dict):
     Opens its OWN database session: the request-scoped session from
     Depends(get_db) is already closed by the time a BackgroundTask runs, so
     every write through it was silently failing.
+
+    Claims the result first so the retry worker cannot start posting the same
+    one while this is still in flight — which it otherwise can, because the
+    record stays '0' for the whole duration of this call. See sync_lock.
     """
+    with claim_result(result_id) as granted:
+        if not granted:
+            return
+        _deliver(result_id, datagram)
+
+
+def _deliver(result_id: int, datagram: dict):
+    """The delivery itself. Only ever called holding this result's claim."""
     db = SessionLocal()
     try:
         service = DatabaseService(db)
 
-        post_status, error_code = ("0", "not_attempted")
+        post_status, error_code, error_detail = (
+            "0", "not_attempted", "Not signed in to Qualix when the scan was saved.",
+        )
         if sync_service.is_authenticated:
-            post_status, error_code = sync_service.post_analysis_data(datagram)
+            post_status, error_code, error_detail = sync_service.post_analysis_data(datagram)
         else:
             logger.warning(
                 "No Qualix session — result %s stays unsynced and will be retried.",
@@ -129,18 +167,27 @@ def sync_result_to_cloud(result_id: int, datagram: dict):
         # Sheets is a side channel. Legacy advanced sync_status on the Qualix
         # response alone (main.py:2930-2941); a Sheets success must not mask a
         # Qualix failure, or the retry worker never sees the record again.
-        try:
-            sync_service.post_to_sheets(datagram)
-        except Exception as exc:
-            logger.error("Sheets sync failed for result %s: %s", result_id, exc)
+        #
+        # Only ever written when Qualix actually accepted the record, matching
+        # what the retry worker and History's Re-sync already do. Posting it
+        # unconditionally was wrong twice over: a payload Qualix *rejected*
+        # (400 — e.g. "Device does not exist") still reached the sheet as
+        # though it had been accepted, and a record that merely failed to
+        # deliver ('0') got a row here and then a SECOND one from the retry
+        # worker once it eventually went through.
+        if post_status == "1":
+            try:
+                sync_service.post_to_sheets(datagram)
+            except Exception as exc:
+                logger.error("Sheets sync failed for result %s: %s", result_id, exc)
 
-        service.set_sync_status(result_id, post_status)
+        service.set_sync_status(result_id, post_status, error_detail)
         if post_status == "1":
             logger.info("Result %s synced to Qualix.", result_id)
         elif post_status == "2":
             logger.error(
-                "Result %s rejected by Qualix (400) — marked '2', will not be retried.",
-                result_id,
+                "Result %s rejected by Qualix (400) — marked '2', will not be retried. %s",
+                result_id, error_detail,
             )
         else:
             logger.warning(
@@ -335,6 +382,7 @@ def cancel_scan():
 @router.post("/submit")
 def submit_scan(
     req: SubmitRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """Finish the run and build the result. Port of submit_video ->
@@ -381,18 +429,34 @@ def submit_scan(
             .first()
         )
 
+    operator_id = current_operator_id(request)
     datagram = build_datagram(
         db,
         session_status=status_before,
         result_payload=result_payload,
         batch=batch,
         surveyor_name=req.surveyor_name,
+        operator_id=operator_id,
     )
+
+    # The idempotency key for the save that will follow, minted here rather
+    # than by the browser on the results page. It is handed back in the
+    # response and the frontend holds onto it until the batch is saved or
+    # discarded.
+    #
+    # Minting it at this point is what makes the protection survive the
+    # operator leaving the results page and coming back: a key created on that
+    # page is lost the moment it unmounts, so the retry that follows looks
+    # like a different save and gets a 409 for a batch that was in fact
+    # stored. Tied to the submission instead, it lasts as long as the
+    # submission does.
+    request_id = str(uuid.uuid4())
 
     with _pending_lock:
         _pending_submission = {
             "result_payload": result_payload,
             "datagram": datagram,
+            "client_request_id": request_id,
             "commodity": status_before.get("commodity", ""),
             "variety": status_before.get("variety", ""),
             # Kept only so a reclassify (see /pending-crops/relabel below) can
@@ -401,12 +465,16 @@ def submit_scan(
             "batch": batch,
             "status_before": status_before,
             "surveyor_name": req.surveyor_name,
+            "operator_id": operator_id,
         }
 
     return {
         "status": "success",
         "result": result_payload,
         "datagram": datagram,
+        # Held by the frontend and sent back on /confirm — see the comment
+        # where it is minted above.
+        "client_request_id": request_id,
     }
 
 
@@ -478,6 +546,7 @@ def relabel_pending_crop(req: RelabelCropRequest, db: Session = Depends(get_db))
             result_payload=result_payload,
             batch=pending["batch"],
             surveyor_name=pending["surveyor_name"],
+            operator_id=pending.get("operator_id", ""),
         )
 
         _pending_submission = {**pending, "result_payload": result_payload, "datagram": datagram}
@@ -491,7 +560,11 @@ def relabel_pending_crop(req: RelabelCropRequest, db: Session = Depends(get_db))
 
 
 @router.post("/confirm")
-def confirm_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def confirm_scan(
+    background_tasks: BackgroundTasks,
+    req: ConfirmRequest = ConfirmRequest(),
+    db: Session = Depends(get_db),
+):
     """Persist the last /submit's result and queue delivery to Qualix/Sheets.
 
     Port of backtohome -> save_result (main.py:1717-1812): legacy starts
@@ -500,8 +573,30 @@ def confirm_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
     results-review page — not from Submit itself. If that second click never
     happens, legacy never saves or syncs the batch either; reproduced here on
     purpose rather than fixed.
+
+    Idempotent on req.client_request_id: a retry of a save that already landed
+    returns the original result_id rather than storing the scan again. See
+    ConfirmRequest for why that matters on this hardware.
     """
     global _pending_submission
+
+    request_id = (req.client_request_id or "").strip()
+
+    # The replay check, before the pending slot is touched. A retry that got
+    # here after the original committed is answered from what the original
+    # stored — and deliberately does NOT re-queue the sync: the first attempt
+    # already queued it, and the retry worker picks up anything still pending,
+    # so posting again would risk a duplicate reaching Qualix.
+    if request_id:
+        already = db.query(Result).filter(Result.client_request_id == request_id).first()
+        if already:
+            logger.info(
+                "Replay of /confirm for request %s — returning the existing result %d "
+                "instead of saving the scan again.",
+                request_id,
+                already.id,
+            )
+            return {"success": True, "result_id": already.id, "duplicate": True}
 
     # Under the lock so a reclassify still in flight can't be persisted
     # half-applied: the Save click follows the last relabel by milliseconds,
@@ -516,23 +611,44 @@ def confirm_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
         pending = _pending_submission
         _pending_submission = None
 
+    # A client that sent no key of its own still gets the one /submit minted
+    # for this submission, so the stored row always carries a key and a later
+    # retry that does send it can be matched.
+    request_id = request_id or pending.get("client_request_id", "")
+
     result_payload = pending["result_payload"]
     datagram = pending["datagram"]
 
     service = DatabaseService(db)
-    saved = service.save_scan_result(
-        sample_id=result_payload["sample_id"],
-        commodity=pending["commodity"],
-        variety=pending["variety"],
-        datagram=datagram,
-        date=result_payload["date"],
-        start_time=result_payload["start_time"],
-        stop_time=result_payload["end_time"],
-    )
+    try:
+        saved = service.save_scan_result(
+            sample_id=result_payload["sample_id"],
+            commodity=pending["commodity"],
+            variety=pending["variety"],
+            datagram=datagram,
+            date=result_payload["date"],
+            start_time=result_payload["start_time"],
+            stop_time=result_payload["end_time"],
+            client_request_id=request_id,
+        )
+    except IntegrityError:
+        # Two retries raced past the SELECT above and both tried to insert the
+        # same key; the unique index let exactly one through. Answer with the
+        # one that won rather than failing a save that did happen.
+        db.rollback()
+        already = db.query(Result).filter(Result.client_request_id == request_id).first()
+        if already is None:
+            raise
+        logger.info(
+            "Concurrent /confirm for request %s — returning result %d.",
+            request_id,
+            already.id,
+        )
+        return {"success": True, "result_id": already.id, "duplicate": True}
 
     background_tasks.add_task(sync_result_to_cloud, saved.id, datagram)
 
-    return {"success": True, "result_id": saved.id}
+    return {"success": True, "result_id": saved.id, "duplicate": False}
 
 
 @router.post("/discard")

@@ -9,10 +9,10 @@ be free text and why vendor_code auto-fill was lost.
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.database import SessionLocal, get_db
+from app.core.database import get_db
 from app.models.schema import (
     BrandDetails,
     ClientInfo,
@@ -123,29 +123,31 @@ def get_all_config(db: Session = Depends(get_db)):
     }
 
 
-def _sync_config_in_background():
-    """Runs after the response — see /sync below. Own session, since the
-    request-scoped one is closed by the time a BackgroundTask executes."""
-    db = SessionLocal()
-    try:
-        sync_service.sync_commodity_config(db)
-    except Exception:
-        logger.exception("Background config sync failed")
-    finally:
-        db.close()
-
-
 @router.post("/sync")
-def sync_config(background_tasks: BackgroundTasks):
-    """Queue a config refresh from Qualix — does not wait for it.
+def sync_config(db: Session = Depends(get_db)):
+    """Refresh the config cache from Qualix, and report whether it worked.
 
     Called every time the operator opens New Batch, the same way login
-    already queues one (see auth.py's _sync_config_in_background). The
-    dropdowns show whatever is already cached in Postgres instantly; this
-    just kicks off getting a newer copy for *next* time. If there's no
-    internet or Qualix is unreachable, sync_commodity_config fails quietly
-    and the existing cached data is left untouched — never blocks or blanks
-    the form waiting on connectivity that may not be there.
+    queues one (see auth.py's _sync_config_in_background). The dropdowns
+    still show whatever is already cached in Postgres instantly — the caller
+    fires this without awaiting it (NewBatch.jsx) and never renders off its
+    response, so taking a few seconds here blocks nothing.
+
+    It runs inline rather than as a BackgroundTask specifically so the
+    response marks the moment the new data is actually in Postgres. That is
+    what lets the frontend invalidate its cached config queries at the right
+    time (see configApi.js's `syncConfig`) and repopulate the dropdowns
+    in place. Queuing it meant the request resolved ~9s before the data
+    landed, so there was no moment to react to and a dropdown that was
+    empty when the page opened stayed empty until the page was revisited.
+
+    If there's no internet or Qualix is unreachable, sync_commodity_config
+    fails quietly, the existing cached data is left untouched, and this says
+    so — it never blanks the form over connectivity that may not be there.
     """
-    background_tasks.add_task(_sync_config_in_background)
-    return {"status": "queued"}
+    try:
+        ok = sync_service.sync_commodity_config(db)
+    except Exception:
+        logger.exception("Config sync failed")
+        ok = False
+    return {"status": "success" if ok else "failed", "synced": bool(ok)}

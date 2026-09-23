@@ -44,7 +44,9 @@ def get_device_id() -> str:
     dead in main.py/api_handle.py/sheet_update.py). settings.DEVICE_ID is kept
     here only as a last-resort fallback for a device with neither file (e.g. a
     non-systemd dev environment), tried AFTER the real machine-id files, not
-    before them.
+    before them. (DEVICE_ID is now the short 2-character batch-id code — see
+    batch.py — but this fallback path is a rare dev-only case and any non-empty
+    string is fine here; it isn't reused as device_serial_no any more.)
 
     Normalised to "" rather than None: the payload must not carry a bare
     Python None into the JSON body.
@@ -114,12 +116,25 @@ def build_datagram(
     result_payload: Dict,
     batch: Optional[BatchDetails] = None,
     surveyor_name: str = "",
+    operator_id: str = "",
 ) -> Dict:
     """Assemble the full {"scan_data": {...}, "analysis": [...]} payload.
 
     session_status  — ScanSession.status() at the time of the scan
     result_payload  — ScanSession.finish() output (result / looker_data / totals)
     batch           — the BatchDetails row for this sample, if one was created
+    operator_id     — Qualix's own user_id for whoever was logged in when this
+                       was submitted (from the caller's session — see
+                       api/scan.py's /submit). Sent alongside device_serial_no
+                       and warehouse_name so Qualix can map location explicitly
+                       from the payload, instead of inferring it from whichever
+                       account authenticated the sync post — which is a fixed
+                       account, not necessarily this operator (see
+                       docs/keycloak_integration/4 - assurance_gateway.md).
+                       Baked into the datagram at build time rather than looked
+                       up again at sync time, so it survives unchanged through
+                       the retry worker and manual resync, which only ever
+                       resend this same stored JSON blob.
     """
     b = batch
     commodity = session_status.get("commodity", "")
@@ -151,6 +166,14 @@ def build_datagram(
             result_payload.get("date", ""), result_payload.get("end_time", "")
         ),
         "device_id": get_device_id(),
+        # Explicit location-mapping trio (see this function's docstring). Not
+        # to be confused with device_id above, which is the machine's own
+        # /etc/machine-id fingerprint — device_serial_no is the human-assigned
+        # per-device identifier from settings.DEVICE_CODE. (DEVICE_ID is the
+        # short 2-character code used for batch numbers instead — see batch.py.)
+        "device_serial_no": settings.DEVICE_CODE,
+        "operator_id": operator_id,
+        "warehouse_name": settings.WAREHOUSE_NAME,
     }
 
     analysis: List[Dict] = []

@@ -65,7 +65,7 @@ def _qualix_username(username: str) -> str:
 
 def _cache_credentials(
     db: Session, username: str, password: str,
-    keycloak_user_id: str = "", refresh_token: str = "",
+    keycloak_user_id: str = "", refresh_token: str = "", operator_id: str = "",
 ):
     """Port of write_creds (database.py:158-176) — one row, replaced each time.
 
@@ -73,17 +73,63 @@ def _cache_credentials(
     Keycloak login (tier 1) — see the Creds model's docstring for why. A
     legacy-path caller passes neither, which is correct: that path has no
     Keycloak identity to carry.
+
+    operator_id is different: it is Qualix's own user_id, not a Keycloak
+    concept, so BOTH tier-1 paths pass it (from /user/keycloak-profile under
+    Keycloak, from the direct Qualix login response under legacy — see
+    _login_keycloak / _login_legacy). Blank preserves the previous cached
+    value rather than wiping it, since not every caller of this function has
+    just fetched a fresh one (e.g. a bare password re-cache).
     """
     try:
+        existing = db.query(Creds).filter(Creds.user == username).first()
+        if not operator_id and existing:
+            operator_id = existing.operator_id or ""
         db.query(Creds).delete()
         db.add(Creds(
             user=username, password=_hash(password),
             keycloak_user_id=keycloak_user_id, refresh_token=refresh_token,
+            operator_id=operator_id,
         ))
         db.commit()
     except Exception as exc:
         db.rollback()
         logger.error("Could not cache credentials: %s", exc)
+
+
+def _log_operator_id_change(db: Session, username: str, new_operator_id: str):
+    """Logs it when a fresh online login's operator_id differs from what was
+    cached last time, so a Qualix-side account remap (or a mistaken one) is
+    visible in the logs rather than silently overwriting the old value.
+    """
+    if not new_operator_id:
+        return
+    row = db.query(Creds).filter(Creds.user == username).first()
+    old_operator_id = (row.operator_id or "") if row else ""
+    if old_operator_id and old_operator_id != new_operator_id:
+        logger.warning(
+            "[AUTH] operator_id changed for %s: %s -> %s. Storing the new value.",
+            username, old_operator_id, new_operator_id,
+        )
+
+
+def _update_cached_operator_id(db: Session, username: str, operator_id: str):
+    """Updates just the operator_id column on the existing Creds row.
+
+    Deliberately narrower than _cache_credentials: this runs after a fast-path
+    login is confirmed by a background Keycloak check, which — unlike a full
+    tier-1 login — has never re-cached the password/keycloak_user_id/
+    refresh_token here, and this must not start silently doing that as a side
+    effect of adding operator_id.
+    """
+    if not operator_id:
+        return
+    try:
+        db.query(Creds).filter(Creds.user == username).update({"operator_id": operator_id})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("Could not update cached operator_id for %s: %s", username, exc)
 
 
 def _check_cached(db: Session, username: str, password: str) -> bool:
@@ -95,14 +141,17 @@ def _check_cached(db: Session, username: str, password: str) -> bool:
 
 
 def _cached_keycloak_identity(db: Session, username: str) -> dict:
-    """The Keycloak identity riding along with the cached password, if any.
+    """The identity riding along with the cached password, if any.
 
     Called whenever a login is about to be accepted from the cached hash
-    (tier 2, or the fast path) rather than a fresh Keycloak call — so that
-    session starts out carrying whatever refresh token this device last
-    obtained for this exact account, instead of nothing at all. _check_cached
-    already guarantees the username matches this row (Creds is one row for
-    the whole device), so there is no ambiguity about whose identity this is.
+    (tier 2, or the fast path) rather than a fresh online check — so that
+    session starts out carrying whatever refresh token and operator_id this
+    device last obtained for this exact account, instead of nothing at all.
+    operator_id is carried forward unchanged here on purpose: it only ever
+    gets refreshed by a real online login (see _login_keycloak / _login_legacy),
+    never invented or guessed for an offline one. _check_cached already
+    guarantees the username matches this row (Creds is one row for the whole
+    device), so there is no ambiguity about whose identity this is.
     """
     row = db.query(Creds).filter(Creds.user == username).first()
     if not row:
@@ -110,6 +159,7 @@ def _cached_keycloak_identity(db: Session, username: str) -> dict:
     return {
         "keycloak_user_id": row.keycloak_user_id or "",
         "refresh_token": row.refresh_token or "",
+        "operator_id": row.operator_id or "",
     }
 
 
@@ -177,11 +227,15 @@ def _verify_cached_login_in_background(username: str, password: str, token: str)
             qualix_user = (profile or {}).get("user") or {}
             if qualix_user.get("first_name"):
                 claims["first_name"] = qualix_user["first_name"]
+            operator_id = str(qualix_user.get("user_id") or "")
+            claims["operator_id"] = operator_id
+            _log_operator_id_change(db, username, operator_id)
             logger.info(
                 "[AUTH] Background check CONFIRMED %s with Keycloak — the fast "
                 "login was legitimate.", username,
             )
             session_store.promote_to_online(token, claims)
+            _update_cached_operator_id(db, username, operator_id)
             # Already running in the background here, so this is a direct
             # call rather than another scheduled task — see
             # _seed_password_baseline_in_background's docstring.
@@ -290,10 +344,10 @@ def _offline_tiers(db: Session, username: str, password: str) -> dict:
     # 3. Last resort: the device credentials from .env / config.INI. This keeps
     #    a brand-new device usable before its first successful online login.
     if (
-        settings.QUALIX_USERNAME
-        and settings.QUALIX_PASSWORD
-        and username == _qualix_username(settings.QUALIX_USERNAME)
-        and hmac.compare_digest(password, settings.QUALIX_PASSWORD)
+        settings.EMERGENCY_LOGIN_USERNAME
+        and settings.EMERGENCY_LOGIN_PASSWORD
+        and username == _qualix_username(settings.EMERGENCY_LOGIN_USERNAME)
+        and hmac.compare_digest(password, settings.EMERGENCY_LOGIN_PASSWORD)
     ):
         logger.info(
             "[AUTH] TIER 3 SUCCESS — offline login for %s from the fixed device "
@@ -399,6 +453,9 @@ def _login_keycloak(
         qualix_user = (profile or {}).get("user") or {}
         first_name = qualix_user.get("first_name") or claims.get("first_name", "")
         customer_name = qualix_user.get("customer_name", "")
+        operator_id = str(qualix_user.get("user_id") or "")
+
+        _log_operator_id_change(db, username, operator_id)
 
         # Cached under what the operator actually typed, not Keycloak's
         # canonical preferred_username: tier 2 looks the row up by whatever
@@ -407,6 +464,7 @@ def _login_keycloak(
             db, username, password,
             keycloak_user_id=claims.get("sub", ""),
             refresh_token=claims.get("refresh_token", ""),
+            operator_id=operator_id,
         )
         # Same refresh legacy does on every login — without this a device
         # switched to Keycloak would keep whatever commodities, vendors and
@@ -429,6 +487,7 @@ def _login_keycloak(
             # Held for the daily revalidation worker; never sent to the client.
             refresh_token=claims.get("refresh_token", ""),
             keycloak_user_id=claims.get("sub", ""),
+            operator_id=operator_id,
         )
         # Seeds password_credential_created_at now, rather than leaving the
         # daily worker's first pass to plant it with nothing to compare
@@ -469,7 +528,13 @@ def _login_legacy(
         logger.warning("Qualix login attempt failed (treating as offline): %s", exc)
 
     if online:
-        _cache_credentials(db, qualix_user, password)
+        # sync_service.customer_id is misnamed — it's actually Qualix's
+        # user_id (api_handle.py:91 in the legacy source: `self.customer_id =
+        # self.response.json()['user']['user_id']`), the same field
+        # /user/keycloak-profile returns as user.user_id under Keycloak mode.
+        operator_id = str(sync_service.customer_id or "")
+        _log_operator_id_change(db, qualix_user, operator_id)
+        _cache_credentials(db, qualix_user, password, operator_id=operator_id)
         background_tasks.add_task(_sync_config_in_background, qualix_user, password)
         logger.info(
             "[AUTH] TIER 1 SUCCESS — online login for %s via QUALIX (legacy direct "
@@ -479,9 +544,9 @@ def _login_legacy(
         token = session_store.create(
             qualix_user,
             mode="online",
-            customer_id=sync_service.customer_id,
             first_name=sync_service.first_name,
             customer_name=sync_service.customer_name,
+            operator_id=operator_id,
         )
         return {
             "status": "success",

@@ -59,9 +59,60 @@ someone removes a scope in Keycloak, remove it here too, and vice versa.
 ## Sync settings
 
 ### `SYNC_SERVICE_USERNAME` / `SYNC_SERVICE_PASSWORD`
-The fixed account used to send scan results — never the logged-in operator's.
-If left blank, falls back to `QUALIX_USERNAME` / `QUALIX_PASSWORD`, which is the
-normal setup. See `4 - assurance_gateway.md` for why this is separate.
+The fixed account every outbound delivery authenticates as — the scan POST and
+the config fetch — under **both** auth providers, never the logged-in
+operator's. See `4 - assurance_gateway.md` for why.
+
+Under `AUTH_PROVIDER=keycloak` it must be a real **Keycloak** account.
+
+**No fallback.** Blank means syncing fails loudly and logs what to set. It used
+to fall back to `QUALIX_USERNAME`/`PASSWORD`, and that caused a real outage:
+those held a Qualix-only account that Keycloak had never heard of, so every
+sync failed with "Invalid user credentials" and nothing said why.
+
+> **Not the same account as `EMERGENCY_LOGIN_*`.** One is an identity that
+> posts data; the other is a door key. See below.
+
+### `EMERGENCY_LOGIN_USERNAME` / `EMERGENCY_LOGIN_PASSWORD`
+The tier-3 credentials that unlock the device when Keycloak is unreachable
+**and** no cached password exists — a brand-new device, or one this operator
+has never logged into online here. See flow 2 in `11 - user_flows.md`.
+
+Checked entirely on-device (`api/auth.py`), against these values. No network
+call, and it authenticates nothing outbound: it decides who gets *in*, never
+what anything is sent *as*. It therefore does not need to exist in Keycloak,
+or in Qualix.
+
+Give it its own credentials rather than reusing a real operator's. These have
+to be shared with whoever might need to recover a device in the field, and if
+they are the same as `SYNC_SERVICE_*` then everyone holding the emergency key
+also holds the account that posts every scan.
+
+Resolved in three steps:
+
+1. `EMERGENCY_LOGIN_USERNAME` / `EMERGENCY_LOGIN_PASSWORD` — what to set now
+2. `QUALIX_USERNAME` / `QUALIX_PASSWORD` — **deprecated aliases**
+3. legacy `config.INI`, `[CONFIG_SETTINGS] username` / `password`
+
+Step 3 is why this is not simply an env var: on a real device the credentials
+live in `config.INI`, not necessarily in `.env` at all. Steps 2 and 3 exist so
+that deploying this change cannot silently take away a device's emergency
+login — the one path whose entire purpose is to work when everything else has
+failed.
+
+`QUALIX_USERNAME`/`QUALIX_PASSWORD` **no longer exist as settings** and are read
+nowhere else. While either of the two older sources is still supplying the
+value, the backend says so at startup:
+
+```
+The tier-3 emergency login is still being read from legacy config.INI
+(/home/nvidia/eye_compass/config.INI). Set EMERGENCY_LOGIN_USERNAME /
+EMERGENCY_LOGIN_PASSWORD instead — they are the device's recovery key and
+should not be the account that syncs (SYNC_SERVICE_USERNAME).
+```
+
+That warning is the signal that a device has been migrated and the old values
+can be deleted.
 
 ### `ASSURANCE_API_URL`
 `https://dev.perfeqtfoods.com/api/asu/gateway/assaying-dev/`
@@ -85,6 +136,47 @@ Default `api/user/keycloak-profile`. Called once at every Keycloak login, with
 the operator's own token, to confirm they are an actual Qualix operator and not
 just anyone with a valid account on the shared Keycloak realm. See
 `2 - how_login_works.md` and `4 - assurance_gateway.md`.
+
+---
+
+## Per-device identity settings
+
+These three are what let Qualix map a scan to a place and a person from the
+payload itself, rather than inferring it from whichever account authenticated
+the post. All three are per physical device. See the *Qualix is now told the
+device, operator and warehouse explicitly* entry in
+`../architecture_and_segregation/enhancements.md` for why this replaced the
+idea of authenticating each sync as the operator.
+
+### `DEVICE_ID`
+**Not** sent to Qualix. It is the 2-character prefix (`A-Z`/`0-9`) on every
+batch number, and the only thing keeping one device's batch numbers distinct
+from another's — the remaining 10 digits are an epoch timestamp that two
+devices can produce identically. Assign these from one central list; a
+duplicate silently reintroduces the cross-device collisions the scheme exists
+to prevent.
+
+Batch creation returns HTTP 500 with a readable message until it is set to
+something valid, and the New Batch form shows that message in place of the
+batch id.
+
+### `DEVICE_CODE`
+Sent as `device_serial_no` on every scan datagram. Free-form — it must match
+whatever serial Qualix has registered for this device, and Qualix rejects the
+post with `Device does not exist` if it does not.
+
+> **These two are not interchangeable, and were previously assigned the other
+> way round.** Neither is derived from the other. `DEVICE_ID` is local and
+> short; `DEVICE_CODE` is whatever Qualix expects.
+>
+> Note also that the datagram's `device_id` field is neither of them — it is
+> the machine's own `/etc/machine-id` fingerprint.
+
+### `WAREHOUSE_NAME`
+Sent as `warehouse_name` on every scan datagram. Fixed per device.
+
+There is no `OPERATOR_ID` setting — the third member of that trio is read from
+Qualix at login rather than configured. See `11 - user_flows.md`.
 
 ---
 
@@ -149,6 +241,21 @@ KEYCLOAK_CLIENT_ID=qualix-backend
 KEYCLOAK_CLIENT_SECRET=<from Keycloak>
 KEYCLOAK_SCOPE=offline_access qualix-application-permissions audience-for-gateway add-asu-be-audience
 ASSURANCE_API_URL=https://dev.perfeqtfoods.com/api/asu/gateway/assaying-dev/
+
+# WHO SYNCS. Must be a real Keycloak account. No fallback.
+SYNC_SERVICE_USERNAME=<a Keycloak account>
+SYNC_SERVICE_PASSWORD=<its password>
+
+# WHO CAN GET IN WHEN NOTHING ELSE WORKS. A door key, not an identity —
+# deliberately NOT the same account as the two lines above.
+EMERGENCY_LOGIN_USERNAME=<device recovery account>
+EMERGENCY_LOGIN_PASSWORD=<its password>
+
+# Per-device, and different on every device. DEVICE_ID must be unique across
+# the fleet; DEVICE_CODE must match the serial Qualix has registered.
+DEVICE_ID=<2 chars, unique per device>
+DEVICE_CODE=<the device serial Qualix knows>
+WAREHOUSE_NAME=<this device's warehouse>
 ```
 
 Everything else has working defaults.

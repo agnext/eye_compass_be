@@ -145,6 +145,21 @@ than inheriting silently:
   no separate confirm) — this was the behavior before this change and
   doesn't have the risk, at the cost of no longer matching legacy exactly.
 
+**Partially mitigated since this was written, though not closed.** One
+*specific* way of never reaching step 2 has been removed: a `/confirm` that
+succeeded server-side but timed out on the way back used to leave the operator
+looking at a failure message, and pressing Save again returned `409 Nothing to
+confirm`. That now returns the original `result_id` instead, via an
+idempotency key (`client_request_id`) minted at `/submit` and held in
+`sessionStorage` — so it works even if the operator leaves the results page
+and comes back before retrying. See the *Saving a scan is now idempotent*
+entry in `enhancements.md`.
+
+The item itself stands: an operator who closes the tab, walks away, or loses
+power before pressing Save at all is still in exactly the position described
+above, and no key helps with that. The decision between the three options is
+still open.
+
 ## Other tracked findings (not yet in the priority list above)
 
 ### Confirm whether PO Number should really accept alphabets

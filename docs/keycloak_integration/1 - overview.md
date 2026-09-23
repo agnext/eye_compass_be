@@ -3,6 +3,11 @@
 **What this folder is:** everything about moving operator login from Qualix to
 Keycloak. Written to be readable by someone who was not part of the work.
 
+> **Looking for the exact payloads?** `../external_apis.md` documents every
+> call this backend makes off the device — the scan POST, the config GET, all
+> the Keycloak token calls, Sheets and S3 — with fields, responses and why each
+> one is made.
+
 ---
 
 ## What changed, in one sentence

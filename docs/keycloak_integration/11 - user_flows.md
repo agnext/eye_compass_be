@@ -433,6 +433,107 @@ credentials.
 **The proof:** the sync account's username appears, not the logged-in operator's.
 If you see the operator's name here, something is wrong.
 
+**Who Qualix thinks ran the batch:** not the sync account. The payload carries
+`operator_id`, `device_serial_no` and `warehouse_name` as explicit fields, so
+the authenticating identity and the recorded identity are deliberately two
+different things. See `4 - assurance_gateway.md`.
+
+---
+
+## 12bb. Two things try to send the same scan at once
+
+**What happens:** only one of them sends it.
+
+A record is marked `'0'` for the whole time its POST is in flight — around half
+a minute against this endpoint — so the retry worker can list it as unsent
+while the post that followed the batch is still running. Pressing Re-sync
+during that window, or twice, is the same situation.
+
+Whichever gets there first holds a claim on that record
+(`services/sync_lock.py`). The others stand down:
+
+```
+Result 412 is already being delivered — not starting a second attempt.
+```
+
+and a manual Re-sync is answered `409 This record is already being sent. Give
+it a moment — the status updates on its own.`
+
+**Why it matters:** Qualix would have coped (it answers `12063`, see above),
+but Google Sheets would not — `post_to_sheets` checks for an existing row and
+*then* appends, so two deliveries overlapping between those steps both append
+and the sheet gets two rows for one scan.
+
+---
+
+## 12ba. Qualix says the sample already exists
+
+**What happens:** it is marked **Synced**, not Rejected.
+
+`12063 Sample ID already exists` means Qualix already holds this scan from an
+earlier attempt — normally one that timed out on the way back, leaving this
+device thinking it had failed. The scan is safe; the record is set to `'1'`
+and any stored error is cleared.
+
+**Logs:**
+```
+Qualix already has sample T11790155376 (error 12063) — counting it as delivered, not rejected.
+```
+
+WARNING rather than INFO on purpose: the outcome is fine, but it means a
+delivery was recorded as failed when it had in fact succeeded. A run of these
+points at the POST timeout being too tight for how slow the endpoint is.
+
+---
+
+## 12b. Qualix rejects the scan
+
+**What happens:** Qualix answers HTTP 400 with a reason, e.g.
+`{"error-code":"12092","error-message":"Device does not exist"}` — usually
+meaning `DEVICE_CODE` does not match a serial Qualix has registered.
+
+The record is marked `sync_status='2'`, which is **terminal**: the retry worker
+deliberately does not pick it up again, because nothing about retrying an
+unchanged rejected payload would produce a different answer.
+
+Two consequences worth knowing:
+
+- **It is not written to Google Sheets.** Only an accepted post is. Sheets and
+  Qualix would otherwise disagree about which scans exist.
+- **The reason is stored on the record** (`result.sync_error`) and shown in the
+  History list and on the record detail page, so it does not live only in the
+  backend log.
+
+**To recover:** fix the setting the reason points at, then use the manual
+re-sync on that record.
+
+---
+
+## 12c. The operator presses Save, the network drops, and they press Save again
+
+**What happens:** nothing is saved twice. `/api/scan/submit` minted a UUID for
+this save and the frontend kept it; every retry carries that same UUID, and
+`/api/scan/confirm` recognises the repeat and answers with the `result_id` it
+already stored.
+
+This holds even if the operator leaves the results page and comes back before
+retrying — the key lives in `sessionStorage`, not in the page.
+
+**Logs:**
+```
+Replay of /confirm for request 550e8400-... — returning the existing result 412 instead of saving the scan again.
+```
+
+**Why it matters:** before this, the retry was answered `409 Nothing to confirm
+— submit a result first`, because the first attempt had already consumed the
+pending slot. The operator read that as a failed save for a scan that had in
+fact been saved and synced — and the natural response, re-running the whole
+batch, is what actually produced duplicates.
+
+**A replay deliberately does not re-queue the sync.** The first attempt already
+did, and the retry worker picks up anything still pending; posting again would
+risk a duplicate reaching Qualix.
+
 ---
 
 ## 13. The periodic retry for anything unsent
@@ -478,3 +579,8 @@ Auth provider: QUALIX direct/legacy (https://assaying-dev.qualix.ai/). Set AUTH_
 | Whether a login was refused for not being a Qualix user | `USERNR01`, `TIER 1 REJECTED` |
 | Why someone was asked to sign in again | `Keycloak REJECTED`, `Background check REJECTED`, or `signed in offline ... reachable again` — never a time limit |
 | Which account syncing uses | `[SYNC] Getting a Keycloak token for the fixed sync account` |
+| Whether an operator's Qualix id changed | `[AUTH] operator_id changed for <user>: <old> -> <new>` |
+| Why Qualix rejected a scan | `sync_error` on the record, shown in History and on the record page |
+| Whether a Save was a retry rather than a new scan | `Replay of /confirm for request <uuid>` |
+| Whether a scan had already reached Qualix on an earlier try | `Qualix already has sample <id> (error 12063)` |
+| Whether a second delivery of the same scan was blocked | `Result <id> is already being delivered` |

@@ -35,6 +35,96 @@ from app.models.schema import (
 
 logger = logging.getLogger(__name__)
 
+# How much of a Qualix error body to keep when it isn't the shape we expect.
+# Long enough to be diagnostic, short enough to sit in a table cell.
+_MAX_ERROR_DETAIL = 300
+
+
+def _readable_qualix_error(body: str) -> str:
+    """Qualix's error body, reduced to something worth showing an operator.
+
+    It normally answers with {"error-code": "...", "error-message": "..."},
+    in which case the message is what matters and the code is worth keeping
+    alongside it for support to quote. Anything else (HTML from a proxy, an
+    empty body, a gateway error page) is passed through truncated rather than
+    discarded — an unhelpful message still beats "Rejected" with no reason.
+    """
+    import json
+
+    text = (body or "").strip()
+    if not text:
+        return "Qualix gave no reason."
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text[:_MAX_ERROR_DETAIL]
+    if not isinstance(parsed, dict):
+        return text[:_MAX_ERROR_DETAIL]
+
+    message = parsed.get("error-message") or parsed.get("message") or ""
+    code = parsed.get("error-code") or ""
+    if message and code:
+        return f"{message} (Qualix error {code})"
+    if message:
+        return str(message)[:_MAX_ERROR_DETAIL]
+    return text[:_MAX_ERROR_DETAIL]
+
+
+def _qualix_error_code(body: str) -> str:
+    """Just the `error-code` from a Qualix error body, or "" if there isn't one."""
+    import json
+
+    try:
+        parsed = json.loads((body or "").strip())
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("error-code") or "")
+
+
+# Qualix's code for "a scan with this sample_id is already recorded". Treated
+# as a SUCCESS, not a rejection.
+#
+# It is the expected answer to re-sending a scan that Qualix already accepted,
+# which happens for a specific and entirely normal reason: when Qualix takes
+# longer to answer than _POST_TIMEOUT_SECONDS below, the scan is stored on
+# their side while this device gives up waiting and records the result as
+# undelivered. The retry that follows is then told the sample already exists —
+# which is confirmation the data arrived, not a failure. Raising that timeout
+# makes this rarer; it cannot make it impossible, because no timeout can
+# distinguish "still working" from "never going to answer".
+# Marking it '2' (Rejected) instead was actively misleading: it reads as lost
+# data on the History screen, and being terminal it would sit there forever.
+#
+# Safe to treat this way *because batch numbers are globally unique* — device
+# code plus epoch seconds, with a UNIQUE constraint behind it (see
+# api/batch.py). A sample_id can therefore only already exist at Qualix if
+# this same scan reached them before.
+#
+# The one way that could be wrong is two devices sharing a DEVICE_ID, which
+# would let device B's genuinely different scan be waved through as "already
+# synced" because device A had used that number. That is exactly what the
+# "assign DEVICE_ID from one central list" rule exists to prevent, and it is
+# why the acceptance below is logged at WARNING rather than silently.
+_QUALIX_ALREADY_RECORDED_CODES = {"12063"}
+
+# How long to wait for the scan POST to answer.
+#
+# Was 30s, which turned out to sit right on top of how long this endpoint
+# actually takes: a measured live call against the dev gateway answered in
+# 28.7s, and the same call moments earlier had exceeded 30s and been recorded
+# as undelivered. Qualix was receiving and storing those scans either way, so
+# the only thing the tight limit achieved was marking delivered scans as
+# failed and re-sending them.
+#
+# Nobody is waiting on this. The post right after a batch runs as a background
+# task once /confirm has already answered the browser, and the retry worker has
+# no user attached at all; only History's manual Re-sync holds an HTTP request
+# open, and that shows a spinner. So the cost of waiting longer is nil, while
+# the cost of giving up early is a scan that looks lost.
+_POST_TIMEOUT_SECONDS = 90
+
 
 class SyncService:
     """Holds one Qualix session. A module-level instance is shared so the token
@@ -149,23 +239,40 @@ class SyncService:
         return headers
 
     # ------------------------------------------------------------------
-    def post_analysis_data(self, raw_data: dict) -> Tuple[str, str]:
-        """POST a scan result. Returns (post_status, error_code).
+    def post_analysis_data(self, raw_data: dict) -> Tuple[str, str, str]:
+        """POST a scan result. Returns (post_status, error_code, error_detail).
 
         post_status is the legacy three-valued flag — see the module docstring.
+
+        error_detail is what actually went wrong, in Qualix's own words where
+        it gave them (e.g. 'Device does not exist'), for storing on the record
+        and showing the operator. It used to exist only in this process's log,
+        which left a "Rejected" row on the History screen with no way to find
+        out why.
         """
         import json
 
         if not self.is_authenticated:
-            return "0", "No_access_token"
+            return "0", "No_access_token", "Not authenticated with Qualix."
 
         try:
             body = json.dumps(raw_data)
+            # The exact bytes being sent, every time, for all three callers
+            # (the post right after a batch, the retry worker, the manual
+            # re-sync) — this method is the single chokepoint they share.
+            #
+            # Logged in full rather than summarised: when Qualix rejects a
+            # payload the reason is usually one wrong field, and reconstructing
+            # what was actually sent from the database afterwards is exactly
+            # the step that was missing. Nothing here is a secret — it is scan
+            # data, and the credentials live in the headers, which are
+            # deliberately not logged.
+            logger.info("[SYNC] POST %s body: %s", self.analysis_post_uri, body)
             response = requests.post(
                 self.analysis_post_uri,
                 data=body,
                 headers=self._auth_headers(json_body=True),
-                timeout=30,
+                timeout=_POST_TIMEOUT_SECONDS,
             )
             # The service token can expire between calls. Fetch a fresh one and
             # retry once before treating this as a delivery failure, otherwise
@@ -179,18 +286,40 @@ class SyncService:
                     self.analysis_post_uri,
                     data=body,
                     headers=self._auth_headers(json_body=True),
-                    timeout=30,
+                    timeout=_POST_TIMEOUT_SECONDS,
                 )
             if response.status_code == 200:
-                return "1", "ok"
+                return "1", "ok", ""
             if response.status_code == 400:
+                error_code = _qualix_error_code(response.text)
+                if error_code in _QUALIX_ALREADY_RECORDED_CODES:
+                    # Qualix already has this scan — see the note on
+                    # _QUALIX_ALREADY_RECORDED_CODES. WARNING rather than INFO
+                    # because, while the outcome is fine, reaching this line at
+                    # all means a delivery was recorded as failed when it had
+                    # in fact succeeded, and a run of these is worth noticing.
+                    logger.warning(
+                        "Qualix already has sample %s (error %s) — counting it as "
+                        "delivered, not rejected. An earlier attempt reached them; "
+                        "this device just never saw the response.",
+                        (raw_data.get("scan_data") or {}).get("sample_id", "?"),
+                        error_code,
+                    )
+                    return "1", "already_recorded", ""
                 logger.error("Qualix rejected the payload (400): %s", response.text[:500])
-                return "2", "bad_request"
-            logger.error("Qualix POST returned HTTP %s", response.status_code)
-            return "0", f"http_{response.status_code}"
+                return "2", "bad_request", _readable_qualix_error(response.text)
+            logger.error(
+                "Qualix POST returned HTTP %s from %s — %s",
+                response.status_code, self.analysis_post_uri, response.text[:500],
+            )
+            return (
+                "0",
+                f"http_{response.status_code}",
+                f"HTTP {response.status_code}: {_readable_qualix_error(response.text)}",
+            )
         except Exception as exc:
-            logger.error("Qualix POST failed: %s", exc)
-            return "0", "exception"
+            logger.error("Qualix POST failed: %s (%s)", exc, self.analysis_post_uri)
+            return "0", "exception", f"Could not reach Qualix: {exc}"
 
     # ------------------------------------------------------------------
     def fetch_config(self) -> Optional[dict]:
@@ -217,11 +346,14 @@ class SyncService:
                     timeout=30,
                 )
             if response.status_code != 200:
-                logger.error("Config fetch failed: HTTP %s", response.status_code)
+                logger.error(
+                    "Config fetch failed: HTTP %s from %s — %s",
+                    response.status_code, self.commodity_uri, response.text[:500],
+                )
                 return None
             return response.json()
         except Exception as exc:
-            logger.error("Config fetch failed: %s", exc)
+            logger.error("Config fetch failed: %s (%s)", exc, self.commodity_uri)
             return None
 
     def sync_commodity_config(self, db, username: str = None, password: str = None) -> bool:
@@ -243,8 +375,11 @@ class SyncService:
             if self._use_keycloak:
                 logger.warning("Cannot sync config — Keycloak service login failed.")
                 return False
-            username = username or settings.QUALIX_USERNAME
-            password = password or settings.QUALIX_PASSWORD
+            # The sync account under BOTH providers — deliberately not the
+            # emergency/tier-3 device credentials, which exist only to unlock
+            # the device and have no business authenticating a sync.
+            username = username or settings.SYNC_SERVICE_USERNAME
+            password = password or settings.SYNC_SERVICE_PASSWORD
             if not self.login_qualix(username, password):
                 logger.warning("Cannot sync config — Qualix login failed.")
                 return False

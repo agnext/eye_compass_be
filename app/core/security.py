@@ -84,6 +84,10 @@ class SessionStore:
                     # worker later ask Keycloak's Admin API about this exact
                     # account (see fetch_account_status).
                     keycloak_user_id=extra.get("keycloak_user_id", ""),
+                    # Qualix's user_id — sent as `operator_id` on every scan
+                    # datagram so Qualix can map location explicitly rather
+                    # than from whichever account authenticated the post.
+                    operator_id=extra.get("operator_id", ""),
                 )
             )
             db.commit()
@@ -132,6 +136,7 @@ class SessionStore:
                 "email": row.email or "",
                 "roles": row.roles or [],
                 "keycloak_user_id": row.keycloak_user_id or "",
+                "operator_id": row.operator_id or "",
                 "password_credential_created_at": row.password_credential_created_at,
             }
         except Exception as exc:
@@ -371,6 +376,7 @@ class SessionStore:
             row.email = claims.get("email", "") or row.email
             row.roles = claims.get("roles", []) or row.roles
             row.keycloak_user_id = claims.get("sub", "") or row.keycloak_user_id
+            row.operator_id = claims.get("operator_id", "") or row.operator_id
             row.last_verified_at = datetime.utcnow()
             row.needs_relogin = False
             row.relogin_suggested = False
@@ -509,3 +515,19 @@ def require_session(request: Request) -> dict:
 
 
 CurrentUser = Depends(require_session)
+
+
+def current_operator_id(request: Request) -> str:
+    """Qualix's user_id for whoever is calling, or "" if that can't be
+    determined — never raises.
+
+    Deliberately soft, unlike require_session: scan.py's endpoints enforce no
+    authentication today (a separate, pre-existing decision, not one this
+    makes), so reading operator_id here must not add a new way for a request
+    to be rejected. It only makes a best-effort attempt to attribute the scan
+    correctly when the caller does have a valid session, which in practice is
+    every real request from the frontend.
+    """
+    token = _extract_token(request)
+    session = session_store.get(token) if token else None
+    return (session or {}).get("operator_id", "") or ""

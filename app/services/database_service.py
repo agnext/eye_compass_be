@@ -29,11 +29,16 @@ class DatabaseService:
         date: str = None,
         start_time: str = None,
         stop_time: str = None,
+        client_request_id: str = "",
     ) -> Result:
         """Persist a completed scan.
 
         Times come from the ScanSession, which stamped them when the run
         actually started and ended — not from the moment of the HTTP call.
+
+        `client_request_id` is the caller's idempotency key. Stored as NULL
+        rather than "" when absent: it is under a unique index, and a second
+        keyless save would collide with the first if they all shared "".
         """
         now = datetime.now()
         result = Result(
@@ -45,18 +50,25 @@ class DatabaseService:
             start_time=start_time or now.strftime("%H:%M:%S"),
             stop_time=stop_time or now.strftime("%H:%M:%S"),
             sync_status=SYNC_PENDING,
+            client_request_id=(client_request_id or "").strip() or None,
         )
         self.db.add(result)
         self.db.commit()
         self.db.refresh(result)
         return result
 
-    def set_sync_status(self, result_id: int, status: str) -> bool:
-        """Record the Qualix outcome, preserving all three legacy states."""
+    def set_sync_status(self, result_id: int, status: str, error: str = "") -> bool:
+        """Record the Qualix outcome, preserving all three legacy states.
+
+        `error` is why it failed, for the History screen to show. A successful
+        sync clears it, so a reason from an earlier failed attempt can never
+        outlive the failure it described.
+        """
         result = self.db.query(Result).filter(Result.id == result_id).first()
         if not result:
             return False
         result.sync_status = status
+        result.sync_error = "" if status == SYNC_OK else (error or "")
         self.db.commit()
         return True
 

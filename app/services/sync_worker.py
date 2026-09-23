@@ -16,6 +16,7 @@ import logging
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.services.database_service import DatabaseService
+from app.services.sync_lock import claim_result
 from app.services.sync_service import sync_service
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,11 @@ def _run_one_cycle() -> dict:
             # Under AUTH_PROVIDER=keycloak, is_authenticated has already tried
             # (and failed) to obtain the sync service token — there is no
             # separate Qualix password login left to attempt.
+            # The sync account, not the emergency/tier-3 device login. Those
+            # used to be the same setting, which meant the credentials that
+            # unlock the device were also the ones posting scans.
             authenticated = settings.AUTH_PROVIDER != "keycloak" and sync_service.login_qualix(
-                settings.QUALIX_USERNAME, settings.QUALIX_PASSWORD
+                settings.SYNC_SERVICE_USERNAME, settings.SYNC_SERVICE_PASSWORD
             )
             if not authenticated:
                 logger.warning(
@@ -58,26 +62,37 @@ def _run_one_cycle() -> dict:
                 summary["still_pending"] += 1
                 continue
 
-            post_status, error_code = sync_service.post_analysis_data(datagram)
+            # A record listed as pending may already be mid-delivery: the post
+            # that runs right after a batch is saved leaves it at '0' for its
+            # whole duration, which against this endpoint is around half a
+            # minute. Posting it again in parallel is what produces duplicate
+            # Google Sheets rows. Leave it alone and look again next cycle.
+            with claim_result(record.id) as granted:
+                if not granted:
+                    summary["still_pending"] += 1
+                    continue
 
-            if post_status == "1":
-                try:
-                    sync_service.post_to_sheets(datagram)
-                except Exception as exc:
-                    logger.error("Sheets retry failed for result %s: %s", record.id, exc)
-                summary["delivered"] += 1
-            elif post_status == "2":
-                logger.error(
-                    "Result %s rejected by Qualix (400) — marking terminal.", record.id
-                )
-                summary["rejected"] += 1
-            else:
-                logger.warning(
-                    "Result %s still undelivered (%s).", record.id, error_code
-                )
-                summary["still_pending"] += 1
+                post_status, error_code, error_detail = sync_service.post_analysis_data(datagram)
 
-            service.set_sync_status(record.id, post_status)
+                if post_status == "1":
+                    try:
+                        sync_service.post_to_sheets(datagram)
+                    except Exception as exc:
+                        logger.error("Sheets retry failed for result %s: %s", record.id, exc)
+                    summary["delivered"] += 1
+                elif post_status == "2":
+                    logger.error(
+                        "Result %s rejected by Qualix (400) — marking terminal. %s",
+                        record.id, error_detail,
+                    )
+                    summary["rejected"] += 1
+                else:
+                    logger.warning(
+                        "Result %s still undelivered (%s).", record.id, error_code
+                    )
+                    summary["still_pending"] += 1
+
+                service.set_sync_status(record.id, post_status, error_detail)
 
         return summary
     except Exception as exc:

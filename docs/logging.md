@@ -68,7 +68,7 @@ Lines belonging to a major flow are tagged, so they can be filtered:
 | `[AUTH]` | Logging in — which system checked the password, which tier succeeded |
 | `[SESSION]` | Sessions being created, extended, expired or flagged |
 | `[REVALIDATE]` | The once-a-day check that accounts are still valid |
-| `[SYNC]` | Getting the token used to send scan results |
+| `[SYNC]` | Getting the token used to send scan results, and the full body of every scan POST to Qualix (headers are never logged — the bearer token is in them) |
 
 Useful filters:
 
