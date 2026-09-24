@@ -359,6 +359,24 @@ class Settings:
         default="",
     )
 
+    # ---------------- History ----------------
+    # How far back the History screen looks, in days.
+    #
+    # The device keeps every scan it has ever taken and nothing prunes the
+    # table, so after a season in the field History is thousands of rows deep
+    # — and an operator on a touch screen is realistically only ever looking
+    # for something from the last few days. Paging back through a year of
+    # scans to find yesterday's is the opposite of useful, so the list is
+    # windowed rather than unbounded.
+    #
+    # This filters the History *list* only. Nothing is deleted, and a record
+    # older than the window is still fetchable by id (GET /api/history/{id}),
+    # so an existing link or a support request for an old batch still works.
+    #
+    # 0 disables the window and shows everything — the escape hatch for
+    # exactly that support case, without a code change.
+    HISTORY_WINDOW_DAYS: int = _as_int(os.getenv("HISTORY_WINDOW_DAYS"), 30)
+
     # ---------------- Background workers ----------------
     # Legacy retried unsynced records every 15 minutes (main.py:2828).
     SYNC_RETRY_INTERVAL_MINUTES: int = _as_int(os.getenv("SYNC_RETRY_INTERVAL_MINUTES"), 30)

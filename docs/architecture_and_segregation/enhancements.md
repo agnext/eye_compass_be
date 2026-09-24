@@ -921,6 +921,36 @@ them alongside further enhancements worth considering but not yet done.
   full text on hover), and the record detail page shows it as a banner —
   red for rejected, amber for still pending. Both read `sync_error` from the
   API described in the backend section above.
+- **History lists the last 30 days, not everything ever scanned.** Nothing
+  prunes the `result` table, so a device that has been in the field for a
+  season has thousands of rows behind that screen, and an operator on a touch
+  screen is realistically only ever looking for something from the last few
+  days. `GET /api/history/` now filters to `HISTORY_WINDOW_DAYS` (default 30,
+  `0` disables the window), and the screen says which window it is showing —
+  otherwise a missing two-month-old batch reads as lost data rather than as a
+  list that stops.
+
+  Nothing is deleted and nothing stops syncing. The window is on the *list*
+  only: `GET /api/history/{id}` still serves a record of any age, so an
+  existing link or a support request for an old batch still works, and the
+  per-request `?days=` override (`0` for everything) exists so support can
+  pull one without editing a device's `.env` and restarting it.
+
+  The window is on the scan date — when the device did the work — not on the
+  operator-entered `receiving_date`, which is free to be older and would make
+  the window mean something other than what it says.
+
+  Two details worth recording. The filter is a plain text comparison against
+  the indexed `result.date` column, which is sound *because* that column is
+  written zero-padded `"%Y-%m-%d"`: for that format, and only for it,
+  lexicographic order is chronological order. And the endpoint now filters,
+  orders and pages in SQL; it previously did all three in Python over
+  `db.query(Result).all()`, reading every scan the device had ever taken —
+  full JSONB datagrams included — in order to return twenty of them.
+
+  Unrelated despite the similar name: `GALLERY_LIMIT` in `ResultsViewer.jsx`
+  caps how many FO crops *one* record's gallery fetches in a single call. It
+  has nothing to do with how far back the History list reaches.
 
 ## Suggested future enhancements
 

@@ -12,6 +12,7 @@ extra tables.
 import base64
 import logging
 import os
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -78,13 +79,26 @@ def _row_to_summary(r: Result) -> dict:
     }
 
 
+def _window_start(days: int) -> Optional[str]:
+    """The oldest scan date the History list will show, as "%Y-%m-%d".
+
+    None when windowing is switched off (HISTORY_WINDOW_DAYS=0), meaning show
+    everything. Returned as a string because Result.date is one — see
+    get_history for why comparing it as text is sound.
+    """
+    if days <= 0:
+        return None
+    return (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 @router.get("/")
 def get_history(
     db: Session = Depends(get_db),
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    days: Optional[int] = Query(None, ge=0),
 ):
-    """Paged history.
+    """Paged history, limited to the last HISTORY_WINDOW_DAYS days (30).
 
     Sorted latest-first by scan date/start_time (r.date, r.start_time — both
     plain strings but written as "%Y-%m-%d"/"%H:%M:%S" by database_service.py,
@@ -92,22 +106,52 @@ def get_history(
     populate_history_table (main.py:2100), which grouped rows by commodity
     name (then receiving date) instead of scan recency — changed back to
     latest-first on request.
+
+    That zero-padded "%Y-%m-%d" shape is also why the window can be a plain
+    text comparison against Result.date: for that format, and only for it,
+    lexicographic order is chronological order. It keeps the filter on the
+    indexed column instead of casting every row to a date to compare it.
+
+    The window is on the scan date (when it ran), not receiving_date (when the
+    goods arrived, operator-entered and free to be older). "Last 30 days"
+    means the device's own last 30 days of work, which is the question the
+    operator is actually asking.
+
+    `days` overrides the configured window per request — 0 for everything.
+    Nothing on the kiosk sends it; it exists so support can pull an older
+    record without editing the device's .env and restarting it.
+
+    Filtering, ordering and paging all happen in SQL now. They used to happen
+    in Python over `db.query(Result).all()`, which read every scan the device
+    had ever taken — full JSONB datagrams and all — to then return twenty of
+    them. That was already wasteful and is worse once most of what it reads
+    is outside the window and gets discarded.
     """
     try:
-        rows = db.query(Result).all()
-        summaries = [_row_to_summary(r) for r in rows]
-        summaries.sort(
-            key=lambda s: (s["date"] or "", s["start_time"] or ""),
-            reverse=True,
+        window_days = settings.HISTORY_WINDOW_DAYS if days is None else days
+        start = _window_start(window_days)
+
+        query = db.query(Result)
+        if start is not None:
+            query = query.filter(Result.date >= start)
+
+        total = query.count()
+        rows = (
+            query.order_by(Result.date.desc(), Result.start_time.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
         )
-        total = len(summaries)
-        page = summaries[offset : offset + limit]
         return {
             "status": "success",
             "total": total,
             "limit": limit,
             "offset": offset,
-            "data": page,
+            # So the screen can say what it is showing rather than letting an
+            # older scan's absence read as data loss. 0 = unwindowed.
+            "window_days": window_days,
+            "window_start": start or "",
+            "data": [_row_to_summary(r) for r in rows],
         }
     except Exception as exc:
         logger.error("Failed to fetch history: %s", exc)
