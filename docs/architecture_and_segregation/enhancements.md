@@ -9,6 +9,12 @@ correctness fixes (which just made the port match legacy — see
 `8 - remediation_log.md` / `9 - post_remediation_session_log.md`) and lists
 them alongside further enhancements worth considering but not yet done.
 
+The entries covering detection, tracking and the review queue stand alone
+here, as this document intends. `12 - object_capture_and_detection.md` reads
+them as one piece instead: what was going wrong, the evidence for each, how
+they interact, the measured figures they were decided against, and what is
+deliberately still open.
+
 ## Enhancements already made
 
 ### Backend
@@ -951,6 +957,270 @@ them alongside further enhancements worth considering but not yet done.
   Unrelated despite the similar name: `GALLERY_LIMIT` in `ResultsViewer.jsx`
   caps how many FO crops *one* record's gallery fetches in a single call. It
   has nothing to do with how far back the History list reaches.
+
+- **Duplicate suppression compares position in two dimensions, not just the
+  x-axis, so an object following closely behind another is still detected.**
+  Legacy's `has_similar_x_axis` (`main.py:2516-2563`) decides whether a fresh
+  detection is merely the already-queued one seen again by comparing x-centres
+  alone, within 10px. The belt travels in +y — the tracker's own match gate
+  (`sort.py`'s `cy >= obj['y'] - 5`) and its `y <= height - 50` exit rule both
+  depend on that — so two objects one behind the other on the belt have
+  near-identical x-centres by construction. An x-only test cannot tell "the
+  same object, one frame later" apart from "a second object a few centimetres
+  behind the first", and discards the second one.
+
+  The window where that matters is the one-second conveyor deceleration delay
+  in `pause_capture()`: frames keep being inferred for that second after a
+  detection freezes the screen, which is exactly when a trailing object slides
+  into view. Because `process_frame` records every tracked id in
+  `existing_track_ids` whether or not it was queued, a suppressed object's id
+  is consumed permanently — it is not new again after Resume, so it is never
+  offered for review, never cropped, and never counted in `total_fo_detected`.
+
+  `_is_duplicate_of_pending` (`scan_session.py`) adds a **directional** y
+  comparison rather than a second distance threshold. An object can only ever
+  move forward down the frame, so a box at the same x that sits at or ahead of
+  a pending box (`ny >= ey - y_tolerance`, the tolerance absorbing per-frame
+  centroid jitter) is that same object seen later and is suppressed; a box at
+  the same x but *behind* a pending one cannot be the same object at any frame
+  interval, so it is treated as new and queued. A symmetric `|ny - ey|`
+  threshold would not work: across the deceleration window the same object
+  legitimately travels a long way in y, so any threshold loose enough to still
+  suppress it would also swallow a real trailing object.
+
+- **The tracker's matched-id set is per frame, and a detection is assigned to
+  its nearest track rather than the first one within tolerance.**
+  `ObjectTracker.matched_ids` (`sort.py`) records which ids the current frame's
+  detections claimed, so the pass that follows can increment `miss_count` for
+  the ones nothing matched. Scoped to the tracker's lifetime instead of the
+  frame, every id that ever matched once stays permanently "seen",
+  `miss_count` never increments again, and the `max_misses` eviction in
+  `_remove_stale_objects` never fires — stale tracks then linger for the full
+  `max_age` window and can absorb a genuinely new object arriving at a similar
+  x. Matching also picks the closest candidate and refuses to hand two
+  detections in the same frame to one track: the candidate set is an unordered
+  dict, so stopping at the first id inside the tolerance box is as likely to
+  pick the wrong track as the right one when two objects are close together,
+  which swaps their identities and makes one of them look new while the other
+  goes stale.
+
+- **Detection runs at the camera's rate; only the display is throttled to
+  `STREAM_FPS`.** The websocket loop in `app/api/camera.py` grabs and infers as
+  fast as the hardware allows and encodes a JPEG for the browser at most once
+  per `1 / STREAM_FPS`, with a frame that has just stopped the belt sent
+  immediately regardless — that frame is the one the operator reviews. Pacing
+  the whole loop to `STREAM_FPS` instead would pin the tracker's input rate to
+  the browser's refresh rate: at `STREAM_FPS=20` with `CAMERA_FRAME_DECIMATION=2`
+  that is 10 Hz, few enough frames that a small object can cross the field of
+  view in one or two of them, or between two of them.
+
+  Two related costs in the same loop. `CAMERA_FRAME_DECIMATION` is applied
+  *before* inference, so a frame that will be discarded never reaches
+  TensorRT — decimating afterwards spends a full inference pass on a frame
+  nothing looks at, halving the detection rate the GPU could otherwise
+  sustain. Set `CAMERA_FRAME_DECIMATION=1` to feed the tracker every frame the
+  camera delivers. And the display JPEG is encoded on a worker thread, as the
+  paused branch already did: a full-resolution encode on the event loop stalls
+  the next grab.
+
+  The `fps` value on the stream now counts frames actually put through
+  detection, which is the rate that determines whether an object can cross the
+  view unseen; it is no longer the same as the rate frames reach the browser.
+
+- **Detections found while the belt decelerates are queued and reviewed one at
+  a time, instead of each one overwriting the last.** A detection does not stop
+  the conveyor instantly — it takes about a second to decelerate, and frames
+  keep being inferred for that whole window. Legacy queues every detection
+  found in it (`detection_queue`, `main.py:2581`) and drains the backlog from
+  `process_queue` (`main.py:2651-2706`), which pops one entry, shows it, and
+  then waits on the `que_next` flag that Submit sets (`main.py:1289`) before
+  popping the next. The live view only returns once the queue is empty.
+
+  `ScanSession.detection_queue` reproduces that. Finding foreign matter only
+  appends to the queue; stopping the belt, engaging the interlock and freezing
+  the frame all belong to `_promote_next_detection`, which runs when a
+  detection actually reaches the screen. `resume()` — the review screen's
+  Submit — saves the current detection's crops and then promotes the next
+  queued one, staying frozen and interlocked; only when nothing is left does it
+  unlock, resume capture and hand back the live view with its Start/Stop
+  sidebar. `queue_depth` rides on every stream message so the Dashboard can
+  hold the overlay up and show how many detections are still waiting.
+
+  Queued detections are promoted with no settling delay. Legacy sleeps
+  0.41-0.56s before each pop, computed from the object's y-coordinate
+  (`(-0.000125 * lowest_y) + 0.56`, `main.py:2672-2696`) — that is conveyor
+  travel-time compensation, holding the belt running just long enough for the
+  detected object to reach the pickup position before the stop command goes
+  out, which is why an object nearer the top of the frame gets the longer wait.
+  It is load-bearing for the first detection of a burst and meaningless for the
+  rest: Submit unlocks the interlock but never sends `machine_start`, so the
+  belt is already stationary when a queued detection is promoted and the delay
+  would buy nothing but a blank screen. (The floor in legacy's own code,
+  `if self.delay < 0.3: self.delay = 0.4`, is unreachable — the formula cannot
+  return less than 0.41 inside a 1200px frame.)
+
+  Two consequences worth recording. Duplicate suppression filters **per box**
+  rather than per frame: the detection under review stays in view for the whole
+  deceleration window, so a frame-level verdict would discard every one of
+  those frames — and any genuinely new object that arrived in one of them —
+  which is what made a backlog impossible before. And pending box indices run
+  continuously for the whole scan instead of restarting at zero per detection,
+  because the index is part of the crop filename and re-labeling deletes the
+  crop it replaces by globbing `*_<index>.png`; with per-detection numbering
+  that glob also matches the identically-numbered box of every earlier
+  detection in the run.
+
+  `CAMERA_FRAME_QUEUE_SIZE` is unrelated and is not read anywhere. It
+  corresponds to legacy's *other* queue, the `LifoQueue(maxsize=32)` between
+  the camera thread and the inference thread (`GrabImage.py:85`); this port
+  grabs and infers in one loop and has no equivalent.
+
+- **A track is dropped after a fixed time without a detection, not a fixed
+  number of frames.** Legacy's `_remove_stale_objects` carried two frame
+  counters, `max_age=9` and `max_misses=2`. Both measure the same thing — a
+  track's `frame` is refreshed only on a match and `miss_count` is reset only
+  on a match — so the tighter one always fired first and `max_age` was
+  unreachable. What actually governed was "drop a track unseen for 3 frames",
+  which at the ~10Hz the pipeline ran came to about 0.3 seconds.
+
+  Counted in frames, that behaviour is hostage to the frame rate. Detection is
+  no longer paced to `STREAM_FPS` and the hardware ceiling is 42.8 fps
+  (measured: 23.4ms per TensorRT pass, with the GigE link capping grabs near
+  50), so the identical constants would drop a track after 70ms — re-minting
+  ids for objects still sitting under the camera and counting each one again as
+  a fresh foreign object. `TRACK_STALE_AFTER_SECONDS` (default 0.3) keeps it
+  the same at any rate.
+
+  The tracker measures that against a clock of its own, advanced only by
+  `update()` and only by the elapsed time since the previous call, clamped to
+  `max_step_seconds`. The clamp is what makes a pause survivable: capture stops
+  entirely while a detection is under review, which can run to minutes, and
+  against a wall clock every track would age out and the objects under the
+  stopped belt would all return as new ids the moment scanning resumed. A gap
+  of any length now ages a track by at most one frame's worth — which is what a
+  frame counter gave for free, and the property that had to be preserved
+  explicitly once the unit changed.
+
+  `scripts/test_tracking.py` asserts the staleness window holds at 10, 21 and
+  43 Hz, and that a four-minute review pause does not evict a track.
+
+- **Boxes describing the same physical object are collapsed into one before
+  the operator sees them.** `non_max_suppression` in the legacy inference
+  module offsets every box by its class id before handing it to
+  `torchvision.ops.nms` (`run_inference.py:727`, with the default
+  `agnostic=False`), so it only ever suppresses overlaps *within* a class. An
+  object the model cannot settle a class for comes back as two boxes at the
+  same coordinates under different classes — observed live on batch
+  `T11790338159`, where `[1412, 759, 1459, 813]` was returned as both class 3
+  at 0.23 and class 2 at 0.27 in a single frame.
+
+  Nothing downstream could tell those apart. The tracker issued each an id,
+  both landed in `pending`, and on the review screen they are one rectangle
+  drawn exactly over another: the operator taps once, labels one of them, and
+  `save_unselected` writes the other as NON-FM. Since `create_results` counts
+  crop files, one piece of foreign matter was reported twice.
+
+  `_merge_overlapping_detections` drops the lower-confidence box of any pair
+  overlapping by more than `DETECTION_MERGE_IOU` (default 0.6), which is what
+  a class-agnostic NMS would have kept. It runs before tracking, so the track
+  ids, the counted ids and the operator's boxes all come off one list. Input
+  order is preserved so the boxes stay in detection order. Two objects that are
+  merely close together are unaffected — the threshold is on overlap, not
+  distance, and the real cases overlap completely.
+
+- **Box-matching tolerance scales with the object's own size instead of being a
+  flat 10 pixels.** Legacy matched a detection to a track when both box edges
+  were within `x_tolerance` and compared review candidates on centre-x within
+  `x_threshold=10` — pixel figures that suit exactly one object size. The model
+  holds a steady box around a small object, but around a large one the box
+  breathes: measured on batch `T11790579022`, a 306x234 box came back on the
+  next look as 298x226, its right edge 16px away and its centre 12px away. Both
+  comparisons rejected that as a different object, so the tracker issued a
+  second id and the operator was shown, cropped and counted the same object
+  twice.
+
+  `TRACK_X_TOLERANCE_RATIO` (default 0.25 of the wider box) now sets the
+  tolerance, with `TRACK_X_TOLERANCE_PX` (default 10) as the floor so small
+  objects keep the tight threshold that stops two of them being collapsed into
+  one. The same figure drives `ObjectTracker._x_tolerance_for` and
+  `ScanSession._novel_boxes`, because a mismatch between them would let an
+  object be re-queued for review while still holding one track id, or the
+  reverse.
+
+  This only became visible once detection ran at the rate it was meant to. At
+  the ~10Hz the port had fallen to, a large object was looked at once or twice
+  on its way through and rarely got the chance to be seen twice; at ~21Hz, with
+  the belt measured at 1550 px/s giving 774ms in view, it is looked at about 16
+  times. The flaw was always there — legacy's own `has_similar_x_axis` uses the
+  same flat 10px on centre-x — it just needed the frames to show up.
+
+- **What the operator is shown is decided by track identity, not by comparing
+  box coordinates.** Legacy decides whether a detection is worth showing with
+  `has_similar_x_axis` (`main.py:2516`), which compares centre-x against the
+  boxes still sitting in `detection_queue`. That comparison has nothing to work
+  with the moment the queue drains: `handle_detection` then queues `coo`, every
+  box in the frame, so an object the operator reviewed and submitted a second
+  earlier goes straight back on screen as soon as anything else triggers a
+  detection.
+
+  Caught live on 28 Sep. Track 2 was shown and submitted; a different object
+  arrived as track 3; the next review frame carried both
+  `[874, 1057, 931, 1120]` (track 3, genuinely new) and
+  `[1132, 0, 1272, 120]` (track 2 again). The churn log for that frame reads
+  `new=[3] evicted={} tracked=[2, 3]` — the tracker had never lost track 2. The
+  information needed to leave it alone was there and unused.
+
+  `counted_track_ids` now decides. `ObjectTracker.last_assignment` reports which
+  track each detection in the current frame belongs to, and a box whose track is
+  already in `counted_track_ids` is not queued again. The set is filled with the
+  ids actually put in front of the operator, so it means exactly one thing:
+  objects this scan has already shown. `total_fo_detected` reads the same set,
+  which is why the live count and what the operator saw cannot drift apart.
+
+  Geometry survives only as a backstop, for the one case identity cannot
+  cover — a track that was dropped and re-minted arrives wearing an id nobody
+  has seen. The directional y comparison stays part of that backstop: without
+  it an object following closely behind another shares its centre-x and is
+  discarded, which is the defect that started this thread.
+
+  Related: `ObjectTracker` no longer refuses an id to a detection with
+  `cx <= 10`. That rule left anything against the left edge with no identity at
+  all, so it could never be recognised as already-shown — it returned for
+  review every time something else fired, and was never counted either.
+
+- **Data Collection cannot be started until every detail is filled in.** The
+  Add Details form's Next button is disabled while any of Sample Id, Commodity,
+  Variety or FM is empty, and names the ones still missing. Three of the four
+  normally fill themselves in from the config, so an operator who has typed a
+  Sample Id and still cannot continue would otherwise have no way to guess that
+  a commodity with no varieties or no analyses configured is what is holding
+  them up.
+
+  `/api/camera/data_collection/prepare` rejects a blank `sample_id`,
+  `commodity` or `variety` with a 422. Those three values *are* the output
+  path — `<OUTPUT_DIR>/Data_Collection/<commodity>/<variety>/<epoch>_<sample_id>`
+  — so a blank one produces a path with an empty segment and the session's
+  frames land somewhere nothing identifies, which defeats the point of
+  collecting them. The check is not redundant with the form: arriving at the
+  page with the form state gone, which a reload does, sends blanks.
+
+  The Sample Id accepts letters, numbers, hyphens and underscores only, and is
+  filtered as it is typed rather than rejected afterwards, with the field
+  saying so underneath. It is used verbatim as part of the directory name, so
+  the restriction is what stops a "/" silently nesting the session inside extra
+  folders or a "../" writing outside `OUTPUT_DIR` entirely. `prepare` enforces
+  the same rule, and confirms the assembled path really is inside
+  `<OUTPUT_DIR>/Data_Collection` before creating anything — commodity and
+  variety are not typed, but they are joined into that path just the same. This
+  is the containment check `history.py` already applies before serving a crop.
+
+  The Data Collection screen keeps START and Capture Image disabled until
+  `prepare` has actually succeeded, and offers a way back to the form when it
+  has not. Recording without a folder would capture every frame and drop it
+  while looking like a working session. Its call also uses `.unwrap()` now: an
+  RTK Query mutation promise resolves with an `{ error }` object rather than
+  rejecting, so the `.catch()` that was there never ran and a rejected prepare
+  was indistinguishable from an accepted one.
 
 ## Suggested future enhancements
 

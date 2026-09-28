@@ -18,6 +18,7 @@ import base64
 import concurrent.futures
 import logging
 import os
+import re
 import threading
 import time
 
@@ -204,8 +205,15 @@ async def camera_stream(websocket: WebSocket):
     fps_counter = 0
     fps_timer = time.time()
     current_fps = 0.0
+    fps_log_timer = time.time()
     raw_frame_index = 0
-    frozen_frame_sent = False
+    # Which frozen review frame has already gone out, and whether the previous
+    # iteration was a paused one. A bool "already sent it" is not enough: a
+    # queued detection is promoted while capture stays paused throughout, so
+    # the frame changes without the pause ever ending.
+    sent_frozen_seq = None
+    was_paused = False
+    last_sent = 0.0
 
     def encode_display(img):
         out = img
@@ -219,8 +227,6 @@ async def camera_stream(websocket: WebSocket):
 
     try:
         while True:
-            loop_start = time.time()
-
             # Port of cam_thread.capture_paused (GrabImage.py:95): while a
             # detection is under review, or the belt has been stopped, legacy
             # grabs no frames at all — so no inference runs, no track ids are
@@ -230,7 +236,9 @@ async def camera_stream(websocket: WebSocket):
             # box overlay drawn over a newer frame than it was computed on.
             if scan_session.capture_paused:
                 payload = {"fps": 0.0, **scan_session.live_state()}
-                if not frozen_frame_sent:
+                was_paused = True
+                frozen_seq = scan_session.frozen_frame_seq
+                if sent_frozen_seq != frozen_seq:
                     frozen = scan_session.pending_frame
                     if frozen is not None:
                         enc = await loop.run_in_executor(None, encode_display, frozen)
@@ -246,57 +254,111 @@ async def camera_stream(websocket: WebSocket):
                             })
                     # No pending_frame (e.g. a manual STOP): send no frame at
                     # all, so the client simply holds the last one it has.
-                    frozen_frame_sent = True
+                    sent_frozen_seq = frozen_seq
                 await websocket.send_json(payload)
                 await asyncio.sleep(0.2)
                 continue
 
-            if frozen_frame_sent:
+            if was_paused:
                 # Just resumed — don't average the paused interval into FPS.
-                frozen_frame_sent = False
+                was_paused = False
+                sent_frozen_seq = None
                 fps_counter = 0
                 fps_timer = time.time()
+                last_sent = 0.0
 
-            def grab_and_infer():
-                # One lock for the whole grab+infer step: the camera handle and
-                # the TensorRT context are both single-owner resources.
+            # Grab and infer are separate steps, each taking the lock for its
+            # own single-owner resource (the camera handle, the TensorRT
+            # context), so a frame about to be decimated away never reaches
+            # inference at all. Both must still run on _hw_executor rather than
+            # the default pool — see the note above _hw_executor's definition.
+            def grab():
                 with _hardware_lock:
-                    frame = _camera.grab_frame()
-                    if frame is None:
-                        return None, None
-                    dets, annotated = _inference.predict(frame)
-                    return (frame, dets, annotated)
+                    return _camera.grab_frame()
 
-            # Must run on _hw_executor, not the default pool — see the note
-            # above _hw_executor's definition.
-            result = await loop.run_in_executor(_hw_executor, grab_and_infer)
-            if result is None or result[0] is None:
+            def infer(img):
+                with _hardware_lock:
+                    return _inference.predict(img)
+
+            frame = await loop.run_in_executor(_hw_executor, grab)
+            if frame is None:
                 await asyncio.sleep(0.02)
                 continue
 
-            frame, detections, annotated = result
+            if settings.USE_MOCK_CAMERA:
+                # The real camera's grab blocks until the sensor delivers,
+                # which is what paces this loop on the device. The mock returns
+                # instantly, so it needs pacing of its own or the loop spins a
+                # core flat out now that nothing else throttles it.
+                await asyncio.sleep(frame_interval / decimation)
 
             raw_frame_index += 1
-            # Legacy processed every 2nd frame (GrabImage.py:117).
+            # Legacy processed every 2nd frame (GrabImage.py:117). The check
+            # sits BEFORE inference rather than after it: running predict() and
+            # then discarding the result spends a full TensorRT pass on a frame
+            # nothing ever looks at, halving the detection rate the GPU could
+            # otherwise sustain. Set CAMERA_FRAME_DECIMATION=1 to feed the
+            # tracker every frame the camera delivers.
             if raw_frame_index % decimation != 0:
                 continue
+
+            detections, annotated = await loop.run_in_executor(_hw_executor, infer, frame)
 
             # Detection state machine — belt stop, interlock, crops, counting.
             state = await loop.run_in_executor(
                 None, scan_session.process_frame, frame, detections
             )
 
-            enc = encode_display(annotated if annotated is not None else frame)
-            if enc is None:
-                continue
-            b64_frame, display_width, display_height = enc
-
+            # Counts frames actually put through detection, which is the rate
+            # that matters for whether an object can cross the view unseen —
+            # it is no longer the same as the rate frames reach the browser.
             fps_counter += 1
             elapsed = time.time() - fps_timer
             if elapsed >= 1.0:
                 current_fps = fps_counter / elapsed
                 fps_counter = 0
                 fps_timer = time.time()
+                # The detection rate only existed in the websocket payload,
+                # which means it could only ever be read off a browser that
+                # happened to be open at the time. It decides whether an object
+                # can cross the view unseen, so it belongs in the journal
+                # alongside everything else about a scan. Every 10s, not every
+                # second, so it stays readable next to the detection lines.
+                if time.time() - fps_log_timer >= 10.0:
+                    fps_log_timer = time.time()
+                    logger.info(
+                        "Detection rate: %.1f fps (decimation=%s, "
+                        "%.0f ms per inferred frame)",
+                        current_fps, decimation,
+                        1000.0 / current_fps if current_fps else 0,
+                    )
+
+            # Display is throttled to STREAM_FPS; DETECTION is not. This loop
+            # used to sleep out the remainder of a STREAM_FPS interval on every
+            # iteration, which pinned the tracker's input rate to the browser's
+            # refresh rate — at STREAM_FPS=20 with decimation 2 that is 10 Hz,
+            # few enough frames that a small object can cross the field of view
+            # in one or two of them, or between two of them. The operator does
+            # not need more than STREAM_FPS frames a second; the tracker needs
+            # every frame it can get.
+            now = time.time()
+            # A detection that has just stopped the belt goes out immediately
+            # instead of waiting out the display interval — that frame is the
+            # one the operator reviews, and pause_capture freezes the stream on
+            # it a moment later.
+            if not state.get("fm_detected") and now - last_sent < frame_interval:
+                continue
+            last_sent = now
+
+            # Encoded off the event loop, as the paused branch above already
+            # does: a full-resolution JPEG encode inline stalls the next grab,
+            # which is the one thing this loop cannot afford.
+            enc = await loop.run_in_executor(
+                None, encode_display, annotated if annotated is not None else frame
+            )
+            if enc is None:
+                continue
+            b64_frame, display_width, display_height = enc
 
             await websocket.send_json({
                 "frame": b64_frame,
@@ -308,10 +370,6 @@ async def camera_stream(websocket: WebSocket):
                 "fps": round(current_fps, 1),
                 **state,
             })
-
-            sleep_time = frame_interval - (time.time() - loop_start)
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
@@ -483,12 +541,56 @@ def prepare_data_collection(req: DataCollectionRequest):
     not recreated per button press.
     """
     global _dc_folder, _dc_frame_count
-    unique = f"{int(time.time())}_{req.sample_id}"
+
+    # The three values ARE the folder path. A blank one produces a path with an
+    # empty segment — <OUTPUT_DIR>/Data_Collection///<epoch>_ — so the session's
+    # frames land somewhere nothing identifies and nobody can find them again
+    # afterwards, which is the entire point of collecting them. The form
+    # disables its own Next button for the same reason (DetailsEntry.jsx); this
+    # also covers reaching the page with the form state lost, e.g. a reload.
+    missing = [
+        name for name, value in (
+            ("sample_id", req.sample_id), ("commodity", req.commodity),
+            ("variety", req.variety),
+        ) if not (value or "").strip()
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot start data collection without {', '.join(missing)}.",
+        )
+
+    # The sample id is used verbatim as part of a directory name below, so it
+    # is restricted to characters that cannot change where that directory ends
+    # up: a "/" would silently nest the session inside extra folders and a
+    # ".." would put it outside OUTPUT_DIR altogether. The Add Details form
+    # filters the same set as the operator types (DetailsEntry.jsx); this is
+    # what makes the rule true regardless of how the request was made.
+    sample_id = req.sample_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", sample_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Sample id may contain only letters, numbers, hyphens and "
+                   "underscores.",
+        )
+
+    unique = f"{int(time.time())}_{sample_id}"
+    root = os.path.join(settings.OUTPUT_DIR, "Data_Collection")
     folder = os.path.join(
-        settings.OUTPUT_DIR, "Data_Collection",
+        root,
         normalize_commodity(req.commodity), normalize_commodity(req.variety),
         unique,
     )
+    # Commodity and variety come from the synced Qualix config rather than
+    # being typed, but they are joined into this path just the same, so the
+    # result is confirmed to be inside the output directory before anything is
+    # created — the same containment check history.py applies before serving a
+    # crop.
+    if not os.path.realpath(folder).startswith(os.path.realpath(root) + os.sep):
+        raise HTTPException(
+            status_code=422,
+            detail="Commodity or variety is not usable as a folder name.",
+        )
     os.makedirs(folder, exist_ok=True)
     with _dc_lock:
         _dc_folder = folder

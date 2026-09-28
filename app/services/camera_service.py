@@ -304,7 +304,43 @@ class RealCameraService(BaseCameraService):
             settings.CAMERA_GAIN,
             self._is_gige,
         )
+        self._log_sensor_geometry()
         return True
+
+    def _log_sensor_geometry(self) -> None:
+        """Report the region being read out against the sensor's maximum.
+
+        Answers, without anyone having to unplug the camera and open MVS
+        Viewer, whether a narrow field of view is something the software is
+        doing (a region smaller than WidthMax, or an offset into the sensor)
+        or purely the lens and the camera's height above the belt. Those have
+        completely different fixes, and only one of them is ours.
+        """
+        from ctypes import byref, sizeof, memset
+
+        def read(name):
+            value = self._MVCC_INTVALUE()
+            memset(byref(value), 0, sizeof(self._MVCC_INTVALUE))
+            if self.cam.MV_CC_GetIntValue(name, value) != 0:
+                return None
+            return value.nCurValue
+
+        geometry = {name: read(name) for name in
+                    ("Width", "Height", "WidthMax", "HeightMax", "OffsetX", "OffsetY")}
+        logger.info(
+            "Sensor geometry: reading %sx%s at offset (%s, %s) from a %sx%s sensor",
+            geometry["Width"], geometry["Height"],
+            geometry["OffsetX"], geometry["OffsetY"],
+            geometry["WidthMax"], geometry["HeightMax"],
+        )
+        width, width_max = geometry["Width"], geometry["WidthMax"]
+        if width and width_max and width < width_max:
+            logger.warning(
+                "Camera is reading only %s of its %s available columns — %s "
+                "columns of sensor are going unused. Widening the region in "
+                "%s would recover them.",
+                width, width_max, width_max - width, settings.CAMERA_FEATURE_FILE,
+            )
 
     def _load_feature_file(self) -> None:
         import os

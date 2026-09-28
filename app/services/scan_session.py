@@ -11,6 +11,8 @@ The legacy sequence being reproduced:
     start_process        main.py:741-850   create output folders, stamp start time
     handle_detection     main.py:2566-2591 cumulative unique-track counting
     has_similar_x_axis   main.py:2516-2563 duplicate suppression
+    detection_queue      main.py:2581       backlog of detections not yet reviewed
+    process_queue        main.py:2651-2706 drain it one at a time
     fm_control           main.py:2604-2650 lock interlock, stop belt, freeze frame
     ImageLabel.mousePress main.py:232-259  operator taps a box
     crop_and_save        main.py:141-147   crop written as <FM_name>_<ts>.png
@@ -118,13 +120,49 @@ class ScanSession:
         # since save_unselected/label_detection only ever act on self.pending.
         # See enhancements.md.
         self.counted_track_ids = set()
-        self.tracker = ObjectTracker(x_tolerance=10)
+        self.tracker = ObjectTracker(
+            x_tolerance=settings.TRACK_X_TOLERANCE_PX,
+            x_tolerance_ratio=settings.TRACK_X_TOLERANCE_RATIO,
+            stale_after_seconds=settings.TRACK_STALE_AFTER_SECONDS,
+        )
         self.tracker.update([[0, 0, 0, 0, 0, 0]], 0, (1200, 1920))
 
-        # Detections awaiting an operator label, keyed by index.
+        # Detections awaiting an operator label, keyed by index. This is the
+        # ONE detection currently on the review screen; anything found while
+        # it is up waits in detection_queue below.
         self.pending: List[Dict] = []
         self.pending_frame: Optional[np.ndarray] = None
         self.labelled_indices = set()
+
+        # Detections found but not yet reviewed, oldest first. Port of legacy's
+        # detection_queue (main.py:2581) drained by process_queue
+        # (main.py:2651-2706) one entry at a time, gated on the que_next flag
+        # that submit_all_fo_new sets (main.py:1289).
+        #
+        # It exists because a detection does not stop the belt instantly: the
+        # conveyor takes about a second to decelerate, and frames keep being
+        # inferred for that whole window (pause_capture's own delay). Without a
+        # queue each of those detections simply overwrites the previous one, so
+        # only the last frame's objects are ever reviewed and everything found
+        # earlier in the deceleration window is discarded unseen — not shown,
+        # not cropped, not counted.
+        self.detection_queue: List[Dict] = []
+
+        # Bumped every time a different frame is put on the review screen. The
+        # stream loop sends the frozen frame once and then holds it, so with a
+        # queue draining behind a still-paused capture it needs something to
+        # tell it the frame underneath the boxes has been replaced — otherwise
+        # the next queued detection's boxes are drawn over the previous
+        # detection's image.
+        self.frozen_frame_seq = 0
+
+        # Pending indices do not restart at 0 for each detection. The index is
+        # baked into the crop filename (label_detection), and re-labeling globs
+        # `*_<index>.png` to delete the crop it is replacing — with per-detection
+        # numbering that glob matches the identically-numbered box of every
+        # EARLIER detection in the run too, deleting already-saved crops that
+        # belong to different objects.
+        self._next_pending_index = 0
 
         # Deliberate deviation from legacy, not a port of anything in
         # main.py: after Submit, resume() clears machine_start_locked and
@@ -305,26 +343,148 @@ class ScanSession:
             logger.error("save_raw_frame failed: %s", exc)
 
     @staticmethod
-    def _x_center(box) -> float:
-        return (box[0] + box[2]) / 2.0
+    def _iou(a, b) -> float:
+        ax1, ay1, ax2, ay2 = a[:4]
+        bx1, by1, bx2, by2 = b[:4]
+        iw = min(ax2, bx2) - max(ax1, bx1)
+        ih = min(ay2, by2) - max(ay1, by1)
+        if iw <= 0 or ih <= 0:
+            return 0.0
+        inter = iw * ih
+        union = ((ax2 - ax1) * (ay2 - ay1)) + ((bx2 - bx1) * (by2 - by1)) - inter
+        return inter / union if union > 0 else 0.0
 
-    def _has_similar_x_axis(self, boxes, x_threshold: int = 10) -> bool:
-        """Port of has_similar_x_axis (main.py:2516-2563).
+    def _merge_overlapping_detections(self, detections: List) -> List:
+        """Collapse boxes that describe the same physical object into one.
 
-        Legacy compared against detections still queued for operator attention;
-        `self.pending` is the equivalent here.
+        The model's own NMS is class-wise: non_max_suppression offsets each
+        box by its class before handing it to torchvision.ops.nms
+        (run_inference.py:727, with the default agnostic=False), so it only
+        ever suppresses overlaps WITHIN a class. An object the model cannot
+        decide a class for therefore comes back as two boxes at the same
+        coordinates under different class ids — confirmed live, e.g.
+        [1412, 759, 1459, 813] returned as both class 3 @ 0.23 and class 2 @
+        0.27 in one frame.
+
+        Downstream, nothing else can tell those apart. The tracker gives them
+        separate ids, both land in `pending`, and on screen they are one
+        rectangle drawn exactly over another — so the operator taps once,
+        labels one of them, and the other is saved as NON-FM by
+        save_unselected. create_results counts files, so one piece of foreign
+        matter is reported twice.
+
+        The highest-confidence box wins, which is also what a class-agnostic
+        NMS would have kept. Input order is preserved so the boxes the operator
+        sees stay in the order they were detected.
         """
-        if not self.pending:
-            return False
-        new_centers = [self._x_center(b) for b in boxes if len(b) >= 4]
-        if not new_centers:
-            return False
+        if len(detections) < 2:
+            return detections
+
+        order = {id(d): i for i, d in enumerate(detections)}
+        by_confidence = sorted(
+            detections, key=lambda d: d[4] if len(d) > 4 else 0.0, reverse=True
+        )
+        kept = []
+        for det in by_confidence:
+            overlap = next(
+                (k for k in kept
+                 if self._iou(det, k) >= settings.DETECTION_MERGE_IOU), None)
+            if overlap is None:
+                kept.append(det)
+            else:
+                logger.info(
+                    "Merged a duplicate box of one object: class %s @ %.2f "
+                    "dropped, overlaps class %s @ %.2f (IoU %.2f) at %s",
+                    det[5] if len(det) > 5 else "?", det[4] if len(det) > 4 else 0.0,
+                    overlap[5] if len(overlap) > 5 else "?",
+                    overlap[4] if len(overlap) > 4 else 0.0,
+                    self._iou(det, overlap), [round(v, 1) for v in det[:4]],
+                )
+        kept.sort(key=lambda d: order[id(d)])
+        return kept
+
+    @staticmethod
+    def _center(box) -> tuple:
+        return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+
+    def _novel_boxes(self, boxes, y_tolerance: int = 10) -> List:
+        """Return only the boxes that are NOT already awaiting operator review.
+
+        Derived from has_similar_x_axis (main.py:2516-2563), which compared the
+        x-centre alone. The belt travels in +y (the tracker's own match gate,
+        sort.py's `cy >= obj['y'] - 5`, and its `y <= height - 50` exit rule
+        both depend on that), so one object trailing another along the belt has
+        an x-centre near-identical to the leader's BY CONSTRUCTION. An x-only
+        comparison therefore cannot tell "the same object, one frame later"
+        apart from "a second object a few centimetres behind the first", and
+        suppresses the second one — which is what made a closely-following
+        object vanish: the suppression window is the 1s deceleration delay in
+        pause_capture(), which is exactly when the trailing object slides into
+        view, and process_frame records its track id as seen regardless, so it
+        was never offered for review again after Resume either.
+
+        The y comparison that fixes it is DIRECTIONAL rather than a second
+        distance threshold. A given object can only ever move forward down the
+        frame, so a box at the same x that sits at or ahead of a pending box
+        (`ny >= ey - y_tolerance`, the tolerance absorbing per-frame centroid
+        jitter) is that same object seen later. A box at the same x but BEHIND
+        a pending one cannot be the same object at any frame interval, so it is
+        a genuinely new one and is queued. A plain |ny - ey| threshold would not
+        work here: across the deceleration window the same object legitimately
+        travels a long way in y, so any threshold loose enough to still suppress
+        it would also swallow a real trailing object.
+
+        Filtering is per BOX rather than per frame. Legacy's has_similar_x_axis
+        returns a single bool for the whole frame and handle_detection then
+        drops every box in it (main.py:2578-2586), which cannot work once
+        detections are queued: the object under review stays in view for the
+        whole deceleration window, so every subsequent frame contains it, and a
+        frame-level verdict would discard each of those frames entirely —
+        including any genuinely new object that arrived in one of them. Keeping
+        the already-queued object's box out while letting the new one through
+        is what makes a backlog possible at all, and it also stops an object
+        the operator has already been shown from being presented, cropped and
+        counted a second time.
+        """
+        awaiting = [
+            (self._center(b), b[2] - b[0]) for b in self._boxes_awaiting_review()
+        ]
+        novel = []
+        for box in boxes:
+            if len(box) < 4:
+                continue
+            nx, ny = self._center(box)
+            width = box[2] - box[0]
+            duplicate = False
+            for (ex, ey), existing_width in awaiting:
+                # Scaled to the object's own width, same reasoning as the
+                # tracker's _x_tolerance_for: a large object's box breathes by
+                # tens of pixels between frames, so a flat threshold lets the
+                # same object through as a new one. Measured live, two reviews
+                # of one 306px-wide object had centres 12px apart — past a flat
+                # 10px, nowhere near 25% of its width.
+                x_threshold = max(
+                    settings.TRACK_X_TOLERANCE_PX,
+                    settings.TRACK_X_TOLERANCE_RATIO * max(width, existing_width),
+                )
+                if abs(nx - ex) < x_threshold and ny >= ey - y_tolerance:
+                    duplicate = True
+                    break
+            if not duplicate:
+                novel.append(box)
+        return novel
+
+    def _boxes_awaiting_review(self):
+        """Every box the operator still has to look at — the one on screen plus
+        the whole queued backlog. Legacy's has_similar_x_axis (main.py:2521)
+        checks `self.detection_queue`, not just the detection being displayed,
+        so a duplicate arriving while several are already queued is matched
+        against all of them."""
         for item in self.pending:
-            existing = self._x_center(item["box"])
-            for nx in new_centers:
-                if abs(nx - existing) < x_threshold:
-                    return True
-        return False
+            yield item["box"]
+        for queued in self.detection_queue:
+            for box in queued["boxes"]:
+                yield box
 
     def process_frame(self, frame: np.ndarray, detections: List) -> Dict:
         """Feed one inferred frame through the detection state machine.
@@ -353,6 +513,11 @@ class ScanSession:
 
             if not detections or not fm_flag:
                 return self._snapshot(fm_detected=False)
+
+            # One box per object before anything downstream sees them — the
+            # tracker, the counted ids and the operator's boxes all come off
+            # this list. See _merge_overlapping_detections.
+            detections = self._merge_overlapping_detections(detections)
 
             # 2. Pad boxes the way emit_results does before anything downstream
             #    sees them (main.py / GrabImage.py:577) — legacy uses pad=10,
@@ -388,17 +553,78 @@ class ScanSession:
             # grabbed at all, so process_frame is never reached. See
             # pause_capture above and the stream loop in app/api/camera.py.
 
+            # Diagnostic for a foreign-object count that moves while the
+            # material does not. A count can only grow when an id appears that
+            # `existing_track_ids` has never seen, and on a stopped belt that
+            # can only mean the tracker dropped a track and re-created it for
+            # the same physical object — so both halves are logged together:
+            # which ids are new this frame, and which were evicted (with the
+            # rule that evicted them) on the way here. Remove once root-caused.
+            if new_ids or self.tracker.last_evicted:
+                logger.info(
+                    "Track churn: new=%s evicted=%s tracked=%s counted_so_far=%s",
+                    sorted(new_ids), self.tracker.last_evicted,
+                    sorted(track_ids), len(self.counted_track_ids),
+                )
+
+            # Identity comes from the tracker, not from comparing boxes. An
+            # object the operator has already been shown keeps its track id for
+            # as long as it stays in view, so that id is what says "do not show
+            # this one again" — and it keeps saying it after the operator
+            # submits, which is exactly when a coordinate comparison stops
+            # working. Confirmed live on batch T1179058xxxx: track 2 was shown,
+            # the operator submitted, a different object (track 3) arrived a
+            # moment later, and track 2 — still listed as tracked, never
+            # evicted — was put on screen a second time along with it, because
+            # by then nothing was awaiting review to compare its box against.
+            assignment = self.tracker.last_assignment
+            candidates = []
+            for i, box in enumerate(boxes):
+                track_id = assignment[i] if i < len(assignment) else None
+                if track_id is not None and track_id in self.counted_track_ids:
+                    continue
+                candidates.append((track_id, box))
+
+            # Geometry is now only a backstop, for the two cases an id cannot
+            # cover: a detection the tracker refused to track at all (it gives
+            # no id to anything against the left edge), and an object whose
+            # track was dropped and re-minted, which arrives wearing an id
+            # nobody has seen before.
+            novel = self._novel_boxes([box for _, box in candidates])
+            keep = {id(box) for box in novel}
+            candidates = [(t, b) for t, b in candidates if id(b) in keep]
+
+            # Nothing new is accepted while the backlog is at its limit. The
+            # objects behind it are deliberately NOT marked as counted, so they
+            # stay unseen ids and are detected again on a later frame once the
+            # operator has worked the queue down — refusing to queue costs a
+            # short delay, whereas marking them counted would lose them for the
+            # rest of the scan.
+            if candidates and len(self.detection_queue) >= settings.DETECTION_QUEUE_MAX:
+                logger.warning(
+                    "Detection backlog is at its limit of %s — holding %s "
+                    "further object(s) until the operator works through it. "
+                    "They stay uncounted and will be detected again.",
+                    settings.DETECTION_QUEUE_MAX, len(candidates),
+                )
+                candidates = []
+
             fm_detected = False
-            if new_ids and not self._has_similar_x_axis(boxes, x_threshold=10):
+            if candidates:
                 fm_detected = True
-                self._on_foreign_matter(frame, boxes)
-                # Only ids actually queued for review count toward
-                # total_fo_detected — see counted_track_ids' comment above.
-                self.counted_track_ids.update(new_ids)
+                self._on_foreign_matter(frame, [box for _, box in candidates])
+                # Only objects actually put in front of the operator count
+                # toward total_fo_detected — see counted_track_ids' comment
+                # above — and recording them here is also what stops each of
+                # them being shown again.
+                self.counted_track_ids.update(
+                    t for t, _ in candidates if t is not None
+                )
             elif new_ids:
                 logger.info(
-                    "FM detected but not queued for review (similar x-axis "
-                    "already pending): %s", new_ids
+                    "New object(s) %s detected but not queued for review — "
+                    "already shown, or overlapping something awaiting review",
+                    sorted(new_ids),
                 )
 
             # existing_track_ids still accumulates every new id regardless
@@ -410,24 +636,84 @@ class ScanSession:
             return self._snapshot(fm_detected=fm_detected)
 
     def _on_foreign_matter(self, frame: np.ndarray, boxes: List):
-        """Port of fm_control (main.py:2604-2650).
+        """Queue one detection, and put it on screen if nothing else is there.
 
-        Ordering matters: the interlock is engaged BEFORE FM_detected goes out,
-        so a machine_start arriving in between cannot win the race.
+        Port of handle_detection's enqueue step (main.py:2581): finding
+        something only ever ADDS to the backlog. Stopping the belt and showing
+        the frozen frame belong to _promote_next_detection below, which is
+        legacy's fm_control (main.py:2604-2650) — in legacy those run from the
+        process_queue thread at pop time, not at detection time.
         """
+        self.detection_queue.append({
+            "frame": frame.copy(),
+            "boxes": [list(box) for box in boxes],
+        })
+        # One raw frame per detection, queued or not — this is what
+        # update_fm_count reports as "Frame Count".
+        self.save_raw_frame(frame)
+
+        if self.pending_frame is None:
+            self._promote_next_detection(immediate=False)
+        else:
+            logger.info(
+                "Foreign matter detected while another detection is under "
+                "review — queued behind it (%s waiting): %s box(es)",
+                len(self.detection_queue), len(boxes),
+            )
+
+    def _promote_next_detection(self, immediate: bool) -> bool:
+        """Move the oldest queued detection onto the review screen.
+
+        Returns False when the queue is empty, which is the caller's signal
+        that the backlog is drained and the live view can come back.
+
+        `immediate` controls when the stream freezes. On the first detection
+        of a burst the belt is still running, so capture is paused a second
+        later once it has decelerated — the same delay legacy applies via
+        stop_camera_with_delay (main.py:2699). Draining the rest of the queue
+        happens with the belt already stopped (Submit never restarts it, see
+        resume), so there is nothing to wait for and a delay would only show
+        the operator a second of live feed over the frame they are meant to be
+        reviewing.
+        """
+        if not self.detection_queue:
+            self.pending = []
+            self.pending_frame = None
+            self.labelled_indices = set()
+            return False
+
+        item = self.detection_queue.pop(0)
+        boxes = item["boxes"]
+
         csc = self.conveyor_stop_count
         csc["fm_count"] += 1
         csc["fm_time"] = time.time()
 
+        # Ordering matters: the interlock is engaged BEFORE FM_detected goes
+        # out, so a machine_start arriving in between cannot win the race.
         conveyor_service.lock_machine_start(reason="FM_detected")
         conveyor_service.send("FM_detected")
 
-        self.pending = [
-            {"index": i, "box": [float(v) for v in box[:4]],
-             "confidence": float(box[4]) if len(box) > 4 else None,
-             "class_id": int(box[5]) if len(box) > 5 else None}
-            for i, box in enumerate(boxes)
-        ]
+        # Ordered by how far each object has travelled down the belt, furthest
+        # first. Within one frozen frame every box was found at the same
+        # instant, so there is no "found first" among them — but the one
+        # furthest along entered the camera's view earliest, which is the same
+        # order the operator watched them arrive in. Left alone, the order is
+        # whatever the model's NMS emitted, which is by confidence: the numbers
+        # on the crops would then follow how sure the model was rather than
+        # anything the operator can see, and the reclassify gallery lists
+        # unlabelled crops in exactly this order.
+        boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2.0, reverse=True)
+
+        self.pending = []
+        for box in boxes:
+            self.pending.append({
+                "index": self._next_pending_index,
+                "box": [float(v) for v in box[:4]],
+                "confidence": float(box[4]) if len(box) > 4 else None,
+                "class_id": int(box[5]) if len(box) > 5 else None,
+            })
+            self._next_pending_index += 1
         # Temporary diagnostic for the count-vs-visible-boxes discrepancy
         # (confirmed NOT a cropping issue — object-fit: fill already shows the
         # whole frame). Logging raw coordinates so the next occurrence shows
@@ -441,16 +727,28 @@ class ScanSession:
               round(p["box"][3] - p["box"][1], 1), p["confidence"], p["class_id"])
              for p in self.pending],
         )
-        self.pending_frame = frame.copy()
+        self.pending_frame = item["frame"]
+        self.frozen_frame_seq += 1
         self.labelled_indices = set()
-        self.save_raw_frame(frame)
 
-        # update_fm_image pauses capture 1s later, once the belt has
-        # decelerated (main.py:983) — from here on the operator reviews a
-        # frozen frame and no further inference runs until they resolve it.
-        self.pause_capture(delay_sec=1.0)
+        if immediate:
+            # Cancel any pause already scheduled and freeze right now — see the
+            # docstring. _pause_token is bumped so a pause queued before this
+            # promotion cannot land afterwards and re-freeze a released scan.
+            self._pause_token += 1
+            self.capture_paused = True
+        else:
+            # update_fm_image pauses capture 1s later, once the belt has
+            # decelerated (main.py:983) — from here on the operator reviews a
+            # frozen frame and no further inference runs until they resolve it.
+            self.pause_capture(delay_sec=1.0)
 
-        logger.info("Foreign matter detected: %s box(es) awaiting operator label", len(boxes))
+        logger.info(
+            "Foreign matter on screen: %s box(es) awaiting operator label "
+            "(%s more detection(s) queued behind it)",
+            len(boxes), len(self.detection_queue),
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Operator interaction
@@ -589,6 +887,21 @@ class ScanSession:
             self.pending = []
             self.pending_frame = None
             self.labelled_indices = set()
+
+            # Legacy's submit_all_fo_new sets que_next = True (main.py:1289),
+            # which lets the process_queue thread pop the next detection rather
+            # than returning to the live view. The operator keeps reviewing
+            # until the backlog captured while the belt was decelerating is
+            # drained; only then does the live feed and its Start/Stop sidebar
+            # come back. Shown immediately, with no settling delay: legacy
+            # sleeps 0.41-0.56s before each pop (main.py:2672-2696) to let the
+            # belt carry the object to the pickup position, but the belt is
+            # already stopped by the time a QUEUED item is promoted — Submit
+            # unlocks the interlock without ever sending machine_start — so
+            # here that delay would buy nothing but a blank screen.
+            if self._promote_next_detection(immediate=True):
+                return {"resumed": True, **self.status()}
+
             # See the flag's own comment in reset(): suspend detection until
             # Start is pressed again, so the live view can safely return
             # without immediately re-locking on the same still-in-frame object.
@@ -834,11 +1147,20 @@ class ScanSession:
                 logger.error("Could not write result.json: %s", exc)
 
             self.active = False
+            # Belt speed as the camera saw it. Everything that decides whether
+            # an object can cross the view unseen is in pixels: at S px/s an
+            # object is in frame for (frame height / S) seconds, which times
+            # the detection rate is how many times it was looked at. The drive
+            # frequency on the VFD cannot be read from here, so this is the
+            # only record of the speed a given batch actually ran at.
+            speed = self.tracker.belt_speed_px_s
             logger.info(
                 "Scan finished: sample=%s total_fo=%s reviewed_tracks=%s "
-                "unique_tracks=%s",
+                "unique_tracks=%s belt=%s",
                 self.sample_id, total,
                 len(self.counted_track_ids), len(self.existing_track_ids),
+                "%.0f px/s (%.0f ms in view)" % (speed, 1200.0 / speed * 1000)
+                if speed else "not measured",
             )
             return result_dict
 
@@ -849,6 +1171,11 @@ class ScanSession:
     def pending_status(self) -> Dict:
         return {
             "pending": self.pending,
+            # How many MORE detections are waiting behind the one on screen.
+            # The client uses this to keep the review overlay up and to tell
+            # the operator there is more to come, instead of treating Submit as
+            # always meaning "back to the live view".
+            "queue_depth": len(self.detection_queue),
             "labelled": sorted(self.labelled_indices),
             "awaiting_label": [
                 p["index"] for p in self.pending if p["index"] not in self.labelled_indices

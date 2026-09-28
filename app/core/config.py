@@ -118,6 +118,47 @@ class Settings:
     # Legacy processed every 2nd frame (GrabImage.py:117).
     CAMERA_FRAME_DECIMATION: int = _as_int(os.getenv("CAMERA_FRAME_DECIMATION"), 2)
 
+    # ---------------- Object tracking ----------------
+    # How long a tracked object may go undetected before its id is dropped.
+    # Measured in seconds of ACTIVE DETECTION, not wall-clock and not frames —
+    # see ObjectTracker's own clock. 0.3s reproduces what legacy's frame-count
+    # rule worked out to at the rate it actually ran (3 frames at ~10Hz).
+    #
+    # Too low and a momentary dip below the model's confidence threshold kills
+    # the track; the same object is then re-detected under a fresh id and
+    # counted as a second foreign object. Too high and a stale track can absorb
+    # a genuinely new object that arrives in the same lane.
+    TRACK_STALE_AFTER_SECONDS: float = _as_float(os.getenv("TRACK_STALE_AFTER_SECONDS"), 0.3)
+
+    # Overlap above which two boxes in one frame are treated as one object and
+    # the lower-confidence one is dropped. The model's NMS is class-wise
+    # (run_inference.py:727 offsets boxes by class before torchvision.ops.nms,
+    # the default agnostic=False), so an object it cannot decide a class for
+    # comes back as two boxes at the SAME coordinates under different classes —
+    # which reach the operator as one rectangle drawn over another, get one tap
+    # between them, and are counted as two objects.
+    DETECTION_MERGE_IOU: float = _as_float(os.getenv("DETECTION_MERGE_IOU"), 0.6)
+
+    # How far a box's edges may wander between frames and still be recognised
+    # as the same object, as a FRACTION OF THAT OBJECT'S OWN WIDTH. A fixed
+    # pixel figure cannot work for both: the model's box around a 47px stone is
+    # steady to a few pixels, while its box around a 300px object breathes by
+    # tens of pixels frame to frame, so a tolerance tight enough to keep two
+    # small objects apart loses every large one. TRACK_X_TOLERANCE_PX stays as
+    # the floor for small objects.
+    TRACK_X_TOLERANCE_PX: int = _as_int(os.getenv("TRACK_X_TOLERANCE_PX"), 10)
+    TRACK_X_TOLERANCE_RATIO: float = _as_float(os.getenv("TRACK_X_TOLERANCE_RATIO"), 0.25)
+
+    # Most detections the operator may have waiting behind the one on screen.
+    # Each queued entry holds its own full frame (1920x1200x3 = 6.9 MB), kept
+    # because every crop is cut from the frame the object was found in, so the
+    # backlog is the one thing in a scan whose memory cost grows without a
+    # natural ceiling. In normal use it cannot get near this: entries are only
+    # added during the ~1s the conveyor takes to stop, and capture is paused
+    # from then until the operator works through them. Reaching the limit means
+    # something is wrong, and is logged as such rather than silently absorbed.
+    DETECTION_QUEUE_MAX: int = _as_int(os.getenv("DETECTION_QUEUE_MAX"), 20)
+
     # ---------------- Streaming ----------------
     STREAM_FPS: int = _as_int(os.getenv("STREAM_FPS"), 20)
     STREAM_JPEG_QUALITY: int = _as_int(os.getenv("STREAM_JPEG_QUALITY"), 70)
