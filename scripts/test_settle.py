@@ -47,6 +47,17 @@ print("2. combined 3 stationary frames -> all 5 on ONE screen, queue empty")
 tops = [p["box"][1] for p in s.pending]
 assert tops == sorted(tops, reverse=True), tops
 
+# Two boxes per object: the padded one the crop is cut from, and the detection
+# as the model reported it, which is what the review overlay draws. Drawing the
+# padded box makes a 40px object look 80px wide and manufactures overlap
+# between objects that never touched.
+for p in s.pending:
+    bw = p["box"][2] - p["box"][0]
+    rw = p["raw_box"][2] - p["raw_box"][0]
+    assert round(rw) == 40, "raw_box is not the unpadded detection: %s" % rw
+    assert round(bw) == 80, "box is not padded by 20 a side: %s" % bw
+print("2b. every object carries both a padded crop box and its true box")
+
 # Submitting releases back to watching, not to another screen.
 s.resume()
 assert s.pending == [] and s.review_phase == "idle", s.review_phase
@@ -93,4 +104,13 @@ s3.resume()
 assert len(s3.pending) == 1 and s3.pending[0]["box"][0] > 800, (
     "the escaped object was not shown after the main screen: %s" % s3.pending)
 print("7. submit -> the escaped object is shown from where it was last seen")
+# Including the ones carried forward and the stop-sighting fallback, both of
+# which reach the screen by a different route than the stationary frames.
+esc = s3.pending[0]
+assert round(esc["raw_box"][2] - esc["raw_box"][0]) == 40, esc
+assert round(esc["box"][2] - esc["box"][0]) == 80, esc
+fb = s2.pending[0]
+assert round(fb["raw_box"][2] - fb["raw_box"][0]) == 40, fb
+assert round(fb["box"][2] - fb["box"][0]) == 80, fb
+print("8. escaped and fallback screens carry both boxes too")
 print("ALL SETTLE CHECKS PASSED")

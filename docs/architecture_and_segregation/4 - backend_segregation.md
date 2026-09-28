@@ -107,6 +107,33 @@ FastAPI application that the frontend talks to over HTTP and one WebSocket.
    to match a legacy page that had no equivalent anywhere in the original
    segregation — see `9 - post_remediation_session_log.md`.
 
+8. **Result sync and retry (`app/services/sync_service.py`,
+   `app/services/sync_worker.py`, `app/api/history.py`)** — posting a
+   completed scan to Qualix, through the Assurance gateway when
+   `AUTH_PROVIDER=keycloak`. `post_analysis_data` keeps legacy's three-valued
+   contract exactly, because the retry worker and the History screen both read
+   it: `'1'` delivered, `'2'` rejected and terminal, `'0'` not delivered and
+   will be retried. There are three call sites — the post-scan attempt
+   (`scan.py`), the background retry worker on its own interval, and History's
+   manual Re-sync — and all three go through this one service, so nothing
+   about delivery is decided at a call site.
+
+   Syncing never uses the operator's own credentials. It authenticates as a
+   fixed service account, because the retry worker runs unattended with nobody
+   logged in, and because an operator who signed in offline has no token to
+   reuse in the first place.
+
+   **The UI never shows why a sync failed.** History and the saved-record
+   screen show the status pill and nothing else, so `Result.sync_error` is a
+   diagnostic rather than a message. It stores the raw failure — the
+   exception's own class and text, or the HTTP status with Qualix's response
+   body — trimmed to `_MAX_ERROR_DETAIL`. The class name matters on its own:
+   `ConnectionError`, `ConnectTimeout` and `SSLError` are three different
+   faults that all read as "the POST did not go through" without it. The log
+   keeps everything in full, including the endpoint and the untrimmed body;
+   this is the copy that stays on the record once the log has rolled. See
+   `scripts/test_sync_error_detail.py`.
+
 ## Database
 
 - SQLAlchemy ORM models in `app/models/schema.py`, mapping to the legacy

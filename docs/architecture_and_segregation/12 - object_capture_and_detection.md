@@ -9,17 +9,21 @@ be failures of the same pipeline seen from different sides:
    the operator, cropped and counted more than once.
 3. **One group of objects arrived across several review screens.** Five pieces
    sitting together on the belt reached the operator as 5, then 1, then 4.
+4. **Overlapping boxes could not be tapped.** Where two objects sat close
+   together, a tap on the frozen frame could only ever reach the box drawn on
+   top, and the confirmation marks covered their neighbours.
 
 Fixing the first made the second far more visible, and fixing both left the
 third as what remained, so they are recorded together. Eight distinct defects
 were found, spanning the camera loop, the inference post-processing, the
 tracker and the review state machine. **5 objects placed, 5 reported** was the
-result after the first two; §4 covers the third.
+result after the first two; §4 covers the third. The fourth is a review-screen
+problem rather than a detection one, and is §9.
 
-Sections 1–3 are the two counting symptoms and their evidence. §4 and §5 are
-the review-screen behaviour, which is the only change here that alters what the
-operator experiences rather than only what is correct — §8.1 is how to turn it
-off without a code change.
+Sections 1–3 are the two counting symptoms and their evidence. §4, §5 and §9
+are the review-screen behaviour, which is the only part of this that alters
+what the operator experiences rather than only what is correct — §8.1 is how to
+turn the settle behaviour off without a code change.
 
 `enhancements.md` carries each change as a standalone entry describing current
 behaviour. This document is the record of what was wrong, what the evidence
@@ -534,6 +538,7 @@ out there.
 | `DETECTION_QUEUE_MAX` | `20` | Most detections that may wait behind the one on screen |
 | `DETECTION_SETTLE_SECONDS` | `1.0` | How long to let the belt stop before looking |
 | `DETECTION_SAMPLE_FRAMES` | `3` | Stationary frames combined into one review screen; 1 disables |
+| `REVIEW_JPEG_QUALITY` | `88` | Quality of the frozen review frame, which is sent at full sensor width rather than `STREAM_MAX_WIDTH` |
 
 `CAMERA_FRAME_QUEUE_SIZE` remains declared and **read nowhere**. It
 corresponds to legacy's *other* queue, the `LifoQueue(maxsize=32)` between the
@@ -588,7 +593,112 @@ spread across several review screens, arriving through `detection_queue`.
 
 ---
 
-## 9. Tests
+## 9. Reviewing what was found
+
+The boxes drawn on the frozen frame were the only way to classify an object,
+and on a touch screen they do not work.
+
+### 9.1 Why they do not work
+
+**They are smaller than a fingertip.** Foreign matter runs 40–70 sensor pixels
+across (§1). The frame is displayed stretched to fill the belt view —
+`object-fit: fill` plus `preserveAspectRatio="none"` on the overlay, matching
+legacy's QLabel exactly — and on a 16:9 panel the 16:10 sensor image is
+squashed more vertically than horizontally. A 47 px object lands under 30
+screen pixels. The usual floor for a reliable touch target is about 44.
+
+**The padding made neighbours overlap that never touched.** Every box shown was
+`enlarge_bbox(..., pad=20)`, which adds 40 px to both width and height. On a
+47 px object the drawn box is nearly double the object. Two objects 30 px apart
+produce boxes that overlap by 10 px. The padding exists to give the *saved
+crop* some margin; it was never meant to be the hit area.
+
+**A tap resolves by DOM order, not by intent.** Overlapping `<rect>` elements
+hand the tap to whichever was drawn last. There was no way to reach the one
+underneath, and nothing on screen said there was one underneath.
+
+**The confirmation marks made it worse.** A labelled box carried a green
+`✓ <type>` tag, with a compact dot fallback for small objects. The comment
+justifying that fallback asserted two tags "essentially can't collide without
+their two boxes already overlapping, which the detector itself rules out" —
+which the padding above makes false. On a cluster the tags covered each other
+and the objects.
+
+### 9.2 What the review screen does instead
+
+The frame is now the map; the controls are beside it.
+
+- **Each object is listed in its own row** in a panel where the Start/Stop
+  sidebar sits (that sidebar is hidden throughout review anyway,
+  `SHOW_SIDEBAR_DURING_FM_REVIEW = false`). A row is a full-width button with a
+  112 px minimum height, so overlap on the frame cannot affect reachability.
+  The panel **collapses to a 56 px rail**, keeping the marked-so-far count and
+  the button that brings it back. Collapsing only gives the frame more width:
+  `object-fit: fill` and `preserveAspectRatio="none"` map the whole frame onto
+  whatever space there is at any width, so nothing is ever cut off in either
+  state — only how much the picture is squeezed changes.
+- **Each row carries a magnified thumbnail of its own object**, cut from the
+  frozen frame with a canvas (`FmCrop` in `Dashboard.jsx`). Cut from the
+  *padded* box, so the object sits in context and the thumbnail is exactly what
+  the backend saves as that object's crop. Letterboxed, never stretched — the
+  belt view is distorted for legacy parity, but an operator judging shape must
+  not be.
+- **Tapping a row opens the existing FM-type picker**, the same bottom bar a
+  box tap opens. Nothing about labelling, re-labelling or Submit changed.
+- **Tapping the thumbnail itself enlarges it** in a preview overlay, with the
+  type buttons repeated and Previous/Next through the whole set. Even in the
+  panel the object is small, and deciding what something is has to be possible
+  before choosing a type for it. Same shape as `ReclassifyObjects.jsx` and
+  `ResultsViewer.jsx`'s own previews, including their backdrop-dismiss guard:
+  the backdrop covers the screen the instant it renders, so without a short
+  dead window the second tap of a double-tap closes the preview again and it
+  reads as blinking. Marking from the preview leaves it open, so Next carries
+  straight on. Each row is a `<div role="button">` containing the thumbnail's
+  `<button>` — a button inside a button is not valid HTML.
+- **The rows and the boxes share one numbering**, assigned by position in
+  `pending` — furthest down the belt first, which is the order the objects
+  entered the camera's view. The frame shows only that number; the type name is
+  in the panel, where there is room for it.
+- **Boxes stay tappable.** It is convenient for an isolated object, and nothing
+  depends on it.
+
+### 9.3 Two supporting changes
+
+**The overlay draws the detection, outset a little.** Every entry in `pending`
+carries both boxes: `box`, padded by 20 px a side, which every crop is cut
+from, and `raw_box`, the detection as the model reported it. Both are set by
+`_set_pending` in `scan_session.py`, which also replaced the duplicated
+pending-building code in `_show` and `_promote_next_detection`, and the
+unpadded box is carried through the detection queue, the escaped-object path
+and the stop-sighting fallback so all three routes to the screen have it.
+
+What is drawn is `raw_box` plus `BOX_OUTSET` (7 px, `Dashboard.jsx`), clamped
+to the frame. The padded box drawn as-is made a ~50 px object look ~90 px, so
+neighbours 30 px apart appeared to overlap; the bare detection removed the
+false overlap but sat flush against the object and read as a much smaller box
+than operators were used to. 7 px clears the object without approaching what it
+takes to collide with a neighbour.
+
+**Classic View is the default, and List View is one press away.** Classic View
+is the screen as it was before the panel: the frozen frame alone at full width,
+boxes drawn at the full padded size, and the green `✓ <type>` tag or its
+compact dot on each labelled one. `ClassicBox` in `Dashboard.jsx` is that view,
+carrying its own original reasoning in its comments — including the assumption
+§9.1 disproves. The **List View** button in the review header brings up the
+panel, which is what to reach for when objects sit too close together to tap
+apart. Either way it is a presentation switch only: the same detections, the
+same `handleLabel`, the same crops and counts.
+
+**The frozen frame is sent at full resolution.** The live stream is capped at
+`STREAM_MAX_WIDTH` (1280) at quality 70 because it pays that cost on every
+frame. The review frame is encoded once per review screen with the belt already
+stopped, and the thumbnails are cut from it, so it goes out uncapped at
+`REVIEW_JPEG_QUALITY` (88) via `encode_review` in `app/api/camera.py`. At 1280
+a 70 px object would arrive as 47 px and be magnified from there.
+
+---
+
+## 10. Tests
 
 Runnable with the service virtualenv from the backend root:
 
@@ -610,7 +720,7 @@ regression reproduces the original failure rather than an approximation of it.
 
 ---
 
-## 10. Not changed, and still open
+## 11. Not changed, and still open
 
 - **`apply_suppression_rules` judges the whole frame by `detections[0]`**
   (`inference_service.py:143`). If the first detection trips a
@@ -639,7 +749,7 @@ regression reproduces the original failure rather than an approximation of it.
 
 ---
 
-## 11. The same thing in simple words
+## 12. The same thing in simple words
 
 **The problem, in one line:** the machine was missing some pieces of foreign
 matter, and showing others to the operator more than once.
@@ -760,6 +870,59 @@ Setting both as shown above returns the machine to how it worked before.
 Everything else in this document keeps working — the counting fixes, the
 duplicate merging, the tracking. The only thing that comes back is one group of
 objects being spread over several screens.
+
+### Why tapping the boxes on screen was so hard
+
+Even with the right objects on the right screen, actually marking them was the
+next problem. **The boxes are smaller than a fingertip.** A piece of foreign
+matter is about the size of a grain of rice in a 2-megapixel photo, and by the
+time that photo is stretched across the display its box is under 30 screen
+pixels — smaller than the area a finger actually covers when it touches glass.
+
+**And the boxes were drawn bigger than the objects.** Every box had a 20-pixel
+margin added all the way round, because the picture the machine saves of each
+object needs a bit of space around it. But that margin was also being drawn on
+screen, which made each object look nearly twice its real size — so two objects
+sitting a small gap apart appeared to overlap when they never touched.
+
+**When two boxes overlap, a tap can only ever reach the top one.** There was no
+way to get at the one underneath, and nothing told you there was one underneath.
+On top of that, a marked box got a green tick and the type name written beside
+it, which on a cluster covered the neighbouring boxes and the objects
+themselves.
+
+**The fix: a list beside the picture.** Every object found is now listed down
+the right-hand side, one row each, with a **close-up of that object** blown up
+several times life size. Tapping a row opens exactly the same type buttons as
+before. The rows are numbered, and the same number appears on the frame, so you
+can always see which object on the belt a row refers to.
+
+The picture is now there to show you *where* things are. The list is how you
+mark them. Overlapping boxes stop mattering, because you are no longer aiming
+at them — and for the first time you can actually see what you are classifying
+instead of a smudge.
+
+**Tap the picture in a row and it opens up big**, with the type buttons right
+there and Previous/Next to walk through every object without going back to the
+list. It is the same enlarged view the reclassify screen and the saved-record
+screen already have.
+
+**The screen still opens the way it always did** — just the picture, the
+bigger boxes, and the green tick and type name on each one. The **List View**
+button in the top bar brings up the list of close-ups beside it, and **Classic
+View** goes back. Nothing else changes: same objects, same pictures saved, same
+counts. Reach for List View when objects are sitting too close together to tap
+apart.
+
+Two smaller things came with it. **The boxes on the frame are drawn close to
+the object's real size now**, with just a small gap around it instead of that
+20-pixel margin — so the picture is much less cluttered and objects only look
+like they are touching when they really are.
+
+And **the frozen picture you review is now sent at the camera's full
+resolution** instead of the reduced size used for the live view. It is sent
+once, with the belt already stopped, so it costs nothing while scanning and
+makes every close-up sharper.
 
 ### Two things worth knowing
 

@@ -38,7 +38,11 @@ for the hardware-QA-specific subset of this list.
    `scan_data` fields, the `analysis` array, etc.), but an actual successful
    round-trip against the real Qualix service, and a look at what a real
    rejection (`sync_status='2'`) looks like in practice, has not been
-   confirmed in this project.
+   confirmed in this project. A rejection is also the one sync failure whose
+   stored reason comes from Qualix's own response rather than from this
+   codebase, so what a real `400` body actually contains decides how useful
+   `Result.sync_error` is on a rejected row. See `_readable_qualix_error` in
+   `sync_service.py`.
 6. **Do thorough testing, likely per-commodity.** Inference correctness
    (`resolve_model`, per-commodity confidence thresholds, the suppression
    rules) was verified structurally against legacy's own logic

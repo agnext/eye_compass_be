@@ -42,13 +42,18 @@ _MAX_ERROR_DETAIL = 300
 
 
 def _readable_qualix_error(body: str) -> str:
-    """Qualix's error body, reduced to something worth showing an operator.
+    """Qualix's error body, trimmed to fit Result.sync_error.
 
-    It normally answers with {"error-code": "...", "error-message": "..."},
-    in which case the message is what matters and the code is worth keeping
-    alongside it for support to quote. Anything else (HTML from a proxy, an
-    empty body, a gateway error page) is passed through truncated rather than
-    discarded — an unhelpful message still beats "Rejected" with no reason.
+    Nothing here reaches the operator — the History list and the saved-record
+    screen show the sync status and nothing else — so this is written for
+    whoever is diagnosing a failure from the database, and keeps as much as
+    the column can hold.
+
+    Qualix normally answers with {"error-code": "...", "error-message": "..."},
+    in which case the message is lifted out and the code kept alongside it.
+    Anything else (HTML from a proxy, an empty body, a gateway error page) is
+    passed through truncated rather than summarised: an unhelpful body is
+    still evidence, and the full one is in the log either way.
     """
     import json
 
@@ -252,11 +257,13 @@ class SyncService:
 
         post_status is the legacy three-valued flag — see the module docstring.
 
-        error_detail is what actually went wrong, in Qualix's own words where
-        it gave them (e.g. 'Device does not exist'), for storing on the record
-        and showing the operator. It used to exist only in this process's log,
-        which left a "Rejected" row on the History screen with no way to find
-        out why.
+        error_detail is what actually went wrong, stored on the record as
+        Result.sync_error. It is a diagnostic, not a message: nothing shows it
+        to the operator, so it keeps the exception's own class and text, the
+        HTTP status, and whatever Qualix said, trimmed to _MAX_ERROR_DETAIL.
+        The log still has all of it in full — this is the copy that survives
+        on the record itself, so a failure can be diagnosed from the database
+        long after the log has rolled.
         """
         import json
 
@@ -321,11 +328,17 @@ class SyncService:
             return (
                 "0",
                 f"http_{response.status_code}",
-                f"HTTP {response.status_code}: {_readable_qualix_error(response.text)}",
+                f"HTTP {response.status_code}: "
+                f"{_readable_qualix_error(response.text)}"[:_MAX_ERROR_DETAIL],
             )
         except Exception as exc:
+            # Stored raw, class name included. Nothing here is shown to the
+            # operator, so this field exists for whoever is diagnosing the
+            # failure afterwards — and for that, which exception it was is the
+            # whole answer. ConnectionError, ConnectTimeout and SSLError all
+            # read as "the POST did not go through" without it.
             logger.error("Qualix POST failed: %s (%s)", exc, self.analysis_post_uri)
-            return "0", "exception", f"Could not reach Qualix: {exc}"
+            return "0", "exception", f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_DETAIL]
 
     def _post_analysis(self, body: str, attempt: int):
         """Send the payload and log what came back.

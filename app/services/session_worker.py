@@ -314,13 +314,24 @@ def _run_one_cycle() -> dict:
 
 
 def _flag_offline_sessions_if_back_online(summary: dict):
-    """Ask offline-signed-in operators to sign in again, once there is a network.
+    """Invite offline-signed-in operators to sign in again, once there is a network.
 
     Their session has no refresh token, so it can never be confirmed silently.
-    Rather than let it run forever unchecked, prompt for one re-login the first
+    Rather than let it run forever unchecked, invite one re-login the first
     time Keycloak is actually reachable. The reachability probe is only made
     when such a session exists, so a fleet of normally-online devices never
     makes this call at all.
+
+    This is suggest_relogin, the soft banner, NOT flag_needs_relogin — nothing
+    here says the account is bad. The operator signed in with a correct
+    password; the device simply had no way to confirm it against Keycloak at
+    that moment. Being back online is not evidence of anything wrong, so this
+    must not block them the way a genuine rejection does. A previous version
+    of this function called flag_needs_relogin by mistake, which meant an
+    operator who had done nothing wrong got the hard "you must sign in again"
+    dialog purely for having logged in while offline — indistinguishable, from
+    the operator's side, from an actual rejected account. See
+    enhancements.md.
     """
     pending = session_store.unverifiable_sessions()
     if not pending:
@@ -337,11 +348,12 @@ def _flag_offline_sessions_if_back_online(summary: dict):
     for session in pending:
         logger.info(
             "[REVALIDATE] %s signed in offline (mode=%s) and Keycloak is reachable "
-            "again — asking them to sign in once at the Home screen so the account "
-            "can actually be checked.",
+            "again — inviting them to sign in once at the Home screen so the "
+            "account can actually be checked. Nothing wrong is known about "
+            "them; this is a dismissible banner, not a block.",
             session["username"], session["mode"],
         )
-        session_store.flag_needs_relogin(
+        session_store.suggest_relogin(
             session["token"],
             reason="signed in offline and Keycloak is reachable again, so the account can now be checked",
         )

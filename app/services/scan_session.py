@@ -710,16 +710,23 @@ class ScanSession:
                 track_id = assignment[i] if i < len(assignment) else None
                 if track_id is not None and track_id in self.counted_track_ids:
                     continue
-                candidates.append((track_id, box))
+                # The padded box travels together with the unpadded
+                # detection it came from. Padding exists to give the saved
+                # crop some margin (see enlarge_bbox above); drawn on screen
+                # it makes every object look 40px wider and taller than it
+                # is, which is enough to make two separate objects overlap on
+                # the review screen when they never touched on the belt. The
+                # review screen draws `raw`; crops are still cut from `box`.
+                candidates.append((track_id, box, detections[i]))
 
             # Geometry is now only a backstop, for the two cases an id cannot
             # cover: a detection the tracker refused to track at all (it gives
             # no id to anything against the left edge), and an object whose
             # track was dropped and re-minted, which arrives wearing an id
             # nobody has seen before.
-            novel = self._novel_boxes([box for _, box in candidates])
+            novel = self._novel_boxes([box for _, box, _ in candidates])
             keep = {id(box) for box in novel}
-            candidates = [(t, b) for t, b in candidates if id(b) in keep]
+            candidates = [(t, b, r) for t, b, r in candidates if id(b) in keep]
 
             # Nothing new is accepted while the backlog is at its limit. The
             # objects behind it are deliberately NOT marked as counted, so they
@@ -756,7 +763,8 @@ class ScanSession:
                 # and come back to it once it has actually stopped.
                 self._trigger = {
                     "frame": frame.copy(),
-                    "boxes": [list(box) for _, box in candidates],
+                    "boxes": [list(box) for _, box, _ in candidates],
+                    "raw_boxes": [list(raw) for _, _, raw in candidates],
                 }
                 csc = self.conveyor_stop_count
                 csc["fm_count"] += 1
@@ -786,13 +794,17 @@ class ScanSession:
             fm_detected = False
             if candidates:
                 fm_detected = True
-                self._on_foreign_matter(frame, [box for _, box in candidates])
+                self._on_foreign_matter(
+                    frame,
+                    [box for _, box, _ in candidates],
+                    [raw for _, _, raw in candidates],
+                )
                 # Only objects actually put in front of the operator count
                 # toward total_fo_detected — see counted_track_ids' comment
                 # above — and recording them here is also what stops each of
                 # them being shown again.
                 self.counted_track_ids.update(
-                    t for t, _ in candidates if t is not None
+                    t for t, _, _ in candidates if t is not None
                 )
             elif new_ids:
                 logger.info(
@@ -833,6 +845,7 @@ class ScanSession:
             self._escaped[obj_id] = {
                 "frame": frame.copy(),
                 "box": enlarge_bbox(box, pad=20, img_w=w, img_h=h),
+                "raw_box": list(box),
             }
             logger.warning(
                 "Object %s left the frame while the belt was still stopping — "
@@ -852,7 +865,9 @@ class ScanSession:
         escaped, self._escaped = self._escaped, {}
         for obj_id, item in escaped.items():
             self.detection_queue.append({
-                "frame": item["frame"], "boxes": [item["box"]],
+                "frame": item["frame"],
+                "boxes": [item["box"]],
+                "raw_boxes": [item["raw_box"]],
             })
             self.counted_track_ids.add(obj_id)
         if escaped:
@@ -898,7 +913,8 @@ class ScanSession:
                 "stopped — falling back to the %s box(es) that triggered it.",
                 len(samples), len(trigger["boxes"]),
             )
-            self._show(trigger["frame"], trigger["boxes"])
+            self._show(trigger["frame"], trigger["boxes"],
+                       trigger.get("raw_boxes"))
             return
 
         if not combined:
@@ -917,12 +933,14 @@ class ScanSession:
         self.tracker.update(combined, self.frame_count, (h, w))
         assignment = self.tracker.last_assignment
         boxes = []
+        raw_boxes = []
         shown_ids = []
         for i, det in enumerate(combined):
             track_id = assignment[i] if i < len(assignment) else None
             if track_id is not None and track_id in self.counted_track_ids:
                 continue
             boxes.append(enlarge_bbox(det, pad=20, img_w=w, img_h=h))
+            raw_boxes.append(list(det))
             shown_ids.append(track_id)
 
         if not boxes:
@@ -940,7 +958,7 @@ class ScanSession:
         )
         self.counted_track_ids.update(t for t in shown_ids if t is not None)
         self.existing_track_ids.update(self.tracker.get_tracked_objects().keys())
-        self._show(frame, boxes)
+        self._show(frame, boxes, raw_boxes)
 
     def _release(self):
         """Nothing to review after all — hand the belt back without a screen."""
@@ -948,7 +966,45 @@ class ScanSession:
         self._escaped = {}
         conveyor_service.unlock_machine_start(reason="nothing to review")
 
-    def _show(self, frame: np.ndarray, boxes: List):
+    def _set_pending(self, boxes: List, raw_boxes: Optional[List] = None):
+        """Turn one set of boxes into the numbered list the operator reviews.
+
+        Ordered by how far each object has travelled down the belt, furthest
+        first. Within one frozen frame every box was found at the same
+        instant, so there is no "found first" among them — but the one
+        furthest along entered the camera's view earliest, which is the same
+        order the operator watched them arrive in. Left alone, the order is
+        whatever the model's NMS emitted, which is by confidence: the numbers
+        on the crops would then follow how sure the model was rather than
+        anything the operator can see, and the reclassify gallery lists
+        unlabelled crops in exactly this order.
+
+        Each entry carries two boxes. `box` is padded and is what every crop
+        is cut from — label_detection, save_unselected and the review panel's
+        thumbnails all read it. `raw_box` is the detection as the model
+        reported it, and is what the overlay draws, so two objects only look
+        like they overlap on screen when they genuinely do on the belt.
+        """
+        if not raw_boxes or len(raw_boxes) != len(boxes):
+            raw_boxes = boxes
+        pairs = sorted(
+            zip(boxes, raw_boxes),
+            key=lambda pair: (pair[0][1] + pair[0][3]) / 2.0,
+            reverse=True,
+        )
+        self.pending = []
+        for box, raw in pairs:
+            self.pending.append({
+                "index": self._next_pending_index,
+                "box": [float(v) for v in box[:4]],
+                "raw_box": [float(v) for v in raw[:4]],
+                "confidence": float(box[4]) if len(box) > 4 else None,
+                "class_id": int(box[5]) if len(box) > 5 else None,
+            })
+            self._next_pending_index += 1
+
+    def _show(self, frame: np.ndarray, boxes: List,
+              raw_boxes: Optional[List] = None):
         """Put one set of boxes on the review screen and freeze the stream.
 
         The belt is already stopped by the time this runs, so capture is paused
@@ -956,16 +1012,7 @@ class ScanSession:
         show the operator a second of live feed over the frame they are meant
         to be reviewing.
         """
-        boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2.0, reverse=True)
-        self.pending = []
-        for box in boxes:
-            self.pending.append({
-                "index": self._next_pending_index,
-                "box": [float(v) for v in box[:4]],
-                "confidence": float(box[4]) if len(box) > 4 else None,
-                "class_id": int(box[5]) if len(box) > 5 else None,
-            })
-            self._next_pending_index += 1
+        self._set_pending(boxes, raw_boxes)
         self.pending_frame = frame
         self.frozen_frame_seq += 1
         self.labelled_indices = set()
@@ -978,7 +1025,8 @@ class ScanSession:
             len(boxes), len(self.detection_queue),
         )
 
-    def _on_foreign_matter(self, frame: np.ndarray, boxes: List):
+    def _on_foreign_matter(self, frame: np.ndarray, boxes: List,
+                           raw_boxes: Optional[List] = None):
         """Queue one detection, and put it on screen if nothing else is there.
 
         Port of handle_detection's enqueue step (main.py:2581): finding
@@ -990,6 +1038,7 @@ class ScanSession:
         self.detection_queue.append({
             "frame": frame.copy(),
             "boxes": [list(box) for box in boxes],
+            "raw_boxes": [list(box) for box in (raw_boxes or boxes)],
         })
         # One raw frame per detection, queued or not — this is what
         # update_fm_count reports as "Frame Count".
@@ -1027,6 +1076,7 @@ class ScanSession:
 
         item = self.detection_queue.pop(0)
         boxes = item["boxes"]
+        raw_boxes = item.get("raw_boxes")
 
         csc = self.conveyor_stop_count
         csc["fm_count"] += 1
@@ -1037,26 +1087,7 @@ class ScanSession:
         conveyor_service.lock_machine_start(reason="FM_detected")
         conveyor_service.send("FM_detected")
 
-        # Ordered by how far each object has travelled down the belt, furthest
-        # first. Within one frozen frame every box was found at the same
-        # instant, so there is no "found first" among them — but the one
-        # furthest along entered the camera's view earliest, which is the same
-        # order the operator watched them arrive in. Left alone, the order is
-        # whatever the model's NMS emitted, which is by confidence: the numbers
-        # on the crops would then follow how sure the model was rather than
-        # anything the operator can see, and the reclassify gallery lists
-        # unlabelled crops in exactly this order.
-        boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2.0, reverse=True)
-
-        self.pending = []
-        for box in boxes:
-            self.pending.append({
-                "index": self._next_pending_index,
-                "box": [float(v) for v in box[:4]],
-                "confidence": float(box[4]) if len(box) > 4 else None,
-                "class_id": int(box[5]) if len(box) > 5 else None,
-            })
-            self._next_pending_index += 1
+        self._set_pending(boxes, raw_boxes)
         # Temporary diagnostic for the count-vs-visible-boxes discrepancy
         # (confirmed NOT a cropping issue — object-fit: fill already shows the
         # whole frame). Logging raw coordinates so the next occurrence shows

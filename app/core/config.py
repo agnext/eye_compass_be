@@ -178,6 +178,13 @@ class Settings:
     STREAM_FPS: int = _as_int(os.getenv("STREAM_FPS"), 20)
     STREAM_JPEG_QUALITY: int = _as_int(os.getenv("STREAM_JPEG_QUALITY"), 70)
     STREAM_MAX_WIDTH: int = _as_int(os.getenv("STREAM_MAX_WIDTH"), 1280)
+    # The frozen frame the operator reviews is encoded on its own terms: full
+    # sensor width, higher quality. It goes out once per review screen with
+    # the belt already stopped, so the per-frame cost the two settings above
+    # exist to control does not apply to it — and the review panel cuts its
+    # thumbnails straight out of this image, so anything lost here is lost
+    # from the picture the operator classifies from.
+    REVIEW_JPEG_QUALITY: int = _as_int(os.getenv("REVIEW_JPEG_QUALITY"), 88)
 
     # ---------------- Serial / conveyor ----------------
     SERIAL_PORT: str = _env("EYE_COMPASS_SERIAL_PORT", "SERIAL_PORT", default="")

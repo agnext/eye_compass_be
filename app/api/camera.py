@@ -225,6 +225,23 @@ async def camera_stream(websocket: WebSocket):
             return None
         return base64.b64encode(buf).decode("utf-8"), int(out.shape[1]), int(out.shape[0])
 
+    def encode_review(img):
+        """The frozen review frame — full resolution, no width cap.
+
+        Everything else goes through encode_display, which caps at
+        STREAM_MAX_WIDTH to keep the live stream affordable. This one is
+        encoded once per review screen, with the belt already stopped, and the
+        review panel cuts each object's thumbnail straight out of it on the
+        client. Capped at 1280 a ~70px object would arrive as ~47px and be
+        magnified from there; at full width it is the real thing.
+        """
+        ok, buf = cv2.imencode(
+            ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, settings.REVIEW_JPEG_QUALITY])
+        if not ok:
+            return None
+        return (base64.b64encode(buf).decode("utf-8"),
+                int(img.shape[1]), int(img.shape[0]))
+
     try:
         while True:
             # Port of cam_thread.capture_paused (GrabImage.py:95): while a
@@ -241,7 +258,7 @@ async def camera_stream(websocket: WebSocket):
                 if sent_frozen_seq != frozen_seq:
                     frozen = scan_session.pending_frame
                     if frozen is not None:
-                        enc = await loop.run_in_executor(None, encode_display, frozen)
+                        enc = await loop.run_in_executor(None, encode_review, frozen)
                         if enc:
                             b64, disp_w, disp_h = enc
                             payload.update({

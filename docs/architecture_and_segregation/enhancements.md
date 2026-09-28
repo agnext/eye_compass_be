@@ -1222,6 +1222,128 @@ deliberately still open.
   rejecting, so the `.catch()` that was there never ran and a rejected prepare
   was indistinguishable from an accepted one.
 
+- **Foreign matter is classified from a list of magnified crops beside the
+  frozen frame, not by tapping the boxes on it.** A detected object is 40–70
+  sensor pixels; the frame is displayed stretched to fill the belt view for
+  legacy QLabel parity, which on a 16:9 panel squashes the 16:10 image
+  vertically and leaves a box under 30 screen pixels — below the ~44 px floor
+  for a reliable touch target before any overlap. Where two boxes did overlap,
+  a tap resolved to whichever `<rect>` was drawn last, so the one underneath
+  could not be reached at all, and the green `✓ <type>` tag drawn beside a
+  labelled box covered its neighbours.
+
+  Every object found now gets a row in a panel where the Start/Stop sidebar
+  sits during normal scanning (that sidebar is hidden throughout review
+  anyway). Each row is a full-width button at least 112 px tall carrying a
+  magnified thumbnail of its own object, cut from the frozen frame with a
+  canvas — from the *padded* box, so the object sits in context and the
+  thumbnail is exactly what the backend saves as that object's crop, and
+  letterboxed rather than stretched, since an operator judging an object by its
+  shape must not be shown a distorted one. Tapping a row opens the same FM-type
+  picker a box tap opens; labelling, re-labelling and Submit are unchanged.
+  Tapping the thumbnail itself enlarges it instead, in a preview overlay with
+  the type buttons repeated and Previous/Next through the whole set — the same
+  shape as `ReclassifyObjects.jsx` and `ResultsViewer.jsx`'s previews, down to
+  their backdrop-dismiss dead window, without which the second tap of a
+  double-tap lands on the freshly rendered backdrop and closes the preview
+  again. Marking from the preview leaves it open so Next carries straight on.
+  The panel collapses to a 56 px rail, keeping the marked-so-far count and the
+  button that reopens it; that only gives the frame more width, since
+  `object-fit: fill` and `preserveAspectRatio="none"` show the whole frame at
+  any width and never crop it. Rows and boxes share one numbering, by position
+  in `pending` — furthest down the belt first. The frame carries only that number now; the type name lives
+  in the panel, where there is room for it. Boxes remain tappable, which suits
+  an isolated object, but nothing depends on it. Legacy had no equivalent of
+  any of this: it had the boxes and nothing else. The crop-gallery shape
+  matches the reclassify screen, which operators already use.
+
+  **Classic View — the screen as it was before this panel — is the default**,
+  on request: the frozen frame alone at full width, boxes at the full padded
+  size, and the green `✓ <type>` tag or its compact dot on each labelled one.
+  `ClassicBox` in `Dashboard.jsx` is that view, keeping its own original
+  reasoning in its comments, including the tag-collision assumption the padding
+  disproves. The **List View** button in the review header brings the panel up
+  and **Classic View** goes back. It is a presentation switch only: same
+  detections, same `handleLabel`, same crops and counts.
+
+- **Each pending detection carries both a padded and an unpadded box.**
+  `pending[].box` is padded by 20 px a side and is what every crop is cut from;
+  `pending[].raw_box` is the detection as the model reported it. The overlay
+  draws `raw_box` outset by `BOX_OUTSET` (7 px, `Dashboard.jsx`) and clamped to
+  the frame. Drawing the padded box added 40 px to an object's width and
+  height, so two objects 30 px apart produced boxes overlapping by 10 px — the
+  display manufactured overlap that was not on the belt; drawing the bare
+  detection removed that but sat flush against the object and read as a much
+  smaller box than before. Both boxes are set by
+  `_set_pending` in `scan_session.py`, which also replaced the duplicated
+  pending-building code in `_show` and `_promote_next_detection`, and the
+  unpadded box is carried through the detection queue, the escaped-object path
+  and the stop-sighting fallback so all three routes to the screen have it.
+
+- **The frozen review frame is sent at full sensor resolution.** The live
+  stream is capped at `STREAM_MAX_WIDTH` (1280) at quality 70 because it pays
+  that cost on every frame. The review frame is encoded once per review screen
+  with the belt already stopped, and the panel's thumbnails are cut from it, so
+  it goes out uncapped at `REVIEW_JPEG_QUALITY` (default 88). Capped at 1280 a
+  70 px object arrived as 47 px and was magnified from there.
+
+- **Every dropdown on the New Batch form uses the app's own `CustomSelect`.**
+  Vendor Name, Product Name, Product Code, Brand and Sorter Name were native
+  `<select>` elements, so their popup was drawn by the browser rather than the
+  page — a different list, a different scrollbar and a different touch target
+  from the identical-looking dropdowns on the reclassify and saved-record
+  screens, which already used `CustomSelect`. The trigger is styled to match
+  the text inputs beside it on this form, since the component's own defaults
+  are sized for the compact controls on those other screens.
+
+  `CustomSelect` now accepts `{ value, label }` options as well as plain
+  strings. Product Code needed it: the batch stores a `variety_code` and the
+  operator reads a `variety_name`. Dropping the native elements costs nothing
+  in validation — `handleStartBatch` already checks every required field in
+  one pass over `REQUIRED_FIELDS` and reports all the missing ones together,
+  rather than relying on the browser stopping at the first `required`.
+
+- **Why a sync failed is not shown in the UI at all.** History and the
+  saved-record screen show the status pill (`Synced` / `Rejected` / `Pending`)
+  and nothing else. `Result.sync_error` used to be printed verbatim on both,
+  which put a urllib3 connection pool, the full gateway URL and `[Errno -3]
+  Temporary failure in name resolution` in a table cell whenever the device
+  simply had no network.
+
+  The column itself remains, and holds the **raw** failure: the exception's
+  own class and text (`ConnectionError: HTTPSConnectionPool(...)`), or the
+  HTTP status alongside Qualix's response body, trimmed to
+  `_MAX_ERROR_DETAIL`. It is a diagnostic, read from the database by whoever
+  is working out what went wrong, so it keeps the evidence rather than
+  summarising it — and the class name is a load-bearing part of that, since
+  `ConnectionError`, `ConnectTimeout` and `SSLError` are three different
+  faults that all read as "the POST did not go through" without it. A 400
+  rejection still lifts out Qualix's `error-message` and code, because that
+  names what about the scan was wrong. The log keeps everything in full;
+  `sync_error` is the copy that survives on the record once the log has
+  rolled. `scripts/test_sync_error_detail.py` covers every branch.
+
+- **A back-online offline login no longer gets the forced re-login dialog.**
+  When an operator signs in while the device has no route to Keycloak, that
+  session is confirmed against nothing but the locally cached password hash.
+  The design was always that this must cost the operator nothing once the
+  network returns — `session_worker.py`'s own module docstring says a local
+  session is "deliberately self-sufficient" and the account is checked
+  silently whenever possible, never by punishing the operator for having been
+  offline.
+
+  `_flag_offline_sessions_if_back_online` was calling `flag_needs_relogin` —
+  the hard, blocking "you must sign in again" dialog, meant only for an
+  account Keycloak has actually refused (disabled, deleted, password
+  changed) — the moment Keycloak became reachable again, for every session
+  that had signed in offline. Nothing about reconnecting is evidence the
+  account is bad, so an operator with a perfectly correct password hit the
+  same dialog as someone actually locked out, with no way to tell the two
+  apart. It now calls `suggest_relogin`, the dismissible Home-screen banner
+  that function was written for, matching what `SessionStore.suggest_relogin`
+  and the module's own docstring already described: "nothing is wrong if
+  they carry on for now." See `scripts/test_offline_reconnect_relogin.py`.
+
 ## Suggested future enhancements
 
 These are not yet built. Some originate from open questions raised during
