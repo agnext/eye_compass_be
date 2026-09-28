@@ -159,6 +159,21 @@ class Settings:
     # something is wrong, and is logged as such rather than silently absorbed.
     DETECTION_QUEUE_MAX: int = _as_int(os.getenv("DETECTION_QUEUE_MAX"), 20)
 
+    # How long to let the conveyor decelerate after the first sighting, before
+    # the frames that make up the review screen are taken. Nothing is shown and
+    # nothing is counted during this window — it exists so the objects are
+    # stationary when they are finally looked at.
+    DETECTION_SETTLE_SECONDS: float = _as_float(os.getenv("DETECTION_SETTLE_SECONDS"), 1.0)
+
+    # How many stationary frames to combine into one review screen. The model's
+    # output is not the same from frame to frame — an object at 0.15 confidence
+    # is found in one frame and missed in the next — so a single frame shows
+    # whatever happened to be found in that one instant, and the rest arrive
+    # afterwards as separate detections. Combining a few frames of a stopped
+    # belt cancels that flicker, and the boxes can share one image precisely
+    # because nothing is moving. 1 disables the behaviour.
+    DETECTION_SAMPLE_FRAMES: int = _as_int(os.getenv("DETECTION_SAMPLE_FRAMES"), 3)
+
     # ---------------- Streaming ----------------
     STREAM_FPS: int = _as_int(os.getenv("STREAM_FPS"), 20)
     STREAM_JPEG_QUALITY: int = _as_int(os.getenv("STREAM_JPEG_QUALITY"), 70)

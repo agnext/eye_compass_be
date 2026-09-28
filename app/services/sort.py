@@ -38,6 +38,11 @@ class ObjectTracker:
         # without the material moving, this is the record of why. Diagnostic
         # only; nothing branches on it.
         self.last_evicted = {}
+        # {object_id: bbox} for those same ids, as they were last seen. An
+        # object dropped by the exit rule was still in frame on the update that
+        # dropped it, so this is a usable last known position for something
+        # that has now left the camera's view — the only record of it there is.
+        self.last_evicted_boxes = {}
         # Which track id each detection of the most recent update() was given,
         # parallel to the detections list (None for a detection that was not
         # tracked at all). This is the only place identity actually lives — the
@@ -182,7 +187,9 @@ class ObjectTracker:
         height, width = frame_size
         survivors = {}
         evicted = {}
+        dropped = {}
         for obj_id, obj_data in self.tracked_objects.items():
+            dropped[obj_id] = obj_data.get("bbox")
             unseen_for = clock - obj_data['seen_at']
             if unseen_for > self.stale_after_seconds:
                 evicted[obj_id] = "unseen(%.2fs)" % unseen_for
@@ -196,6 +203,11 @@ class ObjectTracker:
                 survivors[obj_id] = obj_data
         self.tracked_objects = survivors
         self.last_evicted = evicted
+        self.last_evicted_boxes = {
+            obj_id: self.tracked_objects.get(obj_id, {}).get("bbox")
+            or dropped[obj_id]
+            for obj_id in evicted
+        }
 
     def get_tracked_objects(self):
         return self.tracked_objects

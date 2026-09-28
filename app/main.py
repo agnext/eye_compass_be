@@ -260,8 +260,13 @@ async def lifespan(app: FastAPI):
                 logger.warning("Shutdown all_stop failed: %s", exc)
 
         from app.api.camera import shutdown_camera_services
+        from app.services.scan_session import scan_session
 
         shutdown_camera_services()
+        # Before the interpreter goes away: the raw-frame writer is a daemon
+        # thread, and one killed inside cv2.imencode aborts the process on the
+        # way out.
+        scan_session.stop_raw_frame_writer()
 
         logger.info("Eye Compass API shut down cleanly")
 

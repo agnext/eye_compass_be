@@ -1,17 +1,25 @@
 # 12. Object Capture and Detection — 24–28 September 2026
 
-Two symptoms were reported against the live-scan flow, and they turned out to
-be opposite failures of the same pipeline:
+Three symptoms were reported against the live-scan flow, and they turned out to
+be failures of the same pipeline seen from different sides:
 
 1. **Objects were being missed.** Placing two pieces of foreign matter close
    together on the belt reliably lost the second one.
 2. **Objects were being counted twice.** A single object was put in front of
    the operator, cropped and counted more than once.
+3. **One group of objects arrived across several review screens.** Five pieces
+   sitting together on the belt reached the operator as 5, then 1, then 4.
 
-Fixing the first made the second far more visible, so they are recorded
-together. Six distinct defects were found, spanning the camera loop, the
-inference post-processing, the tracker and the review state machine. The
-final test after all of them: **5 objects placed, 5 reported.**
+Fixing the first made the second far more visible, and fixing both left the
+third as what remained, so they are recorded together. Eight distinct defects
+were found, spanning the camera loop, the inference post-processing, the
+tracker and the review state machine. **5 objects placed, 5 reported** was the
+result after the first two; §4 covers the third.
+
+Sections 1–3 are the two counting symptoms and their evidence. §4 and §5 are
+the review-screen behaviour, which is the only change here that alters what the
+operator experiences rather than only what is correct — §8.1 is how to turn it
+off without a code change.
 
 `enhancements.md` carries each change as a standalone entry describing current
 behaviour. This document is the record of what was wrong, what the evidence
@@ -370,7 +378,104 @@ discarded, which is the defect this whole thread started with.
 
 ---
 
-## 4. Track staleness is measured in time, not frames
+## 4. Stop the belt, let it settle, then look
+
+A detection used to be a snapshot of the single frame something was first
+spotted in. Two things make that the wrong frame to review:
+
+- The belt takes about a second to stop, so the objects are still moving in it.
+- **The model does not find the same set in every frame.** Much of what this
+  machine detects sits at 0.11–0.35 confidence, and an object found in one
+  frame is missed in the next. A single frame shows whatever happened to be
+  found in that one instant.
+
+Caught on 28 September with five objects sitting together on the belt:
+
+```
+16:36:53.514   5 box(es) on screen
+16:36:53.660   1 more found, queued behind it      (146 ms later)
+16:36:54.002   4 more found, queued behind it      (342 ms later)
+```
+
+Nothing was lost — the backlog carried them — but the operator met one group of
+objects across three screens.
+
+`review_phase` now runs a cycle. On the first sighting the interlock goes on and
+`FM_detected` is sent immediately, but **nothing is shown and nothing is
+counted**; the scan enters `settling` for `DETECTION_SETTLE_SECONDS`. Once that
+elapses it collects `DETECTION_SAMPLE_FRAMES` frames of the now-stationary belt,
+`_merge_overlapping_detections` collapses the repeats across them, and the
+result goes on one screen using the newest sample as the image.
+
+Combining across frames is sound **only** because the belt is stopped: boxes
+measured in different frames then describe the same positions, which is exactly
+what is not true during the deceleration. Using the newest sample as the image
+means every crop is cut from a frame its box genuinely belongs to.
+
+Two fallbacks, because a missed object is not recoverable and a spurious box is:
+
+- If the stationary frames find nothing, the sighting that stopped the belt is
+  shown instead of being dropped.
+- If everything found has already been reviewed, the interlock is released
+  rather than leaving the operator on a frozen screen with no boxes.
+
+**One thing this cycle can lose, and what catches it.** An object that is on
+the belt when the stop is commanded but travels out of the bottom of the frame
+before the belt is stationary cannot appear in any of the sample frames. The
+old behaviour caught it, because it froze the frame the object was seen in.
+`_note_escapes` covers that case: the tracker's exit rule drops a track once it
+reaches the bottom of the frame, and it was still in view on the update that
+dropped it, so `ObjectTracker.last_evicted_boxes` holds a box that belongs to
+the frame being processed right then. That pairing — a box and an image that
+match — is kept for any id that has never been shown, and `_queue_escapes`
+puts it behind the main screen. It is marked counted at that point rather than
+when shown, because nothing will detect it again.
+
+This is deliberately narrow. Only the exit rule counts, not a track lost to
+staleness: an object that merely stopped being recognised for a few frames is
+still physically there and will be in the stationary frames.
+
+`detection_queue` survives as a safety net and should now always read 0 — a
+sighting is resolved into one screen before capture pauses, so nothing reaches
+it in ordinary running. `scripts/test_queue.py` drives it directly for that
+reason; `scripts/test_settle.py` covers the normal path.
+
+A related fix fell out of this. `process_frame` used to return early on a frame
+with no detections, which meant such a frame never reached the tracker — so an
+object that vanished completely stopped the staleness clock and its id lived
+forever. Empty frames now flow through.
+
+## 5. Writing the raw frame was costing more than the inference
+
+`save_raw_frame` writes a full-resolution quality-95 JPEG, and it ran inline
+inside `process_frame` — the detection loop. Measured on this device:
+
+| | Time |
+|---|---|
+| TensorRT predict | 23.4 ms |
+| **save_raw_frame (2.7 MB on disk)** | **52.0 ms** |
+| Display encode | 24.6 ms |
+
+More than twice the inference, blocking the next frame, on every detection.
+The effect is worst exactly where it hurts most: during a burst of detections,
+successive events in the log were landing ~150 ms apart — about **7 fps**
+against a 42.8 fps ceiling — which is a large part of why one group of objects
+was being split across screens.
+
+The encode and write now happen on a single background thread. The frame number
+is still assigned on the detection loop so files stay numbered by capture order
+rather than by whichever write finished first, and `flush_raw_frames()` waits
+for the backlog before anything counts those files (`update_fm_count`) or moves
+them (`cancel`). `stop_raw_frame_writer()` retires the thread on shutdown, and
+is also registered with `atexit` — a daemon thread killed inside `cv2.imencode`
+aborts the interpreter, which reads as a crash in the journal.
+
+The stream loop also logs the measured detection rate every 10 s
+(`Detection rate: N fps`), so this no longer has to be inferred from timestamps.
+
+---
+
+## 6. Track staleness is measured in time, not frames
 
 Legacy's `_remove_stale_objects` carried two frame counters, `max_age=9` and
 `max_misses=2`. Both measure the same quantity — a track's `frame` is
@@ -397,7 +502,7 @@ explicitly once the unit changed.
 
 ---
 
-## 5. Diagnostics added
+## 7. Diagnostics added
 
 These stay in place; they are how any recurrence gets diagnosed without
 guesswork.
@@ -415,7 +520,7 @@ guesswork.
 
 ---
 
-## 6. Settings introduced
+## 8. Settings, and how to turn the new behaviour off
 
 All default to current behaviour; all are documented in `.env` and commented
 out there.
@@ -427,15 +532,63 @@ out there.
 | `TRACK_X_TOLERANCE_RATIO` | `0.25` | The same tolerance as a fraction of the object's own width |
 | `DETECTION_MERGE_IOU` | `0.6` | Overlap above which two boxes in one frame are treated as one object |
 | `DETECTION_QUEUE_MAX` | `20` | Most detections that may wait behind the one on screen |
+| `DETECTION_SETTLE_SECONDS` | `1.0` | How long to let the belt stop before looking |
+| `DETECTION_SAMPLE_FRAMES` | `3` | Stationary frames combined into one review screen; 1 disables |
 
 `CAMERA_FRAME_QUEUE_SIZE` remains declared and **read nowhere**. It
 corresponds to legacy's *other* queue, the `LifoQueue(maxsize=32)` between the
 camera thread and the inference thread (`GrabImage.py:85`); this port grabs and
 infers in one loop and has no equivalent.
 
+### 8.1 The two switches behind "stop, settle, then look"
+
+Section 4's behaviour is the one worth being able to back out of a device
+without a code change, because it is the only change here that alters what the
+operator experiences rather than just what is correct. Both settings live in
+`eye_compass_be/.env` and take effect on a service restart.
+
+**`DETECTION_SETTLE_SECONDS`** (default `1.0`) — how long to wait, after the
+belt has been told to stop, before taking the frames the review screen is built
+from. It exists because the conveyor does not stop instantly: at the measured
+1550 px/s it is still carrying objects for most of that second, and frames taken
+during it show objects in positions they will not be in when the operator looks.
+
+- Raise it if the belt is slower to stop than a second, which shows up as boxes
+  that do not sit on the objects in the frozen image.
+- Lower it to make the review screen appear sooner. Too low and the belt is
+  still moving when the frames are taken, which is the problem it exists to
+  solve.
+- `0` takes the frames immediately. Combined with `DETECTION_SAMPLE_FRAMES=1`
+  this is the old freeze-the-first-frame behaviour.
+
+**`DETECTION_SAMPLE_FRAMES`** (default `3`) — how many frames of the stopped
+belt to combine into one review screen. It exists because the model does not
+return the same set of objects in every frame: much of what this machine detects
+sits at 0.11–0.35 confidence, so an object found in one frame is missed in the
+next. One frame shows whatever happened to be found in that instant, and the
+rest arrive afterwards as separate detections — which is how five objects
+sitting together reached the operator as 5, then 1, then 4.
+
+- Raise it if objects are still arriving on separate screens. Each extra frame
+  costs about 50 ms of settle time and one more inference pass.
+- **`1` disables the combining**, so the review screen carries whatever a single
+  frame contained. That is the behaviour this section replaced.
+
+To return a device to the pre-existing behaviour entirely:
+
+```
+DETECTION_SETTLE_SECONDS=0
+DETECTION_SAMPLE_FRAMES=1
+```
+
+Nothing else needs changing, and no other fix in this document is affected —
+the identity filtering, the duplicate merging and the tracker changes all
+continue to apply. What comes back is the old symptom: one group of objects
+spread across several review screens, arriving through `detection_queue`.
+
 ---
 
-## 7. Tests
+## 9. Tests
 
 Runnable with the service virtualenv from the backend root:
 
@@ -450,13 +603,14 @@ Runnable with the service virtualenv from the backend root:
 | `test_queue.py` | The four states of the review screen: first detection shown, second queued behind it, Submit promoting while staying frozen and interlocked, Submit on an empty queue restoring the live view |
 | `test_merge.py` | Both live class-confusion pairs merged, genuinely adjacent objects kept separate |
 | `test_identity.py` | An already-reviewed object not shown again when a different object arrives; a left-edge object reported once and not again |
+| `test_settle.py` | Nothing shown until the belt has stopped; three stationary frames finding different subsets combined into one screen carrying all five objects; fallback when the stationary frames find nothing; an object leaving the view mid-stop held and shown afterwards; raw frames written off the loop |
 
 Several assert against coordinates taken verbatim from production logs, so a
 regression reproduces the original failure rather than an approximation of it.
 
 ---
 
-## 8. Not changed, and still open
+## 10. Not changed, and still open
 
 - **`apply_suppression_rules` judges the whole frame by `detections[0]`**
   (`inference_service.py:143`). If the first detection trips a
@@ -485,7 +639,7 @@ regression reproduces the original failure rather than an approximation of it.
 
 ---
 
-## 9. The same thing in simple words
+## 11. The same thing in simple words
 
 **The problem, in one line:** the machine was missing some pieces of foreign
 matter, and showing others to the operator more than once.
@@ -541,6 +695,72 @@ forgets you the second they finish serving you.
 It now **remembers the numbers**. Once an object has been put in front of you,
 it is never shown again for the rest of that scan.
 
+### Why one group of objects arrived across several screens
+
+Even once nothing was being missed or double-counted, five objects sitting
+together on the belt still reached the operator as 5 on one screen, then 1, then
+4 — three screens for one handful of objects.
+
+**The AI does not find the same things in every photo.** A lot of what this
+machine spots it is only barely sure about. On one photo it sees an object, on
+the next it does not. So a review screen built from a single photo shows
+whatever happened to be found in that one instant, and the stragglers turn up a
+moment later as separate screens.
+
+**And the belt is still moving while all this happens.** It takes about a second
+to stop. The old behaviour froze the very first photo — taken while everything
+was still travelling.
+
+The fix is to **stop the belt, wait for it to actually stop, then look**:
+
+1. Something is spotted → the belt is told to stop, but nothing is shown yet
+2. Wait about a second for it to come to rest
+3. Take three photos of the now-stationary belt
+4. Combine what is found in all three and show it on one screen
+
+Combining only works because nothing is moving. During the stop, boxes measured
+in different photos are in different places and cannot share one image.
+
+**One thing this could lose, and what catches it.** An object that is on the
+belt when the stop begins but slides off the bottom of the picture before the
+belt halts cannot be in any of those three photos. The old behaviour caught it
+by accident, because it froze the photo the object was seen in. So the system
+now keeps hold of anything that leaves the view mid-stop, together with the last
+photo it appeared in, and shows it straight after the main screen. If you ever
+see a second screen now, that is what happened — and the log says so plainly.
+
+**A second thing that was making it worse.** Every detection was saving a
+full-size photo to disk, which took 52 milliseconds — more than twice as long as
+the AI itself — right in the middle of the loop, holding up the next photo. That
+now happens in the background. It mattered most exactly when several objects
+arrived together, which is when the frame rate matters most.
+
+### How to turn this behaviour off
+
+This is the only change here that alters what you actually experience rather
+than just making the counts right, so it can be backed out from
+`eye_compass_be/.env` without touching any code. Restart the service afterwards.
+
+```
+DETECTION_SETTLE_SECONDS=0
+DETECTION_SAMPLE_FRAMES=1
+```
+
+- **`DETECTION_SETTLE_SECONDS`** (normally `1.0`) is how long to wait for the
+  belt to stop before taking the photos. Raise it if the boxes do not sit
+  properly on the objects in the frozen image — that means the belt was still
+  moving. Lower it to make the screen appear sooner. `0` means take the photo
+  straight away.
+- **`DETECTION_SAMPLE_FRAMES`** (normally `3`) is how many photos of the
+  stopped belt to combine. Raise it if objects are still turning up on separate
+  screens; each extra one adds about 50 milliseconds. `1` means use a single
+  photo, which is the old behaviour.
+
+Setting both as shown above returns the machine to how it worked before.
+Everything else in this document keeps working — the counting fixes, the
+duplicate merging, the tracking. The only thing that comes back is one group of
+objects being spread over several screens.
+
 ### Two things worth knowing
 
 **The belt speed is set on a box on the wall and the software cannot read it.**
@@ -558,7 +778,15 @@ something a setting can fix.
 
 ### Where it ended up
 
-Five pieces of foreign matter placed on the belt, five reported. Every fix
-above has an automated test behind it, several written against the exact
-coordinates from the runs where the problem was caught, so if any of it comes
-back it will reproduce the original failure rather than something like it.
+Five pieces of foreign matter placed on the belt, five reported — and now on
+one screen rather than three. Every fix above has an automated test behind it,
+several written against the exact coordinates from the runs where the problem
+was caught, so if any of it comes back it will reproduce the original failure
+rather than something like it.
+
+The measured detection rate is also in the log now, every ten seconds, so it
+never has to be guessed at again:
+
+```
+Detection rate: 20.3 fps (decimation=2, 49 ms per inferred frame)
+```

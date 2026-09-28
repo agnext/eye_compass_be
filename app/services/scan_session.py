@@ -28,8 +28,10 @@ unique track ids for the whole run (existing_track_ids) and produced the final
 per-FM breakdown by listing saved crop files. Both are reproduced here.
 """
 
+import atexit
 import base64
 import glob
+import queue
 import json
 import logging
 import os
@@ -104,6 +106,9 @@ class ScanSession:
         self.end_time = ""
         self.frame_count = 0
         self.saved_frame_count = 0
+        # Created on first use by _raw_frame_writer; survives reset() so a
+        # writer thread is never orphaned mid-write by starting a new scan.
+        self._raw_writer_queue = getattr(self, "_raw_writer_queue", None)
 
         # Cumulative unique detections for the whole run (legacy existing_track_ids)
         # — used only to dedupe the tracker's own ids frame to frame, so an
@@ -147,6 +152,37 @@ class ScanSession:
         # earlier in the deceleration window is discarded unseen — not shown,
         # not cropped, not counted.
         self.detection_queue: List[Dict] = []
+
+        # Where this scan is in the "stop, settle, look" cycle:
+        #   idle      — watching the belt, nothing found yet
+        #   settling  — something was found, the belt has been told to stop,
+        #               and we are waiting for it to actually stop. Nothing is
+        #               shown or counted in this window.
+        #   sampling  — the belt is stopped; collecting a few frames to combine
+        #   reviewing — the operator has the result on screen
+        #
+        # The point of the cycle is that a detection is not a snapshot of the
+        # one frame something was first spotted in. The belt takes about a
+        # second to stop, and in that second the model keeps finding objects it
+        # missed the first time — an object at 0.15 confidence is found in one
+        # frame and not the next. Freezing the first frame means the rest arrive
+        # afterwards as separate detections, so five objects sitting together on
+        # the belt reach the operator as four and then one.
+        self.review_phase = "idle"
+        self._settle_deadline = 0.0
+        self._samples: List[Dict] = []
+        # The frame and boxes that triggered the stop, kept as a fallback: if
+        # the stationary frames somehow turn up nothing, this is still shown
+        # rather than the sighting being silently dropped.
+        self._trigger: Optional[Dict] = None
+        # Objects that left the bottom of the frame while the belt was still
+        # stopping, keyed by track id. They were on the belt when the stop was
+        # commanded but are gone by the time it is stationary, so the fresh
+        # look that builds the review screen cannot find them — they are the
+        # one thing the stop/settle/look cycle can lose that the old
+        # freeze-the-first-frame behaviour caught. Each is kept with the frame
+        # it was last seen in, and shown after the main screen.
+        self._escaped: Dict = {}
 
         # Bumped every time a different frame is put on the review screen. The
         # stream loop sends the frozen frame once and then holds it, so with a
@@ -324,23 +360,108 @@ class ScanSession:
     # ------------------------------------------------------------------
 
     def save_raw_frame(self, frame: np.ndarray):
-        """Write r_frame_N.jpg at quality 95 (main.py:2413-2441).
+        """Queue r_frame_N.jpg for writing at quality 95 (main.py:2413-2441).
 
         This is what update_fm_count counts as "Frame Count", and what the S3
         worker uploads. Without it that metric is always zero.
+
+        The encode and the write happen on a background thread. Measured on
+        this device, a full-resolution quality-95 JPEG costs **52 ms** — more
+        than twice the 23 ms TensorRT pass it sits next to — and this runs
+        inside process_frame, which is the detection loop. Done inline it
+        blocks the next frame, so the detection rate collapses during a burst
+        of detections: exactly when several objects arrive together and the
+        frame rate matters most. Confirmed live, detections during a burst
+        were landing about 150 ms apart (~7 fps) against a hardware ceiling
+        near 43.
+
+        The frame number is still assigned here, in order, so the files are
+        numbered by when they were captured rather than by whichever write
+        finished first. flush_raw_frames() waits for the backlog, and is
+        called before anything counts or moves those files.
         """
-        try:
-            path = os.path.join(self.output_frame_folder, f"r_frame_{self.saved_frame_count}.jpg")
-            # As-is, not through legacy's cv2.COLOR_BGR2RGB (main.py:2464) —
-            # see _COLOR_ORDER_NOTE.
-            encoded = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
-            )[1]
-            with open(path, "wb") as fh:
-                fh.write(encoded.tobytes())
-            self.saved_frame_count += 1
-        except Exception as exc:
-            logger.error("save_raw_frame failed: %s", exc)
+        index = self.saved_frame_count
+        self.saved_frame_count += 1
+        path = os.path.join(self.output_frame_folder, f"r_frame_{index}.jpg")
+        # frame is copied because the caller's array is reused by the camera
+        # loop as soon as this returns.
+        self._raw_frame_writer().put((path, frame.copy()))
+
+    def _raw_frame_writer(self) -> "queue.Queue":
+        """The background writer, started on first use.
+
+        One thread, not a pool: these are large sequential writes to the same
+        directory, so running them in parallel would contend for the disk
+        without finishing any sooner.
+        """
+        if self._raw_writer_queue is None:
+            work = self._raw_writer_queue = queue.Queue()
+
+            def worker():
+                while True:
+                    item = work.get()
+                    try:
+                        if item is None:
+                            return
+                        path, image = item
+                        # As-is, not through legacy's cv2.COLOR_BGR2RGB
+                        # (main.py:2464) — see _COLOR_ORDER_NOTE.
+                        encoded = cv2.imencode(
+                            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                        )[1]
+                        with open(path, "wb") as fh:
+                            fh.write(encoded.tobytes())
+                    except Exception as exc:
+                        logger.error("save_raw_frame failed: %s", exc)
+                    finally:
+                        work.task_done()
+
+            threading.Thread(
+                target=worker, name="raw-frame-writer", daemon=True,
+            ).start()
+            # Not only for the FastAPI app: any process that touches a
+            # ScanSession — a script, a test — otherwise exits with this thread
+            # parked inside the queue, which aborts the interpreter on the way
+            # out and makes a clean run look like a crash.
+            atexit.register(self.stop_raw_frame_writer)
+        return self._raw_writer_queue
+
+    def stop_raw_frame_writer(self, timeout: float = 30.0) -> None:
+        """Finish the pending writes and retire the writer thread.
+
+        Called from the app's shutdown. A daemon thread is killed wherever it
+        happens to be when the interpreter exits, and if that is inside
+        cv2.imencode the process aborts on the way out — which reads as a crash
+        in the journal rather than a clean stop, and loses whatever frame was
+        being written.
+        """
+        if self._raw_writer_queue is None:
+            return
+        self.flush_raw_frames(timeout)
+        self._raw_writer_queue.put(None)
+        self._raw_writer_queue = None
+
+    def flush_raw_frames(self, timeout: float = 30.0) -> None:
+        """Block until every queued raw frame is on disk.
+
+        Called before anything reads or moves those files — update_fm_count
+        counts them for "Frame Count", cancel() moves them to rejected/, and
+        the S3 worker uploads them. Without this, a scan that finished while
+        writes were still in flight would report a frame count short of what
+        it actually captured.
+        """
+        if self._raw_writer_queue is None:
+            return
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (self._raw_writer_queue.join(), done.set()),
+            daemon=True,
+        ).start()
+        if not done.wait(timeout):
+            logger.error(
+                "Raw frame writes did not finish within %.0fs — the saved "
+                "frame count may be short.", timeout,
+            )
 
     @staticmethod
     def _iou(a, b) -> float:
@@ -511,8 +632,14 @@ class ScanSession:
                 detections, self.commodity, self.variety
             )
 
-            if not detections or not fm_flag:
-                return self._snapshot(fm_detected=False)
+            # A frame with nothing in it is not a reason to stop here. It
+            # still has to age the tracker — otherwise an object that vanishes
+            # completely stops the staleness clock and its id lives forever —
+            # and it still has to advance the stop/settle/look cycle, or a
+            # sighting the model loses once the belt stops leaves the scan
+            # frozen in `sampling` with the belt stopped and nothing on screen.
+            if not fm_flag:
+                detections = []
 
             # One box per object before anything downstream sees them — the
             # tracker, the counted ids and the operator's boxes all come off
@@ -600,6 +727,53 @@ class ScanSession:
             # operator has worked the queue down — refusing to queue costs a
             # short delay, whereas marking them counted would lose them for the
             # rest of the scan.
+            # ---- stop, settle, look -------------------------------------
+            # Nothing is shown or counted until the belt has stopped and a few
+            # stationary frames have been combined. See review_phase in reset().
+            if self.review_phase in ("settling", "sampling"):
+                self._note_escapes(frame, h, w)
+
+            if self.review_phase == "settling":
+                self.existing_track_ids.update(track_ids)
+                if time.monotonic() < self._settle_deadline:
+                    return self._snapshot(fm_detected=False)
+                self.review_phase = "sampling"
+                self._samples = []
+                # Falls through — the frame that ends the wait is the first
+                # stationary one, and there is no reason to discard it.
+
+            if self.review_phase == "sampling":
+                self.existing_track_ids.update(track_ids)
+                self._samples.append({"frame": frame, "detections": detections})
+                if len(self._samples) < max(1, settings.DETECTION_SAMPLE_FRAMES):
+                    return self._snapshot(fm_detected=False)
+                self._promote_from_samples(h, w)
+                return self._snapshot(fm_detected=bool(self.pending))
+
+            if candidates and self.review_phase == "idle":
+                # First sighting. Stop the belt now — the interlock goes on
+                # before FM_detected so a machine_start cannot win the race —
+                # and come back to it once it has actually stopped.
+                self._trigger = {
+                    "frame": frame.copy(),
+                    "boxes": [list(box) for _, box in candidates],
+                }
+                csc = self.conveyor_stop_count
+                csc["fm_count"] += 1
+                csc["fm_time"] = time.time()
+                conveyor_service.lock_machine_start(reason="FM_detected")
+                conveyor_service.send("FM_detected")
+                self.review_phase = "settling"
+                self._settle_deadline = (
+                    time.monotonic() + settings.DETECTION_SETTLE_SECONDS)
+                logger.info(
+                    "Foreign matter sighted (%s object(s)) — belt stopping, "
+                    "looking again in %.1fs once it has settled",
+                    len(candidates), settings.DETECTION_SETTLE_SECONDS,
+                )
+                self.existing_track_ids.update(track_ids)
+                return self._snapshot(fm_detected=False)
+
             if candidates and len(self.detection_queue) >= settings.DETECTION_QUEUE_MAX:
                 logger.warning(
                     "Detection backlog is at its limit of %s — holding %s "
@@ -634,6 +808,175 @@ class ScanSession:
             self.existing_track_ids.update(track_ids)
 
             return self._snapshot(fm_detected=fm_detected)
+
+    def _note_escapes(self, frame: np.ndarray, h: int, w: int):
+        """Remember anything that leaves the view while the belt is stopping.
+
+        The tracker's exit rule drops a track once it reaches the bottom of the
+        frame, and it was still in view on the update that dropped it — so its
+        last recorded box belongs to the frame passed in here. That pairing is
+        the whole point: it gives a box and an image that actually match, for
+        an object that will not be in any of the stationary frames the review
+        screen is built from.
+
+        Only ids that have never been shown are kept. An object already
+        reviewed is expected to leave.
+        """
+        for obj_id, reason in self.tracker.last_evicted.items():
+            if not reason.startswith("exit-zone"):
+                continue
+            if obj_id in self.counted_track_ids or obj_id in self._escaped:
+                continue
+            box = self.tracker.last_evicted_boxes.get(obj_id)
+            if box is None or len(box) < 4:
+                continue
+            self._escaped[obj_id] = {
+                "frame": frame.copy(),
+                "box": enlarge_bbox(box, pad=20, img_w=w, img_h=h),
+            }
+            logger.warning(
+                "Object %s left the frame while the belt was still stopping — "
+                "holding its last sighting to show after the main screen.",
+                obj_id,
+            )
+
+    def _queue_escapes(self):
+        """Put anything that got away behind the main review screen.
+
+        One entry each, carrying its own frame, because they were last seen at
+        different moments and a crop has to be cut from the frame its box was
+        measured in. They are marked as counted here rather than when shown:
+        they have left the camera's view, so nothing will detect them again and
+        there is no second chance to record them.
+        """
+        escaped, self._escaped = self._escaped, {}
+        for obj_id, item in escaped.items():
+            self.detection_queue.append({
+                "frame": item["frame"], "boxes": [item["box"]],
+            })
+            self.counted_track_ids.add(obj_id)
+        if escaped:
+            logger.warning(
+                "%s object(s) left the view while the belt was stopping; "
+                "queued behind the main screen: %s",
+                len(escaped), sorted(escaped),
+            )
+
+    def _promote_from_samples(self, h: int, w: int):
+        """Combine the stationary frames into one review screen.
+
+        Every box from every sample goes into one list and
+        _merge_overlapping_detections collapses the repeats, so an object seen
+        in all three frames becomes one box at its best confidence and an
+        object seen in only one is still there. This is only sound because the
+        belt is stopped: boxes measured in different frames describe the same
+        positions, which is exactly what is not true during the deceleration.
+
+        The newest sample supplies the image, so the crops are cut from a frame
+        every box genuinely belongs to.
+        """
+        samples, self._samples = self._samples, []
+        trigger, self._trigger = self._trigger, None
+        self.review_phase = "reviewing"
+
+        # Anything that left the view while the belt was stopping goes behind
+        # whatever the stationary frames turn up. Done first so every exit
+        # below, including the ones that find nothing, still shows them.
+        self._queue_escapes()
+
+        combined = [d for sample in samples for d in sample["detections"]]
+        combined = self._merge_overlapping_detections(combined)
+        frame = samples[-1]["frame"] if samples else None
+
+        if not combined and trigger is not None:
+            # The stationary frames found nothing — the model lost whatever it
+            # saw a moment ago. Fall back to the sighting that stopped the belt
+            # rather than dropping it: a spurious box the operator dismisses is
+            # recoverable, a missed object is not.
+            logger.warning(
+                "Nothing found in %s stationary frame(s) after the belt "
+                "stopped — falling back to the %s box(es) that triggered it.",
+                len(samples), len(trigger["boxes"]),
+            )
+            self._show(trigger["frame"], trigger["boxes"])
+            return
+
+        if not combined:
+            # Nothing found and nothing to fall back on. Release rather than
+            # stranding the operator on a frozen screen with no boxes — unless
+            # something escaped, which is then the only thing to show.
+            if self._promote_next_detection(immediate=True):
+                return
+            logger.info("Nothing found after the belt stopped — releasing.")
+            self._release()
+            return
+
+        # One last tracker pass over the combined set, so every box carries a
+        # track id and the already-shown filter applies to it. The objects have
+        # been tracked throughout the settle, so these match their existing ids.
+        self.tracker.update(combined, self.frame_count, (h, w))
+        assignment = self.tracker.last_assignment
+        boxes = []
+        shown_ids = []
+        for i, det in enumerate(combined):
+            track_id = assignment[i] if i < len(assignment) else None
+            if track_id is not None and track_id in self.counted_track_ids:
+                continue
+            boxes.append(enlarge_bbox(det, pad=20, img_w=w, img_h=h))
+            shown_ids.append(track_id)
+
+        if not boxes:
+            if self._promote_next_detection(immediate=True):
+                return
+            logger.info(
+                "Everything found after the belt stopped has already been "
+                "reviewed — releasing.")
+            self._release()
+            return
+
+        logger.info(
+            "Combined %s stationary frame(s) into one review screen: %s object(s)",
+            len(samples), len(boxes),
+        )
+        self.counted_track_ids.update(t for t in shown_ids if t is not None)
+        self.existing_track_ids.update(self.tracker.get_tracked_objects().keys())
+        self._show(frame, boxes)
+
+    def _release(self):
+        """Nothing to review after all — hand the belt back without a screen."""
+        self.review_phase = "idle"
+        self._escaped = {}
+        conveyor_service.unlock_machine_start(reason="nothing to review")
+
+    def _show(self, frame: np.ndarray, boxes: List):
+        """Put one set of boxes on the review screen and freeze the stream.
+
+        The belt is already stopped by the time this runs, so capture is paused
+        at once rather than after a deceleration delay — waiting would only
+        show the operator a second of live feed over the frame they are meant
+        to be reviewing.
+        """
+        boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2.0, reverse=True)
+        self.pending = []
+        for box in boxes:
+            self.pending.append({
+                "index": self._next_pending_index,
+                "box": [float(v) for v in box[:4]],
+                "confidence": float(box[4]) if len(box) > 4 else None,
+                "class_id": int(box[5]) if len(box) > 5 else None,
+            })
+            self._next_pending_index += 1
+        self.pending_frame = frame
+        self.frozen_frame_seq += 1
+        self.labelled_indices = set()
+        self.save_raw_frame(frame)
+        self._pause_token += 1
+        self.capture_paused = True
+        logger.info(
+            "Foreign matter on screen: %s box(es) awaiting operator label "
+            "(%s more detection(s) queued behind it)",
+            len(boxes), len(self.detection_queue),
+        )
 
     def _on_foreign_matter(self, frame: np.ndarray, boxes: List):
         """Queue one detection, and put it on screen if nothing else is there.
@@ -900,7 +1243,14 @@ class ScanSession:
             # unlocks the interlock without ever sending machine_start — so
             # here that delay would buy nothing but a blank screen.
             if self._promote_next_detection(immediate=True):
+                self.review_phase = "reviewing"
                 return {"resumed": True, **self.status()}
+
+            # Back to watching the belt. The next sighting starts the stop /
+            # settle / look cycle over again from the top.
+            self.review_phase = "idle"
+            self._samples = []
+            self._trigger = None
 
             # See the flag's own comment in reset(): suspend detection until
             # Start is pressed again, so the live view can safely return
@@ -923,6 +1273,7 @@ class ScanSession:
         lowercases and underscores it at main.py:770) — a literal legacy
         inconsistency reproduced rather than "fixed".
         """
+        self.flush_raw_frames()
         with self._lock:
             sample_id = self.sample_id
             if self.output_folder and os.path.isdir(self.output_folder):
@@ -1121,6 +1472,10 @@ class ScanSession:
         Port of submit_video + submit_create_result (main.py:1566-1660),
         including writing result.json into the batch folder.
         """
+        # Outside the lock: the writer thread does not need it, and holding it
+        # across a disk flush would stall the stream loop.
+        self.flush_raw_frames()
+
         with self._lock:
             self.end_time = datetime.now().strftime("%H:%M:%S")
             self.accumulate_stop_times()

@@ -19,6 +19,7 @@ worker and the History screen both depend on them:
 
 import logging
 import os
+import time
 from typing import Optional, Tuple
 
 import requests
@@ -124,6 +125,13 @@ _QUALIX_ALREADY_RECORDED_CODES = {"12063"}
 # open, and that shows a spinner. So the cost of waiting longer is nil, while
 # the cost of giving up early is a scan that looks lost.
 _POST_TIMEOUT_SECONDS = 90
+
+# How much of a response body reaches the log. Generous, because this is now
+# the only record of what Qualix said and its rejection messages carry the one
+# field that was wrong — but capped, because an HTML error page from something
+# in front of Qualix (a gateway, a proxy) can run to tens of kilobytes and
+# would bury the rest of the scan's log lines.
+_RESPONSE_LOG_LIMIT = 2000
 
 
 class SyncService:
@@ -268,12 +276,7 @@ class SyncService:
             # data, and the credentials live in the headers, which are
             # deliberately not logged.
             logger.info("[SYNC] POST %s body: %s", self.analysis_post_uri, body)
-            response = requests.post(
-                self.analysis_post_uri,
-                data=body,
-                headers=self._auth_headers(json_body=True),
-                timeout=_POST_TIMEOUT_SECONDS,
-            )
+            response = self._post_analysis(body, attempt=1)
             # The service token can expire between calls. Fetch a fresh one and
             # retry once before treating this as a delivery failure, otherwise
             # every record would sit pending until the next worker cycle.
@@ -282,12 +285,7 @@ class SyncService:
 
                 logger.info("Assurance returned 401 — refreshing service token and retrying.")
                 keycloak_service.invalidate_service_token()
-                response = requests.post(
-                    self.analysis_post_uri,
-                    data=body,
-                    headers=self._auth_headers(json_body=True),
-                    timeout=_POST_TIMEOUT_SECONDS,
-                )
+                response = self._post_analysis(body, attempt=2)
             if response.status_code == 200:
                 return "1", "ok", ""
             if response.status_code == 400:
@@ -306,11 +304,19 @@ class SyncService:
                         error_code,
                     )
                     return "1", "already_recorded", ""
-                logger.error("Qualix rejected the payload (400): %s", response.text[:500])
-                return "2", "bad_request", _readable_qualix_error(response.text)
+                reason = _readable_qualix_error(response.text)
+                logger.error(
+                    "Qualix rejected sample %s: %s (error code %s). This is "
+                    "terminal — the same payload will not be retried.",
+                    (raw_data.get("scan_data") or {}).get("sample_id", "?"),
+                    reason, error_code,
+                )
+                return "2", "bad_request", reason
             logger.error(
-                "Qualix POST returned HTTP %s from %s — %s",
-                response.status_code, self.analysis_post_uri, response.text[:500],
+                "Qualix POST for sample %s failed with HTTP %s — will be "
+                "retried by the sync worker.",
+                (raw_data.get("scan_data") or {}).get("sample_id", "?"),
+                response.status_code,
             )
             return (
                 "0",
@@ -320,6 +326,40 @@ class SyncService:
         except Exception as exc:
             logger.error("Qualix POST failed: %s (%s)", exc, self.analysis_post_uri)
             return "0", "exception", f"Could not reach Qualix: {exc}"
+
+    def _post_analysis(self, body: str, attempt: int):
+        """Send the payload and log what came back.
+
+        Every outcome is logged, success included. Only failures used to say
+        anything, so a delivery that worked left the request body in the log
+        with nothing after it — no status, no response, no indication it had
+        even returned. Whether a scan reached Qualix could then only be
+        inferred from the absence of an error, which is not the same thing as
+        evidence that it arrived.
+
+        The elapsed time is worth having on its own: this endpoint averages
+        around 30 seconds, and a slow one is the difference between a device
+        that is struggling and a device that is broken.
+        """
+        started = time.monotonic()
+        response = requests.post(
+            self.analysis_post_uri,
+            data=body,
+            headers=self._auth_headers(json_body=True),
+            timeout=_POST_TIMEOUT_SECONDS,
+        )
+        elapsed = time.monotonic() - started
+        text = (response.text or "").strip()
+        if len(text) > _RESPONSE_LOG_LIMIT:
+            text = f"{text[:_RESPONSE_LOG_LIMIT]}… ({len(response.text)} chars total)"
+        logger.log(
+            logging.INFO if response.status_code == 200 else logging.WARNING,
+            "[SYNC] HTTP %s in %.1fs%s — response: %s",
+            response.status_code, elapsed,
+            "" if attempt == 1 else f" (attempt {attempt})",
+            text or "<empty>",
+        )
+        return response
 
     # ------------------------------------------------------------------
     def fetch_config(self) -> Optional[dict]:
@@ -344,6 +384,17 @@ class SyncService:
                     params={"response_type": "code", "client_id": "client-mobile"},
                     headers=self._auth_headers(),
                     timeout=30,
+                )
+            if response.status_code == 200:
+                # Size rather than the body: this response carries every
+                # commodity, variety and analysis name the device knows about
+                # and runs to tens of kilobytes, so printing it would bury
+                # everything around it. A successful fetch still has to leave a
+                # mark, though — a config that silently stopped refreshing
+                # looks exactly like one that never changed.
+                logger.info(
+                    "[SYNC] config fetch OK — HTTP 200, %s bytes from %s",
+                    len(response.content or b""), self.commodity_uri,
                 )
             if response.status_code != 200:
                 logger.error(

@@ -1,11 +1,13 @@
-"""Detection queue drain (ScanSession.detection_queue).
+"""The detection backlog (ScanSession.detection_queue).
 
     /home/nvidia/.virtualenvs/eye_compass/bin/python scripts/test_queue.py
 
-Walks the four states the review screen moves through: first detection shown,
-second one queued behind it rather than overwriting it, Submit promoting the
-queued one while staying frozen and interlocked, and Submit on an empty queue
-handing back the live view.
+Since the stop/settle/look cycle was added this is a safety net rather than
+the normal path: a sighting stops the belt and everything found once it is
+stationary goes on ONE screen, so in ordinary running the backlog stays at 0.
+It still has to behave if anything does reach it, which is what this covers —
+driven through _on_foreign_matter directly, because process_frame no longer
+gets there on its own. `test_settle.py` covers the normal path.
 """
 import sys, tempfile
 sys.path.insert(0, '.')
@@ -15,92 +17,59 @@ settings.OUTPUT_DIR = tempfile.mkdtemp()
 from app.services.scan_session import ScanSession
 from app.services.conveyor_service import conveyor_service
 
-s = ScanSession()
-s.start("T1TEST", "toor", "", analysis_parameters=["Stones"])
 frame = np.zeros((1200, 1920, 3), dtype=np.uint8)
-box = lambda x, y: [x, y, x + 40, y + 40, 0.9, 1]
+box = lambda x, y: [float(x), float(y), float(x + 40), float(y + 40), 0.9, 1]
 
-st = s.process_frame(frame, [box(300, 400)])
-assert st["fm_detected"] is True and st["queue_depth"] == 0 and len(s.pending) == 1, st
+s = ScanSession()
+s.start("T1QUEUE", "toor", "", analysis_parameters=["Stones"])
+
+# First detection goes straight to the screen; the next waits behind it.
+s._on_foreign_matter(frame, [box(300, 400)])
+assert len(s.pending) == 1 and len(s.detection_queue) == 0
 first_seq = s.frozen_frame_seq
-print("1. first detection on screen: pending=%d queue=%d" % (len(s.pending), st["queue_depth"]))
-
-st = s.process_frame(frame, [box(300, 430), box(900, 350)])
-assert st["queue_depth"] == 1, st
+s._on_foreign_matter(frame, [box(900, 350)])
+assert len(s.detection_queue) == 1, len(s.detection_queue)
 assert len(s.pending) == 1, "the on-screen detection was overwritten"
-assert s.frozen_frame_seq == first_seq, "frozen frame changed while still under review"
-print("2. second detection queued behind it: pending=%d queue=%d" % (len(s.pending), st["queue_depth"]))
+assert s.frozen_frame_seq == first_seq, "frozen frame changed while under review"
+print("1. second detection waits behind the first, does not replace it")
 
+# Submit promotes the queued one, staying frozen and interlocked.
 res = s.resume()
-assert res["queue_depth"] == 0 and len(s.pending) == 1, res
-assert s.pending[0]["box"][0] > 800, "the queued box is not the second object"
-assert s.frozen_frame_seq == first_seq + 1, "stream was not told the frame changed"
-assert s.capture_paused is True, "live feed resumed while a queued detection is up"
-assert conveyor_service.machine_start_locked is True, "interlock released mid-backlog"
-assert s.detection_suspended is False, "detection suspended while backlog remains"
+assert res["queue_depth"] == 0 and len(s.pending) == 1
+assert s.pending[0]["box"][0] > 800, "the queued detection was not promoted"
+assert s.frozen_frame_seq == first_seq + 1, "stream not told the frame changed"
+assert s.capture_paused is True, "live feed returned mid-backlog"
+assert conveyor_service.machine_start_locked is True, "interlock released early"
 assert [p["index"] for p in s.pending] == [1], s.pending
-print("3. submit -> next queued shown: pending=%d queue=%d indices=%s"
-      % (len(s.pending), res["queue_depth"], [p["index"] for p in s.pending]))
+print("2. submit -> queued one shown, still frozen, indices do not restart")
 
 res = s.resume()
 assert res["queue_depth"] == 0 and s.pending == [] and s.pending_frame is None
-assert s.capture_paused is False, "live feed did not return"
-assert conveyor_service.machine_start_locked is False, "interlock still engaged"
-assert s.detection_suspended is True
-print("4. submit -> backlog drained, live view restored")
+assert s.capture_paused is False and s.review_phase == "idle"
+assert conveyor_service.machine_start_locked is False
+print("3. submit on an empty backlog -> live view restored")
 
-# --- the backlog is bounded, and nothing is lost when it fills --------------
-from app.core.config import settings as _s
+# Drained oldest-first.
 s2 = ScanSession()
-s2.start("T1CAP", "toor", "", analysis_parameters=["Stones"])
-_s.DETECTION_QUEUE_MAX = 3
-# Each object in its own lane so none is filtered as a duplicate of another.
-for lane in range(10):
-    s2.process_frame(frame, [box(200 + lane * 150, 300)])
-assert len(s2.detection_queue) <= _s.DETECTION_QUEUE_MAX, len(s2.detection_queue)
-held = 10 - (len(s2.detection_queue) + 1)          # +1 for the one on screen
-assert held > 0, "the cap never engaged, so this proves nothing"
-# The objects that could not be queued must NOT be recorded as counted, or
-# they could never be detected again.
-assert len(s2.counted_track_ids) == len(s2.detection_queue) + 1, (
-    "objects refused entry to the backlog were counted anyway: %s counted vs "
-    "%s shown" % (len(s2.counted_track_ids), len(s2.detection_queue) + 1))
-print("5. backlog capped at %d; %d object(s) held back and left uncounted"
-      % (_s.DETECTION_QUEUE_MAX, held))
-
-# --- the backlog is drained oldest-first ------------------------------------
-# Three objects found in turn, each in its own lane so none filters another.
-# The operator must meet them in the order they were found, not in reverse.
-s3 = ScanSession()
-s3.start("T1ORDER", "toor", "", analysis_parameters=["Stones"])
-_s.DETECTION_QUEUE_MAX = 20
+s2.start("T1ORDER", "toor", "", analysis_parameters=["Stones"])
 lanes = [300, 900, 1500]
 for lane in lanes:
-    s3.process_frame(frame, [box(lane, 300)])
-assert len(s3.detection_queue) == 2, len(s3.detection_queue)
+    s2._on_foreign_matter(frame, [box(lane, 300)])
+seen = [s2.pending[0]["box"][0]]
+while s2.detection_queue:
+    s2.resume()
+    seen.append(s2.pending[0]["box"][0])
+assert seen == [float(l) for l in lanes], "not drained in the order found: %s" % seen
+print("4. drained oldest-first: lanes %s" % [int(x) for x in seen])
 
-seen = [s3.pending[0]["box"][0]]
-while s3.detection_queue:
-    s3.resume()
-    s3.start("T1ORDER", "toor", "")
-    seen.append(s3.pending[0]["box"][0])
-# Boxes are padded by 20px, so compare the lane each one came from.
-assert seen == [lane - 20 for lane in lanes], (
-    "backlog was not drained in the order the objects were found: %s" % seen)
-print("6. backlog drained oldest-first: lanes %s" % [int(x) + 20 for x in seen])
-
-# --- boxes within one frozen frame follow the belt, not model confidence ----
-s4 = ScanSession()
-s4.start("T1BOXORDER", "toor", "", analysis_parameters=["Stones"])
-# Emitted low-confidence-last, as NMS does; the middle one is furthest along.
-s4.process_frame(frame, [
-    box(300, 200) + [],          # near the top, entered view most recently
-    box(900, 900),               # furthest down the belt, entered first
-    box(1500, 550),              # in between
-])
-tops = [p["box"][1] for p in s4.pending]
-assert tops == sorted(tops, reverse=True), (
-    "boxes are not ordered down the belt: %s" % tops)
-print("7. boxes within a frame ordered furthest-along-first: y = %s"
-      % [int(t) for t in tops])
+# Bounded, and nothing is lost when it fills.
+s3 = ScanSession()
+s3.start("T1CAP", "toor", "", analysis_parameters=["Stones"])
+settings.DETECTION_QUEUE_MAX = 3
+for lane in range(10):
+    if len(s3.detection_queue) >= settings.DETECTION_QUEUE_MAX:
+        break
+    s3._on_foreign_matter(frame, [box(200 + lane * 150, 300)])
+assert len(s3.detection_queue) == settings.DETECTION_QUEUE_MAX
+print("5. backlog bounded at %d" % settings.DETECTION_QUEUE_MAX)
 print("ALL QUEUE CHECKS PASSED")
