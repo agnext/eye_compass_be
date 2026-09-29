@@ -49,7 +49,8 @@ assert s.capture_paused is False and s.review_phase == "idle"
 assert conveyor_service.machine_start_locked is False
 print("3. submit on an empty backlog -> live view restored")
 
-# Drained oldest-first.
+# Drained newest-first: whatever is on screen stays, then the backlog comes
+# off the most recently identified end.
 s2 = ScanSession()
 s2.start("T1ORDER", "toor", "", analysis_parameters=["Stones"])
 lanes = [300, 900, 1500]
@@ -59,8 +60,9 @@ seen = [s2.pending[0]["box"][0]]
 while s2.detection_queue:
     s2.resume()
     seen.append(s2.pending[0]["box"][0])
-assert seen == [float(l) for l in lanes], "not drained in the order found: %s" % seen
-print("4. drained oldest-first: lanes %s" % [int(x) for x in seen])
+expected = [float(lanes[0])] + [float(l) for l in reversed(lanes[1:])]
+assert seen == expected, "not drained newest-first: %s" % seen
+print("4. drained newest-first: lanes %s" % [int(x) for x in seen])
 
 # Bounded, and nothing is lost when it fills.
 s3 = ScanSession()

@@ -245,12 +245,14 @@ Two consequences fell out of building the queue:
   of every earlier detection in the run. The bug predated the queue; the queue
   would have made it routine.
 
-**Order is oldest-first, and bounded.** `detection_queue` is appended to and
-drained with `pop(0)`, so the operator meets objects in the order they were
-found. Legacy is the same — its `detection_queue` is a `queue.Queue`
-(`main.py:2391`), which is FIFO; its *other* queue, the camera-to-inference
-`LifoQueue`, is the newest-first one, and that is a different thing entirely.
-Neither codebase capped the detection queue. This one now does, at
+**Order is newest-first, and bounded.** `detection_queue` is appended to and
+drained with `pop()`, so once the screen in front of the operator is submitted
+the backlog comes off its most recent end — the object most recently identified
+is the next one shown, and anything found earlier waits behind it. This is a
+deviation from legacy, which drains FIFO: its `detection_queue` is a
+`queue.Queue` (`main.py:2391`). Legacy's *other* queue, the camera-to-inference
+`LifoQueue`, is a newest-first one, but that is a different thing entirely and
+is not the precedent here. Neither codebase capped the detection queue. This one now does, at
 `DETECTION_QUEUE_MAX` (default 20), because each entry holds its own full
 frame (6.9 MB) — every crop is cut from the frame its object was found in.
 Objects that arrive while the backlog is full are held back **uncounted**, so
@@ -435,9 +437,137 @@ match — is kept for any id that has never been shown, and `_queue_escapes`
 puts it behind the main screen. It is marked counted at that point rather than
 when shown, because nothing will detect it again.
 
-This is deliberately narrow. Only the exit rule counts, not a track lost to
-staleness: an object that merely stopped being recognised for a few frames is
-still physically there and will be in the stationary frames.
+This is deliberately narrow, on three counts. Only the exit rule counts, not a
+track lost to staleness: an object that merely stopped being recognised for a
+few frames is still physically there and will be in the stationary frames.
+
+Second, **a track minted and exit-evicted inside the same update is ignored**.
+An object at rest in the bottom 50 px of a stopped belt is detected again on
+every frame from the half still in view, and the exit rule takes its id every
+time, so it was being minted and evicted once per frame — each time under a
+brand new id, which is why the per-id guard above could never collapse them and
+each one queued its own review screen. `ObjectTracker.last_evicted_first_frames`
+records the frame each evicted track was first seen on; when that equals the
+frame it was evicted on, the track never travelled anywhere and did not escape.
+
+Third, **`_queue_escapes` takes the combined stationary detections and drops
+any escape that overlaps one**. Something still visible on the stopped belt did
+not get away: it is about to be shown on the main screen, and queueing it as
+well showed it twice. This is why `_promote_from_samples` builds `combined`
+before calling `_queue_escapes` rather than after. The overlapping escape is
+*not* marked counted on the way out — `_revive` hands the same id back to the
+object still in view, so counting it here would filter it off the very screen
+it belongs on. Together these three produced the 29 Sep report of one parked
+object reaching the operator as three separate screens;
+`scripts/test_parked_edge.py` is the regression.
+
+**One object, one identity — even through a gap in detection.** The model is
+not certain frame to frame: plenty of what this machine detects sits near 0.2
+confidence, so an object in plain view is found, missed for a few frames, and
+found again. A gap longer than `TRACK_STALE_AFTER_SECONDS` (0.3 s, four frames
+at the measured rate) dropped the track, and the next detection of the same
+object became a brand-new id. Every "have I already shown this?" decision rests
+on that id, so the object was shown, cropped and counted again. Measured on
+29 Sep: **one belt stop produced ids 10 through 20** — eleven "objects" — for a
+handful of real ones.
+
+`ObjectTracker._revive` closes it. A track dropped for going unseen is held for
+`TRACK_REVIVE_WITHIN_SECONDS` (2.0) rather than forgotten, and a detection that
+is about to become a new id is offered those held tracks first. It may only
+claim one that it plausibly is: same lane within the usual x tolerance, at or
+ahead of where the track was lost, and no further ahead than `_max_travel`
+allows.
+
+Two deliberate choices make this safe:
+
+- **A separate step, not a longer staleness window.** Widening the live window
+  changes what every detection matches against on every frame. This runs only
+  for a detection that has no live track, so the ordinary path is untouched.
+- **`_max_travel` uses `current_speed_px_s`, not `belt_speed_px_s`.** The
+  latter takes only forward motion, which is right for reporting the belt's
+  running speed and useless here: on a stopped belt nothing moves, so nothing
+  is sampled and the median sits at the running speed as though the belt were
+  still going. `current_speed_px_s` samples every match including stationary
+  ones over a short window, so it falls to roughly zero within a second of the
+  belt stopping. The effect is that the window is tight exactly where objects
+  are not moving, and wide open where they are — so a long revive window costs
+  nothing on a running belt (the object is long past by then) and is what makes
+  a stopped one work.
+
+A track dropped by the **exit rule** is revivable too, but on much tighter
+terms: only by a detection that has barely moved at all (`TRACK_MIN_TRAVEL_PX`,
+80 px). An object that comes to rest half out of the bottom of the frame is
+still detected, frame after frame, from the half still visible; the exit rule
+dropped its track each time, so it collected a fresh id each time and the
+operator was shown it twice. That is precisely when it happens, too — the belt
+is stopped for the whole of review. One frame of a running belt carries an
+object about 96 px, further than that bound, so an object genuinely on its way
+out cannot reclaim its id and keep it. The bound is a fixed distance rather
+than a measured one because once a track starts being evicted every frame it
+stops matching, so no new speed samples are taken and `current_speed_px_s`
+freezes at whatever the belt was last doing — a gate on measured speed
+deadlocks here, and was tried and removed.
+
+**A detection clipped by the bottom edge is never minted a new id.** The belt
+carries material down through the frame, so every object is cut in half by the
+bottom edge on its way out. That clipped box is a perfectly good detection —
+the model finds it from the half still visible — and it used to be given a
+brand new id, which made it a brand new object to everything downstream: an
+object reviewed while whole in the middle of the frame came back a moment later
+as a half box and was reviewed again. Reported live on 29 Sep, two objects
+reaching the operator as four.
+
+`TRACK_EDGE_MARGIN_PX` (default 15) sets how close to the bottom the box has to
+reach to count as clipped. Matching and revival run first and are unaffected —
+an object leaving keeps the id it already owns, which is what the exit rule and
+`_note_escapes` work from. Only the mint is refused. `ScanSession` applies the
+same rule once more when assembling candidates: a bottom-clipped detection that
+came back with no id is dropped there too, because the already-shown filter
+speaks through ids and the geometry backstop would otherwise call it novel and
+put it on screen.
+
+**The top edge is deliberately excluded**, though an entering object is just as
+clipped. An object entering is minted while still clipped and then keeps that
+id as it comes in — its left and right edges do not move and it only travels
+down — so entry never produced a second id in the first place. Refusing one
+there would instead leave a large object resting against the top edge with no
+identity at all, and identity is the only thing that stops it being reviewed
+twice. That case is real and logged: `test_identity.py` is built on a box from
+the live log with its top edge at y=0. `scripts/test_edge_duplicate.py` covers
+the bottom-edge case, including that the bottom of the frame has not become a
+dead zone for genuinely new objects.
+
+Widening the camera's view to give objects room at the edges is not available:
+the MV-CS023-10GC is already read out at its full 1920x1200 sensor, so there is
+no more field of view to take. The margin above is the software equivalent —
+it does not capture more, it stops a half-seen object being mistaken for a
+second one.
+
+**Live matching has no such upper bound, deliberately.** One was tried there —
+a live track may only claim a detection within `_max_travel` of it — and
+removed. Any such bound has to come from how fast things are moving, and while
+the belt decelerates the objects on it are moving at very different speeds at
+the same instant: one already at rest, another still crossing most of a frame
+height. Every estimate over that mixture, median or maximum, sits well below
+what the fastest object is doing, so the bound refused matches the belt had
+plainly made and the next detection of an already-tracked object became a brand
+new id — manufacturing exactly the duplicate the revival logic exists to
+prevent. Two objects one behind the other in the same lane are already
+separated by nearest-match, which hands each detection to the closest track
+rather than the first one in range. `scripts/test_reid.py` covers both halves:
+identity surviving a gap, and an id never reaching a different object.
+
+**Still open: objects lost during the stop.** At this belt's measured
+1244 px/s an object crosses the 1200 px view in 964 ms, about as long as the
+1.0 s settle, so the stationary frames often contain nothing at all — in one
+run, 13 of 18 review screens. Two things can still be lost there: an object the
+model stops finding partway through the stop (only a bottom-of-frame exit is
+held), and the rest of the stopping sighting when the stationary frames find
+some but not all of it. An attempt to close both by holding every sighting
+during the stop was reverted, because it was built on top of the id churn
+described above and faithfully reproduced it — one object became several
+"missed" ones and was shown repeatedly. It is worth revisiting now that the
+identity problem is fixed. See §10.
 
 `detection_queue` survives as a safety net and should now always read 0 — a
 sighting is resolved into one screen before capture pauses, so nothing reaches
@@ -709,6 +839,9 @@ Runnable with the service virtualenv from the backend root:
 | Script | Covers |
 |---|---|
 | `test_tracking.py` | Identity, staleness held constant at 10/21/43 Hz, a four-minute review pause not evicting tracks, exit-zone eviction, belt-speed recovery |
+| `test_reid.py` | An object keeps its id across a gap in detection, including one spanning a whole stop; past the revive window it correctly gets a new one; and an id never reaches a different object — a new arrival in the same lane, two objects one behind the other, a moving belt with a long gap, an object that left the frame, another lane |
+| `test_parked_edge.py` | An object parked half out of the bottom of a stopped belt reaches the operator on one screen, not one per frame, and does not come back after submit |
+| `test_edge_duplicate.py` | An object reviewed while whole is not reviewed again as a half box on its way out of the bottom of the frame, and the bottom of the frame is still live for new objects |
 | `test_dup.py` | Trailing object kept, same object filtered, the whole queued backlog matched against, the live 306 px regression from batch `T11790579022` |
 | `test_queue.py` | The four states of the review screen: first detection shown, second queued behind it, Submit promoting while staying frozen and interlocked, Submit on an empty queue restoring the live view |
 | `test_merge.py` | Both live class-confusion pairs merged, genuinely adjacent objects kept separate |
@@ -835,9 +968,64 @@ in different photos are in different places and cannot share one image.
 belt when the stop begins but slides off the bottom of the picture before the
 belt halts cannot be in any of those three photos. The old behaviour caught it
 by accident, because it froze the photo the object was seen in. So the system
-now keeps hold of anything that leaves the view mid-stop, together with the last
-photo it appeared in, and shows it straight after the main screen. If you ever
-see a second screen now, that is what happened — and the log says so plainly.
+keeps hold of anything that leaves the view mid-stop, together with the last
+photo it appeared in, and shows it straight after the main screen.
+
+**The machine now keeps track of an object even when it blinks.** The AI is not
+certain from photo to photo — a lot of what this machine spots it is only
+barely sure about — so an object sitting in plain view gets found, missed for a
+few photos, then found again. The machine used to treat that second sighting as
+a completely new object. Since "have I already shown you this?" is answered by
+which object it thinks it is, the same piece of foreign matter got shown,
+cropped and counted more than once. On one belt stop this turned a handful of
+real objects into eleven.
+
+Now, when the AI loses sight of something, the machine holds onto its identity
+for a couple of seconds instead of forgetting it immediately. If something
+turns up again in the same place, it gets its old identity back rather than a
+new one.
+
+It only does this when the object could genuinely still be there. It has to be
+in the same position across the belt, and no further down it than the belt
+could have carried it in that time. On a stopped belt that means it has barely
+moved, so the test is strict. On a moving belt the object is long gone, so
+anything new appearing in that lane is correctly treated as a different object.
+An object that has run off the bottom of the picture only keeps its identity if
+it has not moved since — which happens when the belt is stopped and it comes to
+rest half in and half out of the picture. It is still spotted over and over
+from the half that is visible, and used to count as a new object every time.
+One frame of a moving belt carries an object much further than that, so
+something genuinely on its way out does not keep its identity.
+
+There is a second half to that. An object resting at the very bottom edge is
+still in the picture, so it belongs on the ordinary review screen along with
+everything else — and the machine used to *also* file it under "this one got
+away before I could stop the belt" and show it again afterwards. It now checks
+whether the object is still there before doing that. If it is, it goes on the
+normal screen and nowhere else.
+
+**An object is not counted twice for being half out of the picture.** The belt
+carries things down and out of the bottom of the picture, so on its way out
+every object is cut in half — and the machine could still see the half that was
+left, which it used to treat as a brand new object. That is why two pieces of
+paper arrived as four. It now recognises a box cut off by the bottom edge as
+the tail end of something it has already been watching, not as something new.
+
+Giving the camera a wider view instead is not possible — it already reads its
+whole sensor, so there is no more picture to be had.
+
+**Which order the operator sees them in.** When more than one screenful of
+objects is waiting, the most recently identified one is shown first, then the
+one before it, and so on back. The object just identified is the one the
+operator is looking at on the belt.
+
+**And one thing that can still be lost.** This belt is fast — an object crosses
+the whole picture in under a second, about as long as the belt takes to stop —
+so the stopped-belt photos often contain nothing at all, and an object the AI
+stops spotting partway through the stop is not caught. Showing everything ever
+seen during the stop was tried and made things worse at the time, because it
+was built on top of the identity problem above. Worth trying again now that
+part is fixed.
 
 **A second thing that was making it worse.** Every detection was saving a
 full-size photo to disk, which took 52 milliseconds — more than twice as long as

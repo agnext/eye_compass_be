@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.models.schema import Result
 from app.services.database_service import DatabaseService
+from app.services.scan_session import fm_name_from_token
 from app.services.sync_lock import claim_result
 from app.services.sync_service import sync_service
 
@@ -270,8 +271,14 @@ def get_result_images(
                     # Stripping every trailing all-digit token, not just the
                     # last one, handles any of these regardless of how many
                     # numeric suffixes a given crop's filename happens to have.
-                    "fm_type": " ".join(
-                        _strip_trailing_numeric_tokens(name.rsplit(".", 1)[0])
+                    # Back through the same mapping the filename was written
+                    # with, so a name carrying a separator ("Insects/Pest") is
+                    # shown as the operator chose it rather than in its
+                    # on-disk token form.
+                    "fm_type": fm_name_from_token(
+                        "_".join(
+                            _strip_trailing_numeric_tokens(name.rsplit(".", 1)[0])
+                        )
                     ),
                     "data_uri": f"data:{mime};base64,{encoded}",
                 }

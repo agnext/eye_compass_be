@@ -83,6 +83,36 @@ def _slug(value: str) -> str:
     return (value or "").strip().lower().replace(" ", "_")
 
 
+# A crop's filename IS the record — create_results counts files by their FM-type
+# prefix — so the FM name has to survive a round trip through the filesystem.
+# Spaces have always been written as underscores. A forward slash cannot be
+# written at all: it is the path separator, so "Insects/Pest_<ts>_<i>.png" asks
+# for a file called "Pest_..." inside a directory called "Insects" that does not
+# exist, and cv2.imwrite quietly returns False. The operator labels the object,
+# the call succeeds, and the crop is never written — the object is lost, not
+# merely miscounted. Reported live on 29 Sep after the Qualix config gained
+# "Insects/Pest" and "Mould/Fungus".
+#
+# "~" is the stand-in for a separator: it is legal in a filename, and no FM name
+# contains it, so the mapping reverses without ambiguity (unlike "-", which
+# NON-FM already uses). Every writer and every reader goes through this pair.
+_FM_NAME_SEPARATORS = ("/", "\\", os.sep)
+
+
+def fm_filename_token(fm_name: str) -> str:
+    """The form of an FM name that is safe to put in a filename."""
+    token = fm_name.replace(" ", "_")
+    for sep in _FM_NAME_SEPARATORS:
+        if sep:
+            token = token.replace(sep, "~")
+    return token
+
+
+def fm_name_from_token(token: str) -> str:
+    """Reverse fm_filename_token, for display."""
+    return token.replace("~", "/").replace("_", " ")
+
+
 class ScanSession:
     """One inspection run. There is a single active session at a time, matching
     the single-operator, single-conveyor nature of the machine."""
@@ -129,6 +159,10 @@ class ScanSession:
             x_tolerance=settings.TRACK_X_TOLERANCE_PX,
             x_tolerance_ratio=settings.TRACK_X_TOLERANCE_RATIO,
             stale_after_seconds=settings.TRACK_STALE_AFTER_SECONDS,
+            revive_within_seconds=settings.TRACK_REVIVE_WITHIN_SECONDS,
+            travel_margin=settings.TRACK_TRAVEL_MARGIN,
+            min_travel_px=settings.TRACK_MIN_TRAVEL_PX,
+            edge_margin_px=settings.TRACK_EDGE_MARGIN_PX,
         )
         self.tracker.update([[0, 0, 0, 0, 0, 0]], 0, (1200, 1920))
 
@@ -687,10 +721,12 @@ class ScanSession:
             # the same physical object — so both halves are logged together:
             # which ids are new this frame, and which were evicted (with the
             # rule that evicted them) on the way here. Remove once root-caused.
-            if new_ids or self.tracker.last_evicted:
+            if new_ids or self.tracker.last_evicted or self.tracker.last_revived:
                 logger.info(
-                    "Track churn: new=%s evicted=%s tracked=%s counted_so_far=%s",
-                    sorted(new_ids), self.tracker.last_evicted,
+                    "Track churn: new=%s revived=%s evicted=%s tracked=%s "
+                    "counted_so_far=%s",
+                    sorted(new_ids), sorted(self.tracker.last_revived),
+                    self.tracker.last_evicted,
                     sorted(track_ids), len(self.counted_track_ids),
                 )
 
@@ -709,6 +745,19 @@ class ScanSession:
             for i, box in enumerate(boxes):
                 track_id = assignment[i] if i < len(assignment) else None
                 if track_id is not None and track_id in self.counted_track_ids:
+                    continue
+                # A detection clipped by the bottom edge with no id is half an
+                # object on its way out. The tracker deliberately refuses it a
+                # new id, which means the already-shown filter above cannot
+                # speak for it and the geometry backstop below would call it
+                # novel and put it on screen — showing an object the operator
+                # has already reviewed a second time as a half box. Anything
+                # genuinely new was whole and identified further up the frame;
+                # anything leaving that has never been shown is carried by
+                # _note_escapes, which works off its track id. Neither needs
+                # this detection.
+                if (track_id is None
+                        and detections[i][3] >= h - self.tracker.edge_margin_px):
                     continue
                 # The padded box travels together with the unpadded
                 # detection it came from. Padding exists to give the saved
@@ -821,6 +870,33 @@ class ScanSession:
 
             return self._snapshot(fm_detected=fm_detected)
 
+    @staticmethod
+    def _overlaps_any(box, others, min_iou: float = 0.2) -> bool:
+        """Is this box the same object as one of `others`?
+
+        Plain IoU on the unpadded boxes. The belt is stopped whenever this is
+        asked, so the same object measured a moment apart lands in very nearly
+        the same place and a low threshold is enough.
+        """
+        if not others or box is None or len(box) < 4:
+            return False
+        ax1, ay1, ax2, ay2 = box[:4]
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        for other in others:
+            if other is None or len(other) < 4:
+                continue
+            bx1, by1, bx2, by2 = other[:4]
+            ix = max(0, min(ax2, bx2) - max(ax1, bx1))
+            iy = max(0, min(ay2, by2) - max(ay1, by1))
+            inter = ix * iy
+            if not inter:
+                continue
+            area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+            union = area_a + area_b - inter
+            if union > 0 and inter / union >= min_iou:
+                return True
+        return False
+
     def _note_escapes(self, frame: np.ndarray, h: int, w: int):
         """Remember anything that leaves the view while the belt is stopping.
 
@@ -839,6 +915,16 @@ class ScanSession:
                 continue
             if obj_id in self.counted_track_ids or obj_id in self._escaped:
                 continue
+            # An id minted and exit-evicted inside the same update never
+            # travelled anywhere — it is an object sitting in the bottom
+            # 50px of a STOPPED belt, detected afresh because the exit rule
+            # had already taken its previous id. Treating that as an escape
+            # queued one extra review screen per frame, each under a brand
+            # new id, so the per-id guard above could never catch it and the
+            # operator was shown the same parked object several times over.
+            # Reported live, 29 Sep: one object, three screens.
+            if self.tracker.last_evicted_first_frames.get(obj_id) == self.frame_count:
+                continue
             box = self.tracker.last_evicted_boxes.get(obj_id)
             if box is None or len(box) < 4:
                 continue
@@ -853,7 +939,7 @@ class ScanSession:
                 obj_id,
             )
 
-    def _queue_escapes(self):
+    def _queue_escapes(self, still_visible=None):
         """Put anything that got away behind the main review screen.
 
         One entry each, carrying its own frame, because they were last seen at
@@ -861,8 +947,21 @@ class ScanSession:
         measured in. They are marked as counted here rather than when shown:
         they have left the camera's view, so nothing will detect them again and
         there is no second chance to record them.
+
+        `still_visible` is the combined stationary detection set the review
+        screen is being built from. Anything overlapping one of those boxes did
+        not get away at all — it is parked half out of the bottom of the frame
+        and is about to be shown on the main screen — so queueing it as well
+        showed the operator the same object twice.
         """
         escaped, self._escaped = self._escaped, {}
+        for obj_id, item in list(escaped.items()):
+            if self._overlaps_any(item["raw_box"], still_visible or []):
+                logger.info(
+                    "Object %s is still in view on the stopped belt — it is on "
+                    "the main review screen, not queued as an escape.", obj_id,
+                )
+                del escaped[obj_id]
         for obj_id, item in escaped.items():
             self.detection_queue.append({
                 "frame": item["frame"],
@@ -894,14 +993,16 @@ class ScanSession:
         trigger, self._trigger = self._trigger, None
         self.review_phase = "reviewing"
 
-        # Anything that left the view while the belt was stopping goes behind
-        # whatever the stationary frames turn up. Done first so every exit
-        # below, including the ones that find nothing, still shows them.
-        self._queue_escapes()
-
         combined = [d for sample in samples for d in sample["detections"]]
         combined = self._merge_overlapping_detections(combined)
         frame = samples[-1]["frame"] if samples else None
+
+        # Anything that left the view while the belt was stopping goes behind
+        # whatever the stationary frames turn up. Queued before every exit
+        # below, including the ones that find nothing, so they still show —
+        # but after `combined` exists, because anything still sitting in view
+        # belongs on the main screen instead of behind it.
+        self._queue_escapes(still_visible=combined)
 
         if not combined and trigger is not None:
             # The stationary frames found nothing — the model lost whatever it
@@ -1074,7 +1175,10 @@ class ScanSession:
             self.labelled_indices = set()
             return False
 
-        item = self.detection_queue.pop(0)
+        # Newest first. The most recently identified object is the one the
+        # operator is looking at on the belt, so it is the one to show next;
+        # anything queued earlier keeps its place behind it.
+        item = self.detection_queue.pop()
         boxes = item["boxes"]
         raw_boxes = item.get("raw_boxes")
 
@@ -1182,7 +1286,7 @@ class ScanSession:
                 raise ValueError("Degenerate bounding box; nothing to crop")
 
             crop = self.pending_frame[y1:y2, x1:x2]
-            safe_name = fm_name.replace(" ", "_")
+            safe_name = fm_filename_token(fm_name)
             # Nanosecond timestamp AND the box's own index, not just a
             # millisecond timestamp: confirmed live, two boxes on the same
             # reviewed frame tapped in quick succession landed in the same
@@ -1206,7 +1310,16 @@ class ScanSession:
             # legacy's submit_fm_type applies (main.py:1361) — see
             # _COLOR_ORDER_NOTE above for why copying that line literally
             # swapped red and blue in every saved crop.
-            cv2.imwrite(path, crop)
+            #
+            # Checked, not assumed. imwrite reports failure by returning False
+            # rather than raising, and a crop that is not on disk is an object
+            # that never happened: not counted, not synced, not in the
+            # reclassify gallery — while the operator was told the label was
+            # accepted. Raising turns silent data loss into a visible error.
+            if not cv2.imwrite(path, crop):
+                raise RuntimeError(
+                    f"Could not write crop {filename!r} for {fm_name!r}"
+                )
 
             self.labelled_indices.add(index)
             logger.info(
@@ -1351,10 +1464,14 @@ class ScanSession:
 
         if os.path.isdir(self.output_folder):
             for name in os.listdir(self.output_folder):
-                parts = name.split("_")
-                stem = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+                # Matched in the filename's own spelling rather than by
+                # translating the filename back into a display name. The two
+                # are the same thing for a plain name, but a name carrying a
+                # separator only ever exists on disk in its token form, and
+                # that is the form the file actually has.
+                stem = name.rsplit(".", 1)[0]
                 for key in params:
-                    if stem.startswith(key):
+                    if stem.startswith(fm_filename_token(key)):
                         counter[key] += 1
 
         counter["Blower FO"] = blower_fo
@@ -1367,9 +1484,11 @@ class ScanSession:
         counted as — same stem-splitting logic, applied to one name instead
         of a whole directory listing."""
         params = sorted(list(self.analysis_parameters) + ["FM", "NON-FM"], key=len, reverse=True)
-        parts = name.split("_")
-        stem = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
-        return next((key for key in params if stem.startswith(key)), "NON-FM")
+        stem = name.rsplit(".", 1)[0]
+        return next(
+            (key for key in params if stem.startswith(fm_filename_token(key))),
+            "NON-FM",
+        )
 
     def _crop_object_id(self, name: str) -> str:
         """The part of a crop's filename that is NOT its FM-type prefix —
@@ -1384,7 +1503,7 @@ class ScanSession:
         """
         fm_type = self._crop_fm_type(name)
         stem_no_ext = name.rsplit(".", 1)[0]
-        prefix = fm_type.replace(" ", "_") + "_"
+        prefix = fm_filename_token(fm_type) + "_"
         if stem_no_ext.startswith(prefix):
             return stem_no_ext[len(prefix):]
         return stem_no_ext
@@ -1466,7 +1585,7 @@ class ScanSession:
                 raise FileNotFoundError(f"No such crop: {name}")
 
             object_id = self._crop_object_id(safe_source)
-            safe_name = fm_name.replace(" ", "_")
+            safe_name = fm_filename_token(fm_name)
             new_name = f"{safe_name}_{object_id}.png"
             dest = os.path.join(folder, new_name)
             if dest != src:

@@ -149,6 +149,32 @@ class Settings:
     TRACK_X_TOLERANCE_PX: int = _as_int(os.getenv("TRACK_X_TOLERANCE_PX"), 10)
     TRACK_X_TOLERANCE_RATIO: float = _as_float(os.getenv("TRACK_X_TOLERANCE_RATIO"), 0.25)
 
+    # How long a track dropped for going unseen is still allowed to be claimed
+    # back by a later detection of the same object — see ObjectTracker._revive.
+    # The model is not certain frame to frame, so an object sitting in view is
+    # found, missed for a few frames, and found again; without this the second
+    # sighting is a brand-new id and the object is shown and counted twice.
+    # This covers a gap, not a disappearance: the object must still be in the
+    # same lane and no further down the belt than it could have travelled, so
+    # a long window costs nothing on a moving belt (the object is long gone by
+    # then) and is what makes a stopped one work (it has not moved at all).
+    TRACK_REVIVE_WITHIN_SECONDS: float = _as_float(
+        os.getenv("TRACK_REVIVE_WITHIN_SECONDS"), 2.0)
+    # Slack on "how far could it have travelled", as a multiple of the speed
+    # measured over the last few frames, plus a floor in pixels for a belt that
+    # has only just started moving. Generous on purpose: too tight mints a new
+    # id for an object that already had one, which is the failure being fixed.
+    TRACK_TRAVEL_MARGIN: float = _as_float(os.getenv("TRACK_TRAVEL_MARGIN"), 1.6)
+    TRACK_MIN_TRAVEL_PX: float = _as_float(os.getenv("TRACK_MIN_TRAVEL_PX"), 80.0)
+    # How close to the top or bottom edge of the frame a detection has to be
+    # before it is treated as a half-seen object rather than a whole one. A
+    # detection touching either edge may still be matched to a track it already
+    # had, but never mints a new id: the same object is otherwise counted once
+    # crossing the middle of the frame and again as a clipped box on its way
+    # out, which is one object reported as two. The belt runs top to bottom, so
+    # only those two edges matter — an object never enters or leaves sideways.
+    TRACK_EDGE_MARGIN_PX: int = _as_int(os.getenv("TRACK_EDGE_MARGIN_PX"), 15)
+
     # Most detections the operator may have waiting behind the one on screen.
     # Each queued entry holds its own full frame (1920x1200x3 = 6.9 MB), kept
     # because every crop is cut from the frame the object was found in, so the

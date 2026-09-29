@@ -135,6 +135,27 @@ deliberately still open.
   `9 - post_remediation_session_log.md` §7b) to preserve legacy parity for the
   Qualix datagram — that reasoning still applies to the saved figure, which is
   unchanged here.
+- **Batch details can be corrected on the results-review screen, before Save.**
+  Not a legacy feature — legacy has no way to touch the batch once the scan
+  starts. An "Edit Batch Details" button on the results-review screen (pending
+  window only, alongside Reclassify Objects) opens the editable subset of the
+  New Batch form: Vendor Name (with Vendor Code auto-filled from it, as
+  `populate_vendor_code` does), Manufacturing/Receiving Date, Brand, PO Number,
+  Sorting Quantity and Sorter Name. Batch ID, Site Code, Product Name and
+  Product Code are shown for context but never editable — the batch id is the
+  record's identity, and the other three come from Qualix.
+
+  `GET/POST /api/scan/pending/batch-details` back it. The POST writes the edits
+  to the `BatchDetails` row and rebuilds the datagram held in
+  `_pending_submission` from the updated row, the same rebuild-in-place pattern
+  and under the same `_pending_lock` as `/pending-crops/relabel`, so the
+  correction reaches Qualix on `/confirm` with no resend and a Save landing at
+  the same moment cannot read a half-updated datagram. The form seeds from the
+  batch row directly (raw dates, not the datagram's formatted ones), and
+  editing Sorter Name flows through to the datagram's `surveyor_name`, which
+  falls back to `sorter_name` when no submit-time surveyor was given (the
+  live-scan Submit never sends one).
+
 - **The reclassify endpoint is serialized against itself and against Save.**
   `POST /api/scan/pending-crops/relabel` renames one crop, then re-counts the
   entire batch folder and overwrites the module-level `_pending_submission`
@@ -1343,6 +1364,156 @@ deliberately still open.
   that function was written for, matching what `SessionStore.suggest_relogin`
   and the module's own docstring already described: "nothing is wrong if
   they carry on for now." See `scripts/test_offline_reconnect_relogin.py`.
+
+- **The "working offline" notice is a toast shown once at sign-in, not a
+  permanent banner.** It sat at the top of Home for as long as the session
+  lived. Working offline is a supported state rather than a fault, and there is
+  nothing for the operator to act on, so the notice now appears at the bottom
+  of the screen and fades out after six seconds (`OFFLINE_TOAST_MS` in
+  `Home.jsx`). It floats over the page rather than sitting in the layout, so
+  its arrival and departure do not shift the Home buttons, and the bottom
+  keeps it clear of the header and of the buttons the operator came to press.
+
+  Shown **once per session**, not once per visit to Home. Home is where an
+  operator lands after signing in but also where they return between every
+  batch, so showing it whenever Home mounts and the session is offline would
+  replay it all shift. It is recorded against the session token
+  (`OFFLINE_NOTICE_KEY`), so signing in again — which mints a new token — shows
+  it once more, while navigating back to Home, or reloading the page, does not.
+  If `localStorage` is unavailable the notice shows again rather than being
+  suppressed, since it is the operator's only indication they are offline.
+
+  The two re-login notices are deliberately left as they were — both ask the
+  operator for something, so they stay until acted on.
+
+- **An object keeps one identity through a gap in detection.** The model is
+  not certain frame to frame — plenty of what this machine detects sits near
+  0.2 confidence — so an object in plain view is found, missed for a few
+  frames, and found again. A gap longer than `TRACK_STALE_AFTER_SECONDS`
+  (0.3 s, about four frames at the measured rate) dropped the track, and the
+  next detection of the same object became a brand-new id. Every "have I
+  already shown this to the operator?" decision rests on that id, so the object
+  was shown, cropped and counted again. Measured on 29 Sep: one belt stop
+  produced ids 10 through 20, eleven "objects", for a handful of real ones.
+
+  `ObjectTracker._revive` holds a track dropped for going unseen for
+  `TRACK_REVIVE_WITHIN_SECONDS` (2.0) instead of forgetting it, and offers
+  those held tracks to a detection that is about to become a new id. It may
+  only claim one it plausibly is: same lane, at or ahead of where it was lost,
+  and no further ahead than `_max_travel` allows.
+
+  A track dropped by the **exit rule** is revivable on tighter terms — only by
+  a detection that has barely moved (`TRACK_MIN_TRAVEL_PX`, 80 px). An object
+  coming to rest half out of the bottom of the frame is still detected, frame
+  after frame, from the half still visible; the exit rule dropped its track
+  each time, so it collected a fresh id each time and was shown to the operator
+  twice. The belt is stopped throughout review, which is exactly when an object
+  sits there being re-detected. One frame of a running belt carries an object
+  ~96 px, past that bound, so something genuinely leaving cannot keep its id. A
+  fixed distance rather than a measured one because a track being evicted every
+  frame never matches, so no speed samples are taken and `current_speed_px_s`
+  freezes — a gate on measured speed deadlocks, and was tried and removed.
+
+  Deliberately a separate step rather than a longer staleness window: widening
+  the live window would change what every detection matches against on every
+  frame, while this only runs when there is no live track to match.
+
+  `_max_travel` reads `current_speed_px_s`, a new short-window median that
+  samples every match **including stationary ones**. `belt_speed_px_s` takes
+  only forward motion — correct for reporting how fast the belt runs, useless
+  here, because on a stopped belt nothing is sampled and the median sits at the
+  running speed as if it were still going. The new one falls to roughly zero
+  within a second of the belt stopping, which makes the bound tight exactly
+  where objects are not moving and wide where they are.
+
+  Live matching has no such upper bound. One was tried and removed: any bound
+  on how far down its lane a live track may reach has to be derived from how
+  fast things are moving, and while the belt decelerates the objects on it move
+  at very different speeds at the same instant — one already at rest, another
+  still crossing most of a frame height. Every estimate over that mixture sits
+  well below what the fastest object is doing, so the bound refused matches the
+  belt had plainly made and the next detection of an already-tracked object
+  became a new id, manufacturing the very duplicate this work removes. Two
+  objects one behind the other are separated by nearest-match instead, which
+  gives each detection to the closest track rather than the first in range.
+  `scripts/test_reid.py` covers identity surviving a gap and an id never
+  reaching a different object.
+
+- **An object parked at the bottom edge is reviewed once, not once per frame.**
+  An object that comes to rest half in and half out of the bottom of the frame
+  is detected again on every frame from the half still visible, and the
+  tracker's exit rule takes its id every time — so it was minted and evicted
+  once per frame, each time under a new id. Two things then multiplied it:
+  every one of those one-frame ids looked like an object that had just left the
+  view, so each queued its own review screen; and the object is also visible in
+  the stationary frames, so it appeared on the main screen as well. Reported
+  live on 29 Sep as one object reaching the operator as three screens.
+
+  The escape path now ignores any track whose first frame is also its last — it
+  never travelled anywhere — and drops any held escape that overlaps the
+  stationary detections the review screen is being built from, because
+  something still in view did not get away. The overlapping escape is not
+  marked counted on the way out, since revival hands the same id back to the
+  object still in view and counting it would filter it off the screen it
+  belongs on. `scripts/test_parked_edge.py` is the regression.
+
+- **An FM name containing a separator is written to disk safely.** A crop's
+  filename is the record: `create_results` counts files by their FM-type
+  prefix. Spaces have always been written as underscores. A forward slash could
+  not be written at all — it is the path separator, so a crop for
+  `Insects/Pest` asked for a file inside a directory called `Insects` that does
+  not exist, and `cv2.imwrite` quietly returned `False`. The operator labelled
+  the object, the call succeeded, and the crop was never written: the object
+  was lost outright, not merely miscounted, and the submit table showed nothing
+  for that type. Surfaced on 29 Sep when the Qualix commodity config gained
+  `Insects/Pest` and `Mould/Fungus`.
+
+  `fm_filename_token` / `fm_name_from_token` are now the single pair every
+  writer and reader goes through. A separator is written as `~`, which is legal
+  in a filename and appears in no FM name, so the mapping reverses without
+  ambiguity — unlike `-`, which `NON-FM` already uses. Counting and crop-type
+  resolution match on the filename's own spelling rather than translating it
+  back first, since a name carrying a separator only ever exists on disk in its
+  token form. Existing crops are unaffected: none contain `~`, and a plain name
+  tokenises to exactly what was already written.
+
+  `label_detection` now checks `cv2.imwrite`'s return value and raises. It
+  reports failure by returning `False` rather than raising, so any future
+  unwritable crop becomes a visible error instead of an object that silently
+  never happened. `scripts/test_fm_names.py` covers the full vocabulary.
+
+- **An object clipped by the bottom edge of the frame is not a new object.**
+  The belt carries material down and out of the bottom of the frame, so every
+  object is cut in half by that edge on its way out. The model still finds it
+  from the visible half, and that clipped detection used to be minted a fresh
+  track id — making it a new object to everything downstream, so an object
+  reviewed while whole in the middle of the frame was reviewed again a moment
+  later as a half box. Reported live on 29 Sep as two objects reaching the
+  operator as four.
+
+  A detection whose lower edge comes within `TRACK_EDGE_MARGIN_PX` (default 15)
+  of the bottom of the frame is now refused a *new* id. Matching and revival
+  run first and are untouched, so an object on its way out keeps the id it
+  already owns — which is what the exit rule and the escape path work from —
+  and `ScanSession` drops any bottom-clipped detection that still comes back
+  with no id, since the already-shown filter speaks through ids and the
+  geometry backstop would otherwise call it novel.
+
+  The top edge is deliberately excluded. An entering object is equally clipped,
+  but it is minted while clipped and keeps that id as it comes in, so entry
+  never produced a second id; refusing one there would leave a large object
+  resting against the top edge with no identity at all, and identity is the
+  only thing that stops it being reviewed twice. Widening the camera's view to
+  give objects room at the edges is not an option — the sensor is already read
+  out in full. `scripts/test_edge_duplicate.py` is the regression.
+
+- **The review backlog is drained newest-first.** When more than one screenful
+  of objects is waiting, submitting the current screen brings up the most
+  recently identified one next, then the one before it. The object just
+  identified is the one the operator is looking at on the belt. This is a
+  deviation from legacy, whose `detection_queue` is a FIFO `queue.Queue`
+  (`main.py:2391`); legacy's newest-first `LifoQueue` is the camera-to-inference
+  one and is not the precedent here.
 
 ## Suggested future enhancements
 

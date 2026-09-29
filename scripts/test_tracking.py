@@ -61,7 +61,23 @@ print("pause-immunity passed")
 
 # --- the exit-zone rule still fires, and names itself in the diagnostic -----
 t = ObjectTracker(x_tolerance=10)
+# A detection already clipped by the bottom edge is half an object on its way
+# out and is never given an id of its own — it would only be evicted again on
+# the same update, once per frame, each time under a new id.
 t.update([box(300, 1160)], 1, SIZE, now=0.0)
+assert t.get_tracked_objects() == {}, t.get_tracked_objects()
+assert t.last_evicted == {}, (
+    "a half object at the bottom edge was minted an id just to evict it: %s"
+    % t.last_evicted)
+assert t.last_assignment == [None], t.last_assignment
+print("bottom-edge mint refused:", t.last_assignment)
+
+# An object tracked from inside the frame still hits the exit rule on its way
+# out, and still names itself in the diagnostic.
+t = ObjectTracker(x_tolerance=10)
+t.update([box(300, 900)], 1, SIZE, now=0.0)
+assert list(t.get_tracked_objects()) == [1], t.get_tracked_objects()
+t.update([box(300, 1155)], 2, SIZE, now=0.05)
 assert t.get_tracked_objects() == {}
 assert "exit-zone" in list(t.last_evicted.values())[0], t.last_evicted
 print("exit-zone check passed:", t.last_evicted)

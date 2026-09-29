@@ -126,6 +126,43 @@ class RelabelCropRequest(BaseModel):
     fm_name: str
 
 
+# The batch fields the operator may correct on the results-review screen,
+# before Save. Deliberately excludes batch_number (the record's identity),
+# site_code, product_name and product_code: the last three come from Qualix and
+# are shown for context only. vendor_code is derived from the chosen vendor
+# (populate_vendor_code), so it is set from vendor_name, never typed — but it is
+# accepted here because the frontend sends the pair together, exactly as the New
+# Batch form does.
+_EDITABLE_BATCH_FIELDS = (
+    "vendor_name",
+    "vendor_code",
+    "manufacturing_date",
+    "receiving_date",
+    "brand",
+    "po_number",
+    "sorting_quantity",
+    "sorter_name",
+)
+
+_READONLY_BATCH_FIELDS = (
+    "batch_number",
+    "site_code",
+    "product_name",
+    "product_code",
+)
+
+
+class PendingBatchEditRequest(BaseModel):
+    vendor_name: Optional[str] = None
+    vendor_code: Optional[str] = None
+    manufacturing_date: Optional[str] = None
+    receiving_date: Optional[str] = None
+    brand: Optional[str] = None
+    po_number: Optional[str] = None
+    sorting_quantity: Optional[str] = None
+    sorter_name: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Background sync
 # ---------------------------------------------------------------------------
@@ -556,6 +593,112 @@ def relabel_pending_crop(req: RelabelCropRequest, db: Session = Depends(get_db))
             "result": result_payload,
             "datagram": datagram,
             "crops": scan_session.list_pending_crops(),
+        }
+
+
+def _batch_details_response(batch) -> dict:
+    """Editable + read-only batch fields, split the way the review screen shows
+    them. Read straight off the BatchDetails row, so dates come back in their
+    stored form (what a date input needs) rather than the datagram's already-
+    formatted display form."""
+    return {
+        "editable": {f: (getattr(batch, f, "") or "") for f in _EDITABLE_BATCH_FIELDS},
+        "readonly": {f: (getattr(batch, f, "") or "") for f in _READONLY_BATCH_FIELDS},
+    }
+
+
+@router.get("/pending/batch-details")
+def get_pending_batch_details():
+    """The batch details behind the pending submission, for the edit form.
+
+    Only valid between /submit and /confirm-or-discard — the same window as the
+    reclassify feature. Reads from _pending_submission's own BatchDetails row so
+    the form is seeded with exactly what will be saved, no round trip through
+    the datagram (whose field names and date formatting differ).
+    """
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to edit — submit a result first.",
+            )
+        batch = _pending_submission.get("batch")
+        if batch is None:
+            raise HTTPException(
+                status_code=404,
+                detail="This submission has no batch details to edit.",
+            )
+        return {"status": "success", **_batch_details_response(batch)}
+
+
+@router.post("/pending/batch-details")
+def update_pending_batch_details(
+    req: PendingBatchEditRequest, db: Session = Depends(get_db)
+):
+    """Correct the batch details on the results-review screen, before Save.
+
+    Writes the edited fields back to the BatchDetails row AND rebuilds the
+    datagram in _pending_submission from the updated row, so the correction
+    reaches Qualix on /confirm without the frontend resending anything — the
+    same rebuild-in-place pattern as /pending-crops/relabel. batch_number,
+    site_code, product_name and product_code are never touched here (see
+    _EDITABLE_BATCH_FIELDS); a value sent for one is ignored.
+
+    The whole read-modify-write runs under _pending_lock so a Save landing at
+    the same moment cannot read a half-updated datagram.
+    """
+    global _pending_submission
+
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to edit — submit a result first.",
+            )
+        pending = _pending_submission
+        batch = pending.get("batch")
+        if batch is None:
+            raise HTTPException(
+                status_code=404,
+                detail="This submission has no batch details to edit.",
+            )
+
+        row = db.query(BatchDetails).filter(BatchDetails.id == batch.id).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Batch not found")
+
+        for field in _EDITABLE_BATCH_FIELDS:
+            value = getattr(req, field)
+            # None means "not sent" — leave the stored value alone. An empty
+            # string is a deliberate clear and is honoured.
+            if value is not None:
+                setattr(row, field, value.strip() if isinstance(value, str) else value)
+
+        try:
+            db.commit()
+            db.refresh(row)
+        except Exception as exc:
+            db.rollback()
+            logger.error("Failed to update batch details: %s", exc)
+            raise HTTPException(
+                status_code=500, detail=f"Failed to update batch details: {exc}"
+            )
+
+        datagram = build_datagram(
+            db,
+            session_status=pending["status_before"],
+            result_payload=pending["result_payload"],
+            batch=row,
+            surveyor_name=pending["surveyor_name"],
+            operator_id=pending.get("operator_id", ""),
+        )
+
+        _pending_submission = {**pending, "batch": row, "datagram": datagram}
+
+        return {
+            "status": "success",
+            "datagram": datagram,
+            **_batch_details_response(row),
         }
 
 
