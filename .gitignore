@@ -21,6 +21,9 @@ venv.bak/
 # "output/" would also match any future app/**/output/ directory.
 /output/
 /output_frame/
+# Daily log files (logs/eye_compass_<date>.log). Leading slash for the same
+# reason as above — only this directory, not any app/**/logs/.
+/logs/
 /Data_Collection/
 /rejected/
 *.log

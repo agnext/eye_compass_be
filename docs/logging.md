@@ -1,8 +1,52 @@
 # Logging
 
-**What this file is:** how the backend's logs are formatted, how to read them,
-and how to switch the colour off. Applies to the whole backend, not just one
-feature.
+**What this file is:** where the backend's logs are kept, how they are
+formatted, how to read them, and how to switch the colour off. Applies to the
+whole backend, not just one feature.
+
+---
+
+## Where the logs are
+
+Two places, always both:
+
+| | Where | Survives a reboot |
+|---|---|---|
+| The journal | `journalctl -u eye-compass-backend.service` | **No** — see below |
+| Daily files | `eye_compass_be/logs/eye_compass_<YYYY-MM-DD>.log` | Yes |
+
+The journal is what you read day to day, and `scripts/logs.py` below is built
+around it. The files are what is left after the device restarts.
+
+**The journal on this device is not persistent.** `/var/log/journal` does not
+exist, and `Storage=auto` in `journald.conf` means "persist only if that
+directory exists" — so the journal lives in `/run/log/journal`, which is tmpfs.
+`journalctl --list-boots` shows exactly one boot, and everything in it is gone
+the moment the device restarts. On a kiosk that is restarted routinely — and
+often restarted *by* whatever fault someone then wants the logs for — that is
+the wrong place for the only copy.
+
+The daily file is the copy that lasts. It is written by `DailyFileHandler`
+(`app/core/logging_setup.py`) into `logs/eye_compass_<date>.log`, the same
+naming legacy used (`logger.py:31-35`), switching file at midnight and flushing
+every record as it is written so an unexpected shutdown does not lose the last
+few lines. Its timestamps carry the date, which the console's do not: a line
+read six weeks later has to say which day it came from.
+
+```bash
+tail -f eye_compass_be/logs/eye_compass_$(date +%F).log
+grep -E "AUTH|SESSION" eye_compass_be/logs/eye_compass_2026-09-30.log
+```
+
+Files older than `LOG_RETENTION_DAYS` (default 30) are deleted at startup.
+Set it to `0` to keep them forever, which is what legacy did — its
+`archive_old_logs` had the delete block stranded after a `continue` and never
+ran once. Only files matching `eye_compass_<date>.log` with a parsable date are
+ever touched. `LOG_DIR` moves the directory.
+
+If the log file cannot be opened — read-only or full disk — the backend logs
+that and starts anyway, with the journal only. A device whose job is the belt
+does not stop over a log file.
 
 ---
 
@@ -32,9 +76,9 @@ service that colours its own output has that colour removed before `journalctl`
 ever sees the message — this was tested directly on this device and confirmed.
 
 So colour has to be applied when the logs are **read**, not written.
-`scripts/logs.py` runs `journalctl` and colours the output on the way past.
-Nothing is stored differently and no log file is duplicated — it is purely a
-viewer.
+`scripts/logs.py` runs `journalctl` and colours the output on the way past. It
+is purely a viewer — it stores nothing and changes nothing about what is
+written, including the daily file, which is never coloured.
 
 The backend can still colour its own output when run by hand in a terminal
 (uvicorn during development), where nothing strips it.

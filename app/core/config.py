@@ -106,6 +106,15 @@ class Settings:
     XAI_MODEL_PATH: str = _env(
         "XAI_MODEL_PATH", default="/home/nvidia/eye_compass/xai_models/v6_best.pt"
     )
+    # Daily log files, in legacy's layout (logs/eye_compass_<date>.log). The
+    # journal is the primary place these are read from; this is the copy that
+    # survives a reboot. See app/core/logging_setup.py and docs/logging.md.
+    LOG_DIR: str = _env("LOG_DIR", default=str(_backend_root / "logs"))
+    # Days of log files to keep. Legacy kept them forever — its archive_old_logs
+    # had the zip/delete block stranded after a `continue` and never ran even
+    # once — which on a device nobody prunes by hand grows without a ceiling.
+    # 0 disables the sweep and restores that behaviour exactly.
+    LOG_RETENTION_DAYS: int = _as_int(_env("LOG_RETENTION_DAYS", default="30"), 30)
 
     # ---------------- Camera ----------------
     CAMERA_INDEX: int = _as_int(_env("CAMERA_INDEX", section="CAMERA", key="camera_index"), 0)

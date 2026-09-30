@@ -607,6 +607,47 @@ aborts the interpreter, which reads as a crash in the journal.
 The stream loop also logs the measured detection rate every 10 s
 (`Detection rate: N fps`), so this no longer has to be inferred from timestamps.
 
+### 5.1 The same thread now also writes the training artifacts
+
+Legacy kept a second set of files per frame, in an `fm/` folder beside the raw
+frames: the full frame as a PNG, a `.txt` of YOLO labels, and a `.conf` of the
+matching confidences (`main.py:2474-2533`). That is the dataset the detection
+models are retrained from. It had not been ported — the crops under `output/`
+and the `r_frame_N.jpg` frames had, but a crop is one object with no
+coordinates, so a scan was producing nothing that could be relabelled or fed
+back into training.
+
+`save_fm_training_artifacts` restores it, and rides the same background writer
+described above rather than adding a second thread. That is not only to keep
+the encode off the detection loop — a full-frame PNG at compression level 3 is
+slower than the JPEG it sits next to — but so `flush_raw_frames()` covers
+everything a finished scan left in flight instead of half of it. The writer's
+queue now carries tagged jobs (`"jpg"` / `"fm"`); the frame number comes from
+`frame_count`, the same counter legacy named its files after.
+
+Two deliberate differences from legacy:
+
+- **The labels are the model's own boxes, not the padded ones.** Legacy's
+  signal path padded the boxes via `enlarge_bbox` *before* handing them to the
+  saver, so every label it wrote was inflated by the crop padding on all four
+  sides. That padding exists to make a crop the operator can read (§9.3); as
+  ground truth it is simply wrong. The write happens straight after
+  `apply_suppression_rules`, before padding, merging or tracking touch the
+  list — each of those steps serves the review screen and each makes the boxes
+  a worse record of what the model saw.
+- **`fm/low_confidence_frames/` is populated for real.** Legacy created the
+  folder and had the branch, but its `high_confidence` flag is the same value
+  as `fm_flag`, and `emit_results` only emitted at all when detections had
+  *survived* suppression — so nothing suppressed ever reached the saver and the
+  folder stayed empty. Those are the frames most worth retraining on, given
+  §11's first open item: a whole frame discarded on the strength of
+  `detections[0]`. They are now kept, under their own folder, and nothing about
+  what the operator sees changes.
+
+The S3 worker walks the session folder, so it picks the new subfolder up
+unchanged; `update_fm_count` counts only `.jpg` at the folder root, so the
+"Frame Count" metric is unaffected.
+
 ---
 
 ## 6. Track staleness is measured in time, not frames
@@ -1111,6 +1152,25 @@ And **the frozen picture you review is now sent at the camera's full
 resolution** instead of the reduced size used for the live view. It is sent
 once, with the belt already stopped, so it costs nothing while scanning and
 makes every close-up sharper.
+
+### The pictures the models are trained from were not being kept
+
+Separate from everything above, and worth stating plainly: for every frame the
+camera found something in, the original machine saved three files — the whole
+picture, a list of where in it each object was, and how sure the model was
+about each one. Those three files together are what the detection models get
+retrained from. Nothing else on the machine can replace them: the small cut-out
+images the operator labels are one object each with no record of where they
+came from, so they cannot be used to teach the model where to look.
+
+This port had never been saving them. Every scan run on it so far produced no
+training data at all. It does now, into the same folder and the same file
+formats as before, so anything collected from here on can be used directly.
+
+One thing is also kept now that never was before: frames the software decided
+to throw away because it did not trust what it saw. Those are exactly the cases
+worth showing the model again, and they go into their own folder so they are
+never confused with the rest. The operator sees no difference either way.
 
 ### Two things worth knowing
 

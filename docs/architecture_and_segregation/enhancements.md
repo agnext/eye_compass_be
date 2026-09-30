@@ -523,6 +523,51 @@ deliberately still open.
   meaning "accepted", not "done" — so a caller could not tell a finished sync
   from a failed one, and the frontend had no moment at which to refresh. It
   now runs inline and returns `{"status": ..., "synced": bool}`.
+- **The per-frame training artifacts (`fm/frame_N.png` + `.txt` + `.conf`) are
+  written again.** Legacy's `save_image` (`main.py:2474-2533`) kept, for every
+  frame that carried detections, the full frame as a PNG alongside a YOLO
+  label file and a matching confidence file — the dataset the detection models
+  are retrained from. The port had carried over the operator crops under
+  `output/` and the `r_frame_N.jpg` full frames, but not this triple, so a
+  scan produced nothing that could be relabelled or used as detection training
+  data (a crop is one object with no coordinates). `ScanSession.
+  save_fm_training_artifacts` restores it on the existing frame-writer thread,
+  with the same folder layout and the same file formats.
+
+  Two deliberate differences from legacy. The labels are written from the
+  model's own boxes rather than the padded ones legacy happened to pass on,
+  which had every label inflated by the crop padding on all four sides — fine
+  for cutting a crop, wrong as ground truth. And `fm/low_confidence_frames/`
+  is genuinely populated: legacy created the folder and had the branch, but
+  its own signal only fired for detections that had *survived* commodity
+  suppression, so nothing ever landed there. Suppressed frames are exactly the
+  ones worth retraining on, so here they are kept.
+
+- **Logs are written to a daily file again, not only to the journal.** The port
+  logged exclusively to stderr, on the reasoning that journald is where these
+  are read from — which is true, and unchanged. What it missed is that journald
+  on this device keeps nothing across a reboot: `/var/log/journal` does not
+  exist, so `Storage=auto` puts the journal on tmpfs. `journalctl --list-boots`
+  lists one boot. Every log line was being lost on restart, on a kiosk that is
+  restarted routinely and frequently restarted *by* the fault someone would then
+  want the logs for — so the port had strictly less log history than legacy,
+  whose September files are still readable on disk.
+
+  `DailyFileHandler` writes `logs/eye_compass_<date>.log` in legacy's naming
+  (`logger.py:31-35`), switching file at midnight and flushing each record as
+  legacy's `ImmediateFlushFileHandler` did. The journal keeps its role and the
+  console format is untouched; the file's timestamps carry the date, the
+  console's still do not. uvicorn's own loggers are attached to the file from
+  the lifespan, since uvicorn installs its handlers after this module runs and
+  its request lines would otherwise never reach it.
+
+  Two differences from legacy. Old files are actually deleted
+  (`LOG_RETENTION_DAYS`, default 30): legacy meant to and never did — the
+  zip-and-delete block in `archive_old_logs` sits after a `continue` and is
+  unreachable, so a device nobody prunes by hand grows without a ceiling. `0`
+  restores that. And a log file that cannot be opened is logged and stepped
+  over rather than raised: a read-only or full disk must not keep a machine
+  whose job is the belt from starting.
 
 ### Frontend
 - **The Home screen checks whether the backend has flagged the session for

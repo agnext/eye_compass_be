@@ -83,6 +83,33 @@ def _slug(value: str) -> str:
     return (value or "").strip().lower().replace(" ", "_")
 
 
+def _write_fm_triple(stem: str, image: np.ndarray, detections: List) -> None:
+    """Write <stem>.png / .txt / .conf — one frame's training artifacts.
+
+    Runs on the frame-writer thread; see save_fm_training_artifacts for what
+    these files are and why they exist. The .txt is YOLO format normalised
+    against this image's own dimensions, deliberately without the confidence,
+    and the .conf carries the confidences on their own in the same row order,
+    exactly as legacy split them (main.py:2510-2525) — a label file a training
+    run can read unmodified, with the model's certainty kept alongside it
+    rather than mixed in.
+    """
+    os.makedirs(os.path.dirname(stem), exist_ok=True)
+    img_h, img_w = image.shape[:2]
+    encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 3])[1]
+    with open(stem + ".png", "wb") as fh:
+        fh.write(encoded.tobytes())
+    with open(stem + ".txt", "w") as txt, open(stem + ".conf", "w") as conf:
+        for det in detections:
+            x1, y1, x2, y2, confidence, class_id = det[:6]
+            w = (x2 - x1) / img_w
+            h = (y2 - y1) / img_h
+            x = (x1 + x2) / 2 / img_w
+            y = (y1 + y2) / 2 / img_h
+            txt.write(f"{int(class_id)} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n")
+            conf.write(f"{float(confidence):.6f}\n")
+
+
 # A crop's filename IS the record — create_results counts files by their FM-type
 # prefix — so the FM name has to survive a round trip through the filesystem.
 # Spaces have always been written as underscores. A forward slash cannot be
@@ -419,14 +446,70 @@ class ScanSession:
         path = os.path.join(self.output_frame_folder, f"r_frame_{index}.jpg")
         # frame is copied because the caller's array is reused by the camera
         # loop as soon as this returns.
-        self._raw_frame_writer().put((path, frame.copy()))
+        self._raw_frame_writer().put(("jpg", path, frame.copy(), None))
+
+    def save_fm_training_artifacts(self, frame: np.ndarray, detections: List,
+                                   fm_flag: bool):
+        """Queue the per-frame training triple: full-frame .png + .txt + .conf.
+
+        Port of save_image (main.py:2474-2533). This is the dataset the models
+        are retrained from, and it is the reason the full frame is kept at all:
+        the operator-facing crops under output/ are cut down to one object and
+        carry no coordinates, so they cannot be relabelled or re-used as
+        detection training data on their own.
+
+        Layout, identical to legacy:
+
+            output_frame/<commodity>/<variety>/<folder>/fm/
+                frame_<n>.png    the full frame, PNG compression 3
+                frame_<n>.txt    one YOLO line per detection, no confidence
+                frame_<n>.conf   one confidence per line, same order
+                low_confidence_frames/
+                    low_confidence_frame_<n>.{png,txt,conf}
+
+        `fm_flag` is legacy's `high_confidence` (they are the same value —
+        process_results returns it as fm_flag and main.py receives it under the
+        other name): False means a commodity suppression rule threw the frame
+        away, so it never reached the operator. Those frames are still the most
+        valuable ones to retrain on, which is why they are kept in their own
+        folder rather than dropped. Note this branch was effectively dead in
+        legacy — emit_results only emitted when detections survived, so nothing
+        suppressed ever reached save_image and low_confidence_frames/ stayed
+        empty. Here it is wired up for real, deliberately.
+
+        Two deviations from legacy, both intentional:
+
+        * the boxes written are the model's own, before enlarge_bbox pads them.
+          Legacy wrote the padded boxes (emit_results pads before handing them
+          on), which inflates every training label by the padding on all four
+          sides — fine for cutting a crop the operator can see, wrong as ground
+          truth.
+        * no BGR->RGB conversion on the way out, for the same reason as the
+          raw frames — see _COLOR_ORDER_NOTE.
+        """
+        if not detections or not self.output_frame_folder:
+            return
+        fm_dir = os.path.join(self.output_frame_folder, "fm")
+        if fm_flag:
+            stem = os.path.join(fm_dir, f"frame_{self.frame_count}")
+        else:
+            stem = os.path.join(
+                fm_dir, "low_confidence_frames",
+                f"low_confidence_frame_{self.frame_count}",
+            )
+        self._raw_frame_writer().put(
+            ("fm", stem, frame.copy(), [list(d) for d in detections])
+        )
 
     def _raw_frame_writer(self) -> "queue.Queue":
         """The background writer, started on first use.
 
         One thread, not a pool: these are large sequential writes to the same
         directory, so running them in parallel would contend for the disk
-        without finishing any sooner.
+        without finishing any sooner. It carries both frame jobs — the r_frame
+        JPEGs and the fm/ training triples — for that same reason, and so that
+        flush_raw_frames() covers everything a finished scan has left in
+        flight rather than only half of it.
         """
         if self._raw_writer_queue is None:
             work = self._raw_writer_queue = queue.Queue()
@@ -437,16 +520,19 @@ class ScanSession:
                     try:
                         if item is None:
                             return
-                        path, image = item
-                        # As-is, not through legacy's cv2.COLOR_BGR2RGB
-                        # (main.py:2464) — see _COLOR_ORDER_NOTE.
-                        encoded = cv2.imencode(
-                            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95]
-                        )[1]
-                        with open(path, "wb") as fh:
-                            fh.write(encoded.tobytes())
+                        kind, path, image, detections = item
+                        if kind == "jpg":
+                            # As-is, not through legacy's cv2.COLOR_BGR2RGB
+                            # (main.py:2464) — see _COLOR_ORDER_NOTE.
+                            encoded = cv2.imencode(
+                                ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                            )[1]
+                            with open(path, "wb") as fh:
+                                fh.write(encoded.tobytes())
+                        else:
+                            _write_fm_triple(path, image, detections)
                     except Exception as exc:
-                        logger.error("save_raw_frame failed: %s", exc)
+                        logger.error("frame write failed: %s", exc)
                     finally:
                         work.task_done()
 
@@ -662,9 +748,18 @@ class ScanSession:
             h, w = frame.shape[:2]
 
             # 1. Commodity-specific suppression (process_results).
+            raw_detections = detections
             detections, fm_flag = apply_suppression_rules(
                 detections, self.commodity, self.variety
             )
+
+            # Training artifacts, written from the model's own output before
+            # padding, merging or tracking touch it — those steps exist to
+            # serve the operator's review screen, and every one of them makes
+            # the boxes a worse record of what the model actually saw. Kept
+            # for suppressed frames too, under their own folder; see
+            # save_fm_training_artifacts.
+            self.save_fm_training_artifacts(frame, raw_detections, fm_flag)
 
             # A frame with nothing in it is not a reason to stop here. It
             # still has to age the tracker — otherwise an object that vanishes

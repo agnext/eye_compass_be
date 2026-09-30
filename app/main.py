@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.database import Base, engine
 from app.models import schema  # noqa: F401  — registers the tables on Base.metadata
 
+from app.core import logging_setup
 from app.core.logging_setup import configure_logging
 
 configure_logging(level=logging.INFO)
@@ -111,7 +112,16 @@ async def lifespan(app: FastAPI):
     into a known-safe state, and start the background workers
     (start_background_threads, main.py:3112-3124).
     """
+    # uvicorn installs its own handlers after this module is imported, so the
+    # request log and its startup banner reach the console but not the log file
+    # until they are pointed at it here. See logging_setup.attach_to.
+    logging_setup.attach_to("uvicorn", "uvicorn.error", "uvicorn.access")
+
     logger.info("Eye Compass API starting up...")
+    if logging_setup.file_handler is not None:
+        logger.info("Logging to %s (kept %s days) and the journal",
+                    logging_setup.file_handler.baseFilename,
+                    settings.LOG_RETENTION_DAYS or "all")
 
     # Which identity provider operator logins go to. Logged explicitly because
     # it is otherwise invisible: a successful login looks identical in the
