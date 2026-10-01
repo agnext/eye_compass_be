@@ -171,9 +171,24 @@ class ScanSession:
         # how many detections happened, which is the coupling legacy's two
         # mutually exclusive branches specifically avoid.
         self._clean_frame_count = 0
-        # Created on first use by _raw_frame_writer; survives reset() so a
-        # writer thread is never orphaned mid-write by starting a new scan.
-        self._raw_writer_queue = getattr(self, "_raw_writer_queue", None)
+        # Two background writers, each a queue + a daemon thread created on
+        # first use and surviving reset() so a thread is never orphaned
+        # mid-write by starting a new scan. They are SEPARATE on purpose:
+        #
+        #   jpg  — r_frame_N.jpg, the clean-belt frames. update_fm_count counts
+        #          these for "Frame Count", so Submit must wait for them to
+        #          land (flush_raw_frames) before it reports that number. Fast:
+        #          ~32 ms a frame, and few of them.
+        #   png  — the fm/ and fm_full_frames/ training triples. Nothing
+        #          user-facing reads these before they are written: Cancel does
+        #          not move output_frame/ at all, and the S3 worker leaves a
+        #          folder alone for S3_MIN_AGE_MINUTES. They are slow (~200 ms a
+        #          PNG) and there are many, so making Submit or Cancel wait for
+        #          them is what made those buttons hang for seconds after a busy
+        #          scan. They finish on their own in the background instead; only
+        #          shutdown drains them, so a clean stop still loses nothing.
+        self._jpg_writer_queue = getattr(self, "_jpg_writer_queue", None)
+        self._png_writer_queue = getattr(self, "_png_writer_queue", None)
 
         # Cumulative unique detections for the whole run (legacy existing_track_ids)
         # — used only to dedupe the tracker's own ids frame to frame, so an
@@ -457,28 +472,29 @@ class ScanSession:
         self._enqueue_write(("jpg", path, frame.copy(), None))
 
     def _enqueue_write(self, job) -> None:
-        """Hand one write to the background thread, warning if it is falling behind.
+        """Hand one write to the right background writer (jpg or png), warning
+        if that writer is falling behind.
 
-        The queue is deliberately unbounded — dropping a training frame or a
-        belt frame silently would be worse than the memory — but it holds a full
-        uncompressed copy per entry (~6.9 MB at 1920x1200), so a backlog is the
-        one way this path can hurt the running scan. Worth saying out loud
+        The queues are deliberately unbounded — dropping a training frame or a
+        belt frame silently would be worse than the memory — but each entry
+        holds a full uncompressed copy (~6.9 MB at 1920x1200), so a backlog is
+        the one way this path can hurt the running scan. Worth saying out loud
         rather than discovering as an OOM.
 
-        It is close: a detected frame's PNG costs ~204 ms to encode and they can
-        arrive ~50 ms apart during a burst. What saves it is that the belt stops
-        on a detection and capture stops with it (see pause_capture), so the
-        writer gets the whole review to catch up. This log is here to show if a
-        scan ever comes along where that isn't enough.
+        It is close on the png side: a detected frame's PNG costs ~204 ms to
+        encode and they can arrive ~50 ms apart during a burst. What saves it is
+        that the belt stops on a detection and capture stops with it (see
+        pause_capture), so the writer gets the whole review to catch up. This
+        log is here to show if a scan ever comes along where that isn't enough.
         """
-        work = self._raw_frame_writer()
+        work = self._frame_writer("jpg" if job[0] == "jpg" else "png")
         work.put(job)
         depth = work.qsize()
         if depth >= 40 and depth % 20 == 0:
             logger.warning(
-                "Frame writer is %s frames behind (~%.0f MB queued) — the disk "
-                "or the PNG encode is not keeping up with the scan.",
-                depth, depth * 6.9,
+                "%s frame writer is %s frames behind (~%.0f MB queued) — the "
+                "disk or the encode is not keeping up with the scan.",
+                "jpg" if job[0] == "jpg" else "png", depth, depth * 6.9,
             )
 
     def save_fm_training_artifacts(self, frame: np.ndarray, detections: List,
@@ -588,18 +604,19 @@ class ScanSession:
             stem = os.path.join(full_dir, f"frame_{item['index']}")
             self._enqueue_write(("fm", stem, image, [det]))
 
-    def _raw_frame_writer(self) -> "queue.Queue":
-        """The background writer, started on first use.
+    def _frame_writer(self, kind: str) -> "queue.Queue":
+        """The jpg or png background writer, each started on first use.
 
-        One thread, not a pool: these are large sequential writes to the same
-        directory, so running them in parallel would contend for the disk
-        without finishing any sooner. It carries both frame jobs — the r_frame
-        JPEGs and the fm/ training triples — for that same reason, and so that
-        flush_raw_frames() covers everything a finished scan has left in
-        flight rather than only half of it.
+        One thread per kind, not a pool within a kind: the writes of one kind
+        are large and sequential to the same directory, so running them in
+        parallel would contend for the disk without finishing sooner. The two
+        kinds are split so a user action that must wait for the jpg frames (see
+        flush_raw_frames) does not also wait for the far slower png backlog.
         """
-        if self._raw_writer_queue is None:
-            work = self._raw_writer_queue = queue.Queue()
+        attr = "_jpg_writer_queue" if kind == "jpg" else "_png_writer_queue"
+        if getattr(self, attr) is None:
+            work = queue.Queue()
+            setattr(self, attr, work)
 
             def worker():
                 while True:
@@ -607,8 +624,8 @@ class ScanSession:
                     try:
                         if item is None:
                             return
-                        kind, path, image, detections = item
-                        if kind == "jpg":
+                        _kind, path, image, detections = item
+                        if _kind == "jpg":
                             # As-is, not through legacy's cv2.COLOR_BGR2RGB
                             # (main.py:2464) — see _COLOR_ORDER_NOTE.
                             encoded = cv2.imencode(
@@ -624,44 +641,56 @@ class ScanSession:
                         work.task_done()
 
             threading.Thread(
-                target=worker, name="raw-frame-writer", daemon=True,
+                target=worker, name=f"{kind}-frame-writer", daemon=True,
             ).start()
             # Not only for the FastAPI app: any process that touches a
             # ScanSession — a script, a test — otherwise exits with this thread
             # parked inside the queue, which aborts the interpreter on the way
             # out and makes a clean run look like a crash.
             atexit.register(self.stop_raw_frame_writer)
-        return self._raw_writer_queue
+        return getattr(self, attr)
 
     def stop_raw_frame_writer(self, timeout: float = 30.0) -> None:
-        """Finish the pending writes and retire the writer thread.
+        """Finish the pending writes and retire BOTH writer threads.
 
         Called from the app's shutdown. A daemon thread is killed wherever it
         happens to be when the interpreter exits, and if that is inside
         cv2.imencode the process aborts on the way out — which reads as a crash
         in the journal rather than a clean stop, and loses whatever frame was
-        being written.
+        being written. Unlike flush_raw_frames (jpg only), this drains the png
+        writer too, so a clean stop loses no training frame either.
         """
-        if self._raw_writer_queue is None:
-            return
-        self.flush_raw_frames(timeout)
-        self._raw_writer_queue.put(None)
-        self._raw_writer_queue = None
+        for attr in ("_jpg_writer_queue", "_png_writer_queue"):
+            work = getattr(self, attr)
+            if work is None:
+                continue
+            done = threading.Event()
+            threading.Thread(
+                target=lambda w=work: (w.join(), done.set()), daemon=True,
+            ).start()
+            if not done.wait(timeout):
+                logger.error("%s writes did not finish within %.0fs on stop.",
+                             attr, timeout)
+            work.put(None)
+            setattr(self, attr, None)
 
     def flush_raw_frames(self, timeout: float = 30.0) -> None:
-        """Block until every queued raw frame is on disk.
+        """Block until every queued r_frame JPEG is on disk.
 
-        Called before anything reads or moves those files — update_fm_count
-        counts them for "Frame Count", cancel() moves them to rejected/, and
-        the S3 worker uploads them. Without this, a scan that finished while
-        writes were still in flight would report a frame count short of what
-        it actually captured.
+        Called by finish() before update_fm_count counts those files for
+        "Frame Count": a scan that reported the number while writes were still
+        in flight would undercount. Deliberately waits ONLY on the jpg writer —
+        the png training frames are not counted or moved by anything a user
+        action triggers, so making Submit/Cancel wait for that much slower
+        backlog is pure latency (it was the post-scan button hang). The png
+        writer catches up on its own and is drained only at shutdown.
         """
-        if self._raw_writer_queue is None:
+        work = self._jpg_writer_queue
+        if work is None:
             return
         done = threading.Event()
         threading.Thread(
-            target=lambda: (self._raw_writer_queue.join(), done.set()),
+            target=lambda: (work.join(), done.set()),
             daemon=True,
         ).start()
         if not done.wait(timeout):
@@ -1612,8 +1641,15 @@ class ScanSession:
         own path (main.py:2039 uses currentText() directly while start_process
         lowercases and underscores it at main.py:770) — a literal legacy
         inconsistency reproduced rather than "fixed".
+
+        No flush_raw_frames() here, unlike finish(): Cancel only moves the crops
+        in output_folder, which are written synchronously (cv2.imwrite in
+        label_detection / save_unselected), and it never touches output_frame/,
+        which is where the background writers' files go. Waiting for that
+        backlog protected nothing Cancel does and was the main reason Cancel
+        hung for seconds after a busy scan. Any frames still being written land
+        in the (now-abandoned) output_frame folder on their own.
         """
-        self.flush_raw_frames()
         with self._lock:
             sample_id = self.sample_id
             if self.output_folder and os.path.isdir(self.output_folder):

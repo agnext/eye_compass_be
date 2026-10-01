@@ -14,6 +14,11 @@ from app.core.config import settings
 settings.OUTPUT_DIR = tempfile.mkdtemp()
 settings.DETECTION_SETTLE_SECONDS = 0.0      # no real waiting in a test
 settings.DETECTION_SAMPLE_FRAMES = 3
+# Pin the clean-belt frame interval so step 5's "a raw frame reached disk"
+# check is deterministic: it generates only a few empty frames, and the
+# device's own .env may set RAW_FRAME_EVERY high enough that none would be
+# written in so short a run (see docs 12 §5.2).
+settings.RAW_FRAME_EVERY = 1
 from app.services.scan_session import ScanSession
 from app.services.conveyor_service import conveyor_service
 
