@@ -106,6 +106,28 @@ class Settings:
     XAI_MODEL_PATH: str = _env(
         "XAI_MODEL_PATH", default="/home/nvidia/eye_compass/xai_models/v6_best.pt"
     )
+    # Save one r_frame_N.jpg every Nth frame that had NO detection in it —
+    # legacy's `if frame_count % 2 == 0` on the no-FM branch of emit_results
+    # (GrabImage.py:623). These are the clean-belt frames, and counting them is
+    # what "Frame Count" reports to Qualix. 0 disables them entirely.
+    RAW_FRAME_EVERY: int = _as_int(_env("RAW_FRAME_EVERY", default="2"), 2)
+    # Cancel / Discard moves the batch's crops into <OUTPUT_DIR>/rejected/
+    # (legacy's cancel_result). false deletes them instead of keeping them.
+    REJECTED_SAVE_ENABLED: bool = _as_bool(_env("REJECTED_SAVE_ENABLED", default="true"), True)
+    # fm/ — every frame the model found anything in (confirmed or suppressed),
+    # as .png/.txt/.conf. Legacy's save_image. The largest thing a scan writes
+    # (~1.7 MB a frame, many frames per object); off turns fm/ and
+    # fm/low_confidence_frames/ off together and nothing else.
+    FM_FRAMES_ENABLED: bool = _as_bool(_env("FM_FRAMES_ENABLED", default="true"), True)
+    # fm_full_frames/ — exactly one full frame per FM counted in the batch, in
+    # the same .png/.txt/.conf format. 20 FMs in the result -> 20 frames here.
+    FM_FULL_FRAMES_ENABLED: bool = _as_bool(_env("FM_FULL_FRAMES_ENABLED", default="true"), True)
+    # PNG compression for the fm/ training frames. Legacy used 3. PNG is
+    # lossless at every level — only the encode time and the file size change,
+    # never a pixel — and on this device level 3 costs 436 ms per frame against
+    # 204 ms at level 1, for 10% less disk. At ~20 detected frames a second
+    # that is the difference between the writer keeping up and falling behind.
+    FM_FRAME_PNG_COMPRESSION: int = _as_int(_env("FM_FRAME_PNG_COMPRESSION", default="1"), 1)
     # Daily log files, in legacy's layout (logs/eye_compass_<date>.log). The
     # journal is the primary place these are read from; this is the copy that
     # survives a reboot. See app/core/logging_setup.py and docs/logging.md.
@@ -433,7 +455,26 @@ class Settings:
     )
     S3_BUCKET_FOLDER: str = _env("S3_BUCKET_FOLDER", section="S3", key="bucket_folder", default="")
     S3_CLIENT: str = _env("S3_CLIENT", section="S3", key="client", default="")
-    S3_UPLOAD_INTERVAL_SECONDS: int = _as_int(os.getenv("S3_UPLOAD_INTERVAL_SECONDS"), 60)
+    # Upload output/, output_frame/ and Data_Collection/ once every this many
+    # days. The date of the last completed run is kept on disk
+    # (<OUTPUT_DIR>/.s3_upload_state.json), so restarts do not reset the count.
+    S3_UPLOAD_EVERY_DAYS: float = float(_env("S3_UPLOAD_EVERY_DAYS", default="3") or 3)
+    # How often the worker wakes to ask "is a run due, and is the machine
+    # idle?". Cheap — it reads one small file. Also how soon a run that failed
+    # (no internet) or was put off (a scan started) is tried again.
+    S3_CHECK_INTERVAL_SECONDS: int = _as_int(_env("S3_CHECK_INTERVAL_SECONDS", default="3600"), 3600)
+    # Delete each local file once S3 is confirmed to hold an identical copy
+    # (SHA-256 checked by S3 on the way in and read back afterwards). false
+    # uploads and keeps everything.
+    S3_DELETE_AFTER_UPLOAD: bool = _as_bool(_env("S3_DELETE_AFTER_UPLOAD", default="true"), True)
+    # How many days of data always stay on the device. A batch or collection
+    # folder is uploaded and removed only once nothing in it has changed for
+    # this long, so the most recent N days are always there to look at. 0 means
+    # keep nothing back — upload and remove everything each run.
+    S3_RETENTION_DAYS: float = float(_env("S3_RETENTION_DAYS", default="3") or 3)
+    # A floor under the above, in minutes, and the guard that still applies when
+    # S3_RETENTION_DAYS is 0: never touch a folder written to this recently.
+    S3_MIN_AGE_MINUTES: int = _as_int(_env("S3_MIN_AGE_MINUTES", default="30"), 30)
     S3_ENABLED: bool = _as_bool(os.getenv("S3_ENABLED"), True)
 
     # ---------------- Google Sheets ----------------

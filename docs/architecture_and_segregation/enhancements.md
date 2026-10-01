@@ -74,17 +74,29 @@ deliberately still open.
   behavior always did; the Sheet was never environment-aware in legacy at
   all, so this is a genuine deviation, not a legacy-matching fix. See
   `9 - post_remediation_session_log.md`.
-- **The S3 upload sweep now runs continuously, not just once at app boot.**
-  Legacy's `s3_upload.py` (`s3Uploading` QThread) is started once at startup
-  and never again — `run()` walks the whole `output/` tree once, uploads
-  anything missing/stale, and the thread simply ends; a file saved mid-session
-  doesn't reach S3 until the app is restarted. Confirmed directly from a real
-  startup log: the "All images of ... uploaded Successfully" line appears
-  exactly once, right after boot. `S3UploaderTask.start()` in `s3_worker.py`
-  runs the same sweep immediately at startup (matching legacy's one-shot
-  behavior) but then keeps repeating it every `S3_UPLOAD_INTERVAL_SECONDS`
-  for the life of the process, so newly-saved files get uploaded without
-  needing a restart.
+- **S3: one uploader, every 3 days, all three data trees, and the device is
+  cleared only after a verified upload.** Legacy had two uploaders. The
+  in-app `s3_upload.py` walked `output/` once at startup and never deleted
+  anything, so the disk only ever filled. The cron script
+  `upload_videos_pool_id.py` deleted after upload, but trusted matching sizes
+  and deleted without checking at all when the bucket refused a lookup.
+  `s3_worker.py` uploads `output/`, `output_frame/` and `Data_Collection/`
+  every `S3_UPLOAD_EVERY_DAYS` (default 3), and only folders older than
+  `S3_RETENTION_DAYS` (default 3), so the most recent few days of batches are
+  always still on the device. `output/` is held for at least
+  `HISTORY_WINDOW_DAYS` (30) instead, since History's record view reads it and
+  a listed batch must still have its images — it is ~0.5% of the data, so the
+  disk saving is unaffected. The last completed run is recorded
+  in the new `s3_upload_state` table so restarts don't reset the count, and it checks hourly so a run put
+  off by a scan or no internet is tried again soon. It never touches a folder
+  in use or changed in the last 30 minutes, and stops between files if a scan
+  starts. Each file is deleted only once S3 reads back the file's own SHA-256
+  and size (it was also checked by S3 on upload), and folders are removed only
+  when already empty. See `11 - data_folders_and_s3_upload.md` §5. Once a
+  batch is removed, History's record view says its images were uploaded
+  rather than that none were captured.
+- **`REJECTED_SAVE_ENABLED`**: Cancel / Discard archives a batch's crops to
+  `rejected/` by default, as legacy did. `false` deletes them instead.
 - **Real HTTP error codes instead of silent failure.** Legacy's conveyor
   commands returned `200 {"success": false}` (or nothing at all — a warning
   only in a log file the operator never sees) for both a blocked interlock and
@@ -542,6 +554,38 @@ deliberately still open.
   its own signal only fired for detections that had *survived* commodity
   suppression, so nothing ever landed there. Suppressed frames are exactly the
   ones worth retraining on, so here they are kept.
+
+- **`r_frame_N.jpg` counts the clean belt again, which fixes "Frame Count".**
+  Found while checking the file counts of a scan after the above. Legacy splits
+  every frame down one of two mutually exclusive branches of `emit_results`
+  (`GrabImage.py:621-624`): with detections it writes the `fm/` triple, without
+  detections it writes `r_frame_N.jpg`, every 2nd one. This port had wired the
+  raw frame to the detection events instead — neither branch — so it wrote one
+  frame per review screen. `update_fm_count` derives **"Frame Count" by counting
+  those `.jpg` files, and that metric is posted to Qualix**: under legacy it
+  means "how much belt did this scan look at", here it had come to mean "how
+  many times did we stop". An observed scan reported 8 against the few hundred a
+  legacy device reports for comparable work, into the same field. Now restored,
+  throttled by `RAW_FRAME_EVERY` (default 2, legacy's value) off a counter of
+  its own so it stays independent of the detection rate. Batches synced before
+  the fix keep the low number.
+- **`fm_full_frames/`: one full frame per FM, and `.env` switches for both
+  frame folders.** `fm/` keeps every frame the model saw anything in, so it
+  cannot answer which frame a given counted FM came from. `fm_full_frames/`
+  holds exactly one `.png`/`.txt`/`.conf` per FM on the review list — the same
+  entries that become crops and that `total_fo_detected` counts — named by the
+  index its crop already ends in, with only that FM's box in the label file.
+  `FM_FRAMES_ENABLED` and `FM_FULL_FRAMES_ENABLED` (both default on) switch the
+  two folders independently. Legacy had neither the folder nor the switch.
+- **`fm/` frames are written at PNG compression 1, not legacy's 3.** PNG is
+  lossless at every level — this changes encode time and file size, never image
+  data. Measured here: 436 ms at level 3 against 204 ms at level 1, for 10% more
+  disk. The writer is a single thread and each queued frame holds an
+  uncompressed ~6.9 MB copy, so falling behind costs memory, and detected frames
+  can arrive ~50 ms apart in a burst. It kept up only because a detection stops
+  the belt and capture with it, which is a margin that happened to hold rather
+  than one that was chosen. `_enqueue_write` now also warns once the queue
+  passes 40 frames. `FM_FRAME_PNG_COMPRESSION=3` restores legacy's setting.
 
 - **Logs are written to a daily file again, not only to the journal.** The port
   logged exclusively to stderr, on the reasoning that journald is where these

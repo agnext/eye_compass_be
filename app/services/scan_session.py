@@ -96,7 +96,9 @@ def _write_fm_triple(stem: str, image: np.ndarray, detections: List) -> None:
     """
     os.makedirs(os.path.dirname(stem), exist_ok=True)
     img_h, img_w = image.shape[:2]
-    encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 3])[1]
+    encoded = cv2.imencode(
+        ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, settings.FM_FRAME_PNG_COMPRESSION]
+    )[1]
     with open(stem + ".png", "wb") as fh:
         fh.write(encoded.tobytes())
     with open(stem + ".txt", "w") as txt, open(stem + ".conf", "w") as conf:
@@ -163,6 +165,12 @@ class ScanSession:
         self.end_time = ""
         self.frame_count = 0
         self.saved_frame_count = 0
+        # Frames that had nothing in them, counted so every RAW_FRAME_EVERY-th
+        # one is kept. Separate from frame_count, which counts every frame:
+        # throttling on that one would tie how many clean frames are saved to
+        # how many detections happened, which is the coupling legacy's two
+        # mutually exclusive branches specifically avoid.
+        self._clean_frame_count = 0
         # Created on first use by _raw_frame_writer; survives reset() so a
         # writer thread is never orphaned mid-write by starting a new scan.
         self._raw_writer_queue = getattr(self, "_raw_writer_queue", None)
@@ -446,7 +454,32 @@ class ScanSession:
         path = os.path.join(self.output_frame_folder, f"r_frame_{index}.jpg")
         # frame is copied because the caller's array is reused by the camera
         # loop as soon as this returns.
-        self._raw_frame_writer().put(("jpg", path, frame.copy(), None))
+        self._enqueue_write(("jpg", path, frame.copy(), None))
+
+    def _enqueue_write(self, job) -> None:
+        """Hand one write to the background thread, warning if it is falling behind.
+
+        The queue is deliberately unbounded — dropping a training frame or a
+        belt frame silently would be worse than the memory — but it holds a full
+        uncompressed copy per entry (~6.9 MB at 1920x1200), so a backlog is the
+        one way this path can hurt the running scan. Worth saying out loud
+        rather than discovering as an OOM.
+
+        It is close: a detected frame's PNG costs ~204 ms to encode and they can
+        arrive ~50 ms apart during a burst. What saves it is that the belt stops
+        on a detection and capture stops with it (see pause_capture), so the
+        writer gets the whole review to catch up. This log is here to show if a
+        scan ever comes along where that isn't enough.
+        """
+        work = self._raw_frame_writer()
+        work.put(job)
+        depth = work.qsize()
+        if depth >= 40 and depth % 20 == 0:
+            logger.warning(
+                "Frame writer is %s frames behind (~%.0f MB queued) — the disk "
+                "or the PNG encode is not keeping up with the scan.",
+                depth, depth * 6.9,
+            )
 
     def save_fm_training_artifacts(self, frame: np.ndarray, detections: List,
                                    fm_flag: bool):
@@ -487,6 +520,8 @@ class ScanSession:
         * no BGR->RGB conversion on the way out, for the same reason as the
           raw frames — see _COLOR_ORDER_NOTE.
         """
+        if not settings.FM_FRAMES_ENABLED:
+            return
         if not detections or not self.output_frame_folder:
             return
         fm_dir = os.path.join(self.output_frame_folder, "fm")
@@ -497,9 +532,61 @@ class ScanSession:
                 fm_dir, "low_confidence_frames",
                 f"low_confidence_frame_{self.frame_count}",
             )
-        self._raw_frame_writer().put(
+        self._enqueue_write(
             ("fm", stem, frame.copy(), [list(d) for d in detections])
         )
+
+    def save_fm_full_frames(self, frame: np.ndarray):
+        """One full frame per FM on the review screen, into fm_full_frames/.
+
+            output_frame/<commodity>/<variety>/<folder>/fm_full_frames/
+                frame_<index>.png    the full frame the FM was reviewed on
+                frame_<index>.txt    one YOLO line: this FM's box
+                frame_<index>.conf   this FM's confidence
+
+        fm/ keeps every frame the model saw anything in, so one object sitting
+        under a stopped belt fills twenty of them and there is no telling which
+        frame belongs to which counted FM. This folder is the per-FM record
+        instead: it is written from the review list (`self.pending`), and every
+        entry on that list becomes exactly one crop under output/, which is
+        what total_fo_detected counts. So a batch reporting 20 FMs has 20
+        frames here.
+
+        `<index>` is the pending index, the same number every crop for that
+        object ends its filename with (`..._<index>.png`), so a crop and its
+        full frame pair up by name.
+
+        The .txt holds only this FM's box, not every box in the frame. Several
+        FMs reviewed on one screen share one image, so a file listing every box
+        would make those entries identical and the folder would stop saying
+        which FM each frame is for. The box is the model's own (`raw_box`),
+        unpadded, for the same reason as fm/ — see save_fm_training_artifacts.
+
+        Called with the frame the operator reviews on, after self.pending has
+        been set for it. Entries whose box would produce no crop (degenerate
+        after clamping — save_unselected skips those too) are skipped, so the
+        count stays one-to-one with the crops.
+        """
+        if not settings.FM_FULL_FRAMES_ENABLED:
+            return
+        if frame is None or not self.output_frame_folder or not self.pending:
+            return
+        full_dir = os.path.join(self.output_frame_folder, "fm_full_frames")
+        h, w = frame.shape[:2]
+        image = None
+        for item in self.pending:
+            x1, y1, x2, y2 = [int(round(v)) for v in item["box"]]
+            if min(w, x2) <= max(0, x1) or min(h, y2) <= max(0, y1):
+                continue
+            if item.get("class_id") is None or item.get("confidence") is None:
+                continue
+            if image is None:
+                # One copy for the whole screen: every entry here is the same
+                # frame, and the writer only reads it.
+                image = frame.copy()
+            det = list(item["raw_box"][:4]) + [item["confidence"], item["class_id"]]
+            stem = os.path.join(full_dir, f"frame_{item['index']}")
+            self._enqueue_write(("fm", stem, image, [det]))
 
     def _raw_frame_writer(self) -> "queue.Queue":
         """The background writer, started on first use.
@@ -760,6 +847,23 @@ class ScanSession:
             # for suppressed frames too, under their own folder; see
             # save_fm_training_artifacts.
             self.save_fm_training_artifacts(frame, raw_detections, fm_flag)
+
+            # The clean-belt frames, and the other half of legacy's split.
+            # emit_results sends a frame down exactly one of two paths
+            # (GrabImage.py:621-624): one with detections in it goes to the fm/
+            # triple above, one without goes — every RAW_FRAME_EVERY-th time —
+            # to r_frame_N.jpg. They are mutually exclusive, and it matters
+            # which is which: "Frame Count" is the number of r_frame files, and
+            # under legacy that means "how much belt did this scan look at".
+            #
+            # This port had it on the detection events instead, so Frame Count
+            # was counting review screens — 8 against legacy's ~288 for
+            # comparable work, on the same Qualix field. See doc 12 §5.1.
+            if not detections:
+                self._clean_frame_count += 1
+                every = settings.RAW_FRAME_EVERY
+                if every > 0 and self._clean_frame_count % every == 0:
+                    self.save_raw_frame(frame)
 
             # A frame with nothing in it is not a reason to stop here. It
             # still has to age the tracker — otherwise an object that vanishes
@@ -1210,9 +1314,9 @@ class ScanSession:
         """
         self._set_pending(boxes, raw_boxes)
         self.pending_frame = frame
+        self.save_fm_full_frames(frame)
         self.frozen_frame_seq += 1
         self.labelled_indices = set()
-        self.save_raw_frame(frame)
         self._pause_token += 1
         self.capture_paused = True
         logger.info(
@@ -1236,10 +1340,6 @@ class ScanSession:
             "boxes": [list(box) for box in boxes],
             "raw_boxes": [list(box) for box in (raw_boxes or boxes)],
         })
-        # One raw frame per detection, queued or not — this is what
-        # update_fm_count reports as "Frame Count".
-        self.save_raw_frame(frame)
-
         if self.pending_frame is None:
             self._promote_next_detection(immediate=False)
         else:
@@ -1301,6 +1401,7 @@ class ScanSession:
              for p in self.pending],
         )
         self.pending_frame = item["frame"]
+        self.save_fm_full_frames(self.pending_frame)
         self.frozen_frame_seq += 1
         self.labelled_indices = set()
 
@@ -1516,14 +1617,31 @@ class ScanSession:
         with self._lock:
             sample_id = self.sample_id
             if self.output_folder and os.path.isdir(self.output_folder):
-                rejected_folder = os.path.join(
-                    settings.OUTPUT_DIR, "rejected", self.commodity, self.variety, self.folder_name
-                )
-                os.makedirs(rejected_folder, exist_ok=True)
-                for name in os.listdir(self.output_folder):
-                    src = os.path.join(self.output_folder, name)
-                    if os.path.isfile(src):
-                        shutil.move(src, rejected_folder)
+                if settings.REJECTED_SAVE_ENABLED:
+                    rejected_folder = os.path.join(
+                        settings.OUTPUT_DIR, "rejected", self.commodity, self.variety,
+                        self.folder_name,
+                    )
+                    os.makedirs(rejected_folder, exist_ok=True)
+                    for name in os.listdir(self.output_folder):
+                        src = os.path.join(self.output_folder, name)
+                        if os.path.isfile(src):
+                            shutil.move(src, rejected_folder)
+                else:
+                    # REJECTED_SAVE_ENABLED=false: the operator discarded this
+                    # batch and the device is told not to keep it, so its crops
+                    # are deleted rather than archived. Only the files directly
+                    # in this batch's own output folder — exactly what would
+                    # otherwise have been moved — and never output_frame/,
+                    # which Cancel has never touched in either direction.
+                    for name in os.listdir(self.output_folder):
+                        src = os.path.join(self.output_folder, name)
+                        if os.path.isfile(src):
+                            os.remove(src)
+                    logger.info(
+                        "Batch %s cancelled; crops deleted (REJECTED_SAVE_ENABLED=false)",
+                        sample_id,
+                    )
             self.reset()
         return {"cancelled": True, "sample_id": sample_id}
 

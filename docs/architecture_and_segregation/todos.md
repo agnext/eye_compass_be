@@ -182,62 +182,6 @@ practice — so **confirm with the team whether PO Number should be restricted
 the same way Sorting Quantity was**, or left as free text matching legacy's
 real (unvalidated) behavior.
 
-### S3 upload paths (found while auditing "at what other points does it upload to S3?")
-
-Legacy has three upload-related code paths, of which only two are real:
-
-1. **`upload_videos_pool_id.py`** — a standalone CLI script meant to be
-   triggered by the OS's actual crontab, not part of the running Qt app.
-   Walks the output folders, waits for inference to be idle, retries
-   transient failures, deletes local files after a successful upload by
-   default.
-2. **In-app background thread** (`main.py:3148`, `s3_upload.py`'s
-   `s3Uploading` QThread) — started once at app boot and **does not loop**:
-   `run()` walks the whole `output/` tree once and the thread ends, confirmed
-   against a real startup log (the "All images of ... uploaded Successfully"
-   line appears exactly once, never again for the rest of the session). This
-   is the one already ported to `s3_worker.py`'s `S3UploaderTask` — which
-   *does* loop, on `S3_UPLOAD_INTERVAL_SECONDS`, a deliberate improvement over
-   legacy's one-shot-at-boot behavior; see `enhancements.md`.
-3. **Login-triggered upload — does NOT actually exist.** `main.py:588, 612,
-   638` print log lines like `"Starting the s3 upload thread in login."`,
-   but there is no code near them that starts or restarts the thread.
-   Misleading dead logging, not real behavior — nothing to port here.
-
-**To look into later:** the cron script (#1) is external to the app and was
-not ported into the backend. If it's still needed, it has to keep running as
-its own separate scheduled process, and would need to be pointed at the new
-`OUTPUT_DIR` (see the `.env` `OUTPUT_DIR` change in
-`9 - post_remediation_session_log.md` §5) instead of the legacy
-`/home/nvidia/eye_compass/` tree, or it will keep uploading from — and only
-from — the old location.
-
-### `S3UploaderTask`'s cycle cost grows without bound
-
-`s3_worker.py`'s `_sync_directory` (see `S3UploaderTask._run_cycle`) has no
-memory of what it already confirmed uploaded. Every cycle — by default every
-`S3_UPLOAD_INTERVAL_SECONDS` (60s) — it walks the **entire** `output/` and
-`output_frame/` trees again, and for **every file that has ever existed there**
-makes an S3 request asking for its remote size, to decide whether to (re-)
-upload it.
-
-This means the per-cycle cost is proportional to the device's total scan
-history, not to what changed since the last cycle. A device running for
-months will eventually spend real time and S3 requests every 60 seconds just
-re-confirming thousands of already-uploaded files are still there, before it
-ever gets to anything new.
-
-**Two independent things worth doing, not a single fix:**
-1. **Widen `S3_UPLOAD_INTERVAL_SECONDS`** (e.g. to a few minutes) — a scan
-   image is not urgent to back up the instant it is written, so this buys
-   time without changing anything else. On its own this only slows down how
-   often the growing cost is paid, it does not stop the cost from growing.
-2. **Give the worker some memory of what it already uploaded** (a local flag
-   per file, or at least skip the S3 size lookup once a file is known to have
-   been handled), so a cycle only does real work on genuinely new files
-   instead of re-checking the whole history every time. This is the one that
-   actually fixes the unbounded growth; #1 alone does not.
-
 ### XAI View is broken in legacy — missing model file
 
 Clicking "XAI View" on the live-scan screen silently does nothing in legacy.

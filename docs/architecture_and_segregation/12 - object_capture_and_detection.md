@@ -645,8 +645,106 @@ Two deliberate differences from legacy:
   what the operator sees changes.
 
 The S3 worker walks the session folder, so it picks the new subfolder up
-unchanged; `update_fm_count` counts only `.jpg` at the folder root, so the
-"Frame Count" metric is unaffected.
+unchanged.
+
+### 5.2 `r_frame` was counting the wrong thing, and Qualix was being told
+
+Putting the `fm/` folder back made an existing defect visible. A scan produced
+8 `r_frame_N.jpg` against 136 `fm/` frames — and on the legacy machine that
+ratio runs the other way (`288 r_frame / 180 fm`, `69 / 28`, `28 / 0` across
+the sessions still on this device).
+
+Legacy feeds its two savers from two **mutually exclusive** branches of
+`emit_results` (`GrabImage.py:621-624`):
+
+| Signal | Fires when | Writes |
+|---|---|---|
+| `fm_update` | the frame **had** detections, every such frame | `fm/frame_N.{png,txt,conf}` |
+| `image_update` | the frame had **nothing**, every 2nd such frame | `r_frame_N.jpg` |
+
+So `r_frame` is legacy's record of the *clean belt* — the bulk of any run. This
+port had wired `save_raw_frame` to the detection events instead (`_show` and
+`_on_foreign_matter`), which is neither branch: it wrote one frame per review
+screen.
+
+That is not only a file-count oddity. **`update_fm_count` derives "Frame Count"
+by counting `.jpg` files in the session folder**, and that metric is posted to
+Qualix in the datagram. Under legacy it means "how much belt did this scan look
+at"; as wired here it meant "how many times did we stop". The scan above
+reported `"Frame Count": 8` where a legacy device reports a few hundred for
+comparable work, into the same field.
+
+`save_raw_frame` now runs from `process_frame`'s no-detection path, every
+`RAW_FRAME_EVERY`-th (default 2) such frame, restoring the split. The counter is
+its own (`_clean_frame_count`), not `frame_count`: throttling on the latter
+would tie how many clean frames are kept to how many detections happened, which
+is the coupling legacy's two branches exist to avoid.
+
+Batches synced before this fix carry the low number and cannot be corrected
+retroactively.
+
+### 5.3 `fm_full_frames/` — one full frame per FM
+
+`fm/` records every frame the model saw anything in, which is the right shape
+for training data but the wrong one for answering "show me the frame this FM
+came from": one object under a stopped belt fills twenty frames, and nothing
+ties any of them to a counted FM. `fm_full_frames/` is that per-FM record,
+beside `fm/` in the session's `output_frame` folder:
+
+```
+fm_full_frames/
+    frame_<index>.png    the full frame the FM was reviewed on
+    frame_<index>.txt    one YOLO line: this FM's box
+    frame_<index>.conf   this FM's confidence
+```
+
+`save_fm_full_frames` runs when a review screen is set up — from `_show` and
+from `_promote_next_detection`, the only two places `pending_frame` is set —
+and writes one triple per entry on the review list. Each of those entries
+becomes exactly one crop under `output/`, and the crops are what
+`total_fo_detected` counts, so the two numbers match: a batch reporting 20 FMs
+has 20 frames here. `<index>` is the pending index that also ends every crop's
+filename (`..._<index>.png`), so a crop and its full frame pair up by name.
+
+The `.txt` holds only that FM's box. Several FMs reviewed on one screen share
+one image, and a label file listing every box would make those entries
+identical and the folder would stop saying which FM each is for. The box is the
+model's own (`raw_box`), unpadded, as in `fm/`.
+
+Both folders are switchable in `.env`: `FM_FRAMES_ENABLED` turns off `fm/` and
+`fm/low_confidence_frames/` together, `FM_FULL_FRAMES_ENABLED` turns off
+`fm_full_frames/`. Both default to on, and neither affects `r_frame` or the
+crops.
+
+### 5.4 The PNG encode, and the one way this can hurt a scan
+
+Measured on this device, at 1920×1200:
+
+| | Time |
+|---|---|
+| `frame.copy()` | 0.7 ms |
+| JPEG q95 encode (`r_frame`, 0.18 MB) | 32 ms |
+| **PNG level 3 encode (`fm/`, 1.72 MB)** | **436 ms** |
+| PNG level 1 encode (`fm/`, 1.90 MB) | 204 ms |
+
+The copy is on the detection thread and is negligible. The encodes are not, and
+they share one writer thread — so the risk is a **backlog**, not latency: every
+queued entry holds an uncompressed copy (~6.9 MB), so a queue that grows is
+memory that grows.
+
+At level 3 it is genuinely close. Frames with detections can arrive ~50 ms apart
+during a burst against a 436 ms encode. What rescues it is that a detection
+stops the belt and `pause_capture` stops capture with it, so the writer gets the
+whole review window to drain — the observed scan wrote 136 PNGs in a 60 s run
+with 34 s of stopped belt, and kept up. That is a margin that happens to hold,
+not one that was designed.
+
+Two changes make it hold on purpose. `FM_FRAME_PNG_COMPRESSION` defaults to 1
+rather than legacy's 3 — **PNG is lossless at every level, so this trades encode
+time against file size and never touches a pixel** — halving the encode for 10%
+more disk. And `_enqueue_write` logs a warning once the queue passes 40 frames,
+so a scan where the margin does not hold says so instead of being found as an
+OOM.
 
 ---
 
@@ -1171,6 +1269,19 @@ One thing is also kept now that never was before: frames the software decided
 to throw away because it did not trust what it saw. Those are exactly the cases
 worth showing the model again, and they go into their own folder so they are
 never confused with the rest. The operator sees no difference either way.
+
+### One number sent to head office was wrong
+
+Every batch reports a "Frame Count" to Qualix. On the original machine that
+number means roughly *how much belt did this scan look at* — it counts the
+pictures taken while nothing was found, which is most of a run.
+
+This port had been counting something else entirely: how many times the belt
+stopped for the operator. The scan checked above reported 8 where the original
+machine would have reported a few hundred, into the same box on the same
+report. That is fixed, and the number now means what it always meant. Batches
+already sent keep the low figure — nothing can go back and correct those — so
+anyone reading that column should know it changes shape from this date.
 
 ### Two things worth knowing
 

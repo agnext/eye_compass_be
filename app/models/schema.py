@@ -160,6 +160,35 @@ class ClientInfo(Base):
     image_folder_name = Column(String(150))
 
 
+class S3UploadState(Base):
+    """When the S3 uploader last ran. One row, id=1 (legacy has no equivalent).
+
+    This is the whole schedule: the worker uploads every S3_UPLOAD_EVERY_DAYS,
+    and it decides whether a run is due by comparing `last_completed_at` against
+    now. It has to outlive the process — a plain in-memory timer restarts its
+    count on every reboot, and this device reboots far more often than every
+    three days, so the run would never come due.
+
+    Only a *completed* run sets `last_completed_at`. One that failed or stopped
+    early (no internet, a scan started) leaves it alone, so the next check
+    retries rather than waiting out another full period.
+    """
+
+    __tablename__ = "s3_upload_state"
+
+    id = Column(Integer, primary_key=True)
+    # When the device first had this feature enabled. The first upload is due
+    # one period after this, not immediately: switching it on should not start
+    # clearing the existing backlog off the disk while someone is working.
+    first_seen_at = Column(DateTime, default=datetime.now)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_completed_at = Column(DateTime, nullable=True)
+    # The last run's summary (counts of uploaded/deleted/failed), same dict the
+    # worker logs. Kept for support: "when did this device last clear down, and
+    # did anything fail?" without needing the journal, which is not persistent.
+    last_result = Column(JSONType, nullable=True)
+
+
 class SurveyorDetails(Base):
     """Populates the Sorter Name dropdown (legacy `surveyordetails`)."""
 

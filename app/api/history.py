@@ -237,8 +237,14 @@ def get_result_images(
     # Guard against anything escaping the output tree.
     root = os.path.realpath(os.path.join(settings.OUTPUT_DIR, "output"))
     folder = os.path.realpath(folder)
-    if not folder.startswith(root) or not os.path.isdir(folder):
+    if not folder.startswith(root):
         return {"status": "success", "total": 0, "images": []}
+    if not os.path.isdir(folder):
+        # A saved result whose batch folder is gone: the S3 worker uploads
+        # batches and then removes them from the device (s3_worker.py). Said
+        # explicitly so the record view can tell the operator where the images
+        # went, rather than implying the scan never captured any.
+        return {"status": "success", "total": 0, "images": [], "on_device": False}
 
     names = sorted(
         f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))

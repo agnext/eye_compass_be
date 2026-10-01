@@ -399,18 +399,19 @@ device. Boto config: 15s connect, 60s read, 3 attempts.
 
 | | `s3_worker.py` (sweep) | `s3_service.py` (on demand) |
 |---|---|---|
-| Trigger | Every `S3_UPLOAD_INTERVAL_SECONDS` (default 60), started in the app lifespan | Called with an explicit key |
-| Scans | `{OUTPUT_DIR}/output` and `{OUTPUT_DIR}/output_frame` | n/a |
-| Key layout | `{image_folder_name}/{client_name}/{output or output_frame}/{relative path}` — folder and client from the synced `ClientInfo` row, falling back to `S3_BUCKET_FOLDER` / `S3_CLIENT` | Caller's key |
+| Trigger | Every `S3_UPLOAD_EVERY_DAYS` (default 3), checked hourly, started in the app lifespan; or `scripts/s3_upload_now.py` | Called with an explicit key |
+| Scans | `{OUTPUT_DIR}/output`, `{OUTPUT_DIR}/output_frame` and `{OUTPUT_DIR}/Data_Collection` | n/a |
+| Key layout | `{image_folder_name}/{client_name}/{output, output_frame or Data_Collection}/{relative path}` — folder and client from the synced `ClientInfo` row, falling back to `S3_BUCKET_FOLDER` / `S3_CLIENT` | Caller's key |
 
-The sweep compares sizes rather than re-uploading blindly: it reads the remote
-object's `content_length` and uploads only when the remote is smaller than the
-local file (a missing object counts as `-1`), which resumes truncated uploads
-and skips completed ones. Transfers are multipart above 8 MB with
-`max_concurrency=4`.
+The worker uses `HeadObject` (with `ChecksumMode=ENABLED`) and `PutObject`
+(single request, `ChecksumSHA256` attached, so S3 rejects a corrupted body).
+A file is skipped if S3 already holds the same SHA-256 and size, and deleted
+locally only after `HeadObject` reads back the same SHA-256 and size after
+upload. So the Cognito role needs `s3:PutObject` and `s3:GetObject` on the
+prefix. See `architecture_and_segregation/11 - data_folders_and_s3_upload.md` §5.
 
 On an `ExpiredToken` / `InvalidAccessKeyId` error both clients re-issue Cognito
-credentials — the worker aborts the cycle and resumes on the next tick.
+credentials. The worker then carries on with the next file, and anything that failed is retried on the next run.
 
 > The key prefix depends on config that arrives from the **config GET** (§2).
 > A device that has never synced config falls back to the `.env` values, so
