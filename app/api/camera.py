@@ -207,6 +207,11 @@ async def camera_stream(websocket: WebSocket):
     current_fps = 0.0
     fps_log_timer = time.time()
     raw_frame_index = 0
+    # Per-stage latency, accumulated between the periodic FPS logs so the
+    # same 10s log line also shows where the time within each inferred
+    # frame actually goes (grab vs. inference vs. the detection/crop logic).
+    stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
+    stage_count = 0
     # Which frozen review frame has already gone out, and whether the previous
     # iteration was a paused one. A bool "already sent it" is not enough: a
     # queued detection is promoted while capture stays paused throughout, so
@@ -297,7 +302,9 @@ async def camera_stream(websocket: WebSocket):
                 with _hardware_lock:
                     return _inference.predict(img)
 
+            _t_grab_start = time.perf_counter()
             frame = await loop.run_in_executor(_hw_executor, grab)
+            _t_grab_end = time.perf_counter()
             if frame is None:
                 await asyncio.sleep(0.02)
                 continue
@@ -319,12 +326,20 @@ async def camera_stream(websocket: WebSocket):
             if raw_frame_index % decimation != 0:
                 continue
 
+            _t_infer_start = time.perf_counter()
             detections, annotated = await loop.run_in_executor(_hw_executor, infer, frame)
+            _t_infer_end = time.perf_counter()
 
             # Detection state machine — belt stop, interlock, crops, counting.
             state = await loop.run_in_executor(
                 None, scan_session.process_frame, frame, detections
             )
+            _t_process_end = time.perf_counter()
+
+            stage_totals["grab"] += _t_grab_end - _t_grab_start
+            stage_totals["infer"] += _t_infer_end - _t_infer_start
+            stage_totals["process"] += _t_process_end - _t_infer_end
+            stage_count += 1
 
             # Counts frames actually put through detection, which is the rate
             # that matters for whether an object can cross the view unseen —
@@ -349,6 +364,19 @@ async def camera_stream(websocket: WebSocket):
                         current_fps, decimation,
                         1000.0 / current_fps if current_fps else 0,
                     )
+                    if stage_count:
+                        logger.info(
+                            "Latency breakdown (avg over %d frames): "
+                            "grab=%.0f ms, infer=%.0f ms, process=%.0f ms, "
+                            "total=%.0f ms",
+                            stage_count,
+                            1000.0 * stage_totals["grab"] / stage_count,
+                            1000.0 * stage_totals["infer"] / stage_count,
+                            1000.0 * stage_totals["process"] / stage_count,
+                            1000.0 * sum(stage_totals.values()) / stage_count,
+                        )
+                    stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
+                    stage_count = 0
 
             # Display is throttled to STREAM_FPS; DETECTION is not. This loop
             # used to sleep out the remainder of a STREAM_FPS interval on every

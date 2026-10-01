@@ -47,12 +47,21 @@ from app.models.schema import BatchDetails, Result
 from app.services.conveyor_service import conveyor_service
 from app.services.database_service import DatabaseService
 from app.services.datagram import build_datagram
-from app.services.scan_session import scan_session
+from app.services.scan_session import archive_crops, scan_session
 from app.services.sync_lock import claim_result
 from app.services.sync_service import sync_service
+from app.services import scan_progress
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _checkpoint(awaiting_save: bool = False) -> None:
+    """Record the current run in scan_progress, so it survives a power cut and
+    can be held. Called after each operator action that changes the run —
+    never from the per-frame loop. Best-effort: see scan_progress."""
+    if scan_session.folder_name:
+        scan_progress.checkpoint(scan_session.progress_state(), awaiting_save=awaiting_save)
 
 # Holds the last /submit's computed result until /confirm persists it — the
 # in-memory equivalent of legacy's self.datagram/self.final_result sitting on
@@ -266,6 +275,11 @@ def reset_scan():
     page can never be blocked by a previous session's leftover lock.
     """
     with scan_session._lock:
+        # A run still loaded here was left without Save, Cancel or Hold (the
+        # scan page was reloaded, or the operator went to another batch). It
+        # is kept as interrupted so it can be continued, rather than lost.
+        if scan_session.folder_name:
+            scan_progress.interrupt(scan_session.folder_name)
         scan_session.reset()
     conveyor_service.unlock_machine_start(reason="new batch (page load)")
     return {"success": True}
@@ -298,6 +312,8 @@ def start_scan(req: ScanStartRequest, db: Session = Depends(get_db)):
         analysis_parameters=analysis,
         batch={"id": req.batch_id} if req.batch_id else {},
     )
+
+    _checkpoint()
 
     conveyor_service.unlock_machine_start(reason="new scan")
     conveyor_service.send("camera_on")
@@ -337,7 +353,9 @@ def label_detection(req: LabelRequest):
     what create_results counts, so this call IS the measurement.
     """
     try:
-        return scan_session.label_detection(req.index, req.fm_name)
+        result = scan_session.label_detection(req.index, req.fm_name)
+        _checkpoint()
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except (RuntimeError, ValueError) as exc:
@@ -349,7 +367,9 @@ def resume_scan():
     """Release the interlock and restart the belt after a detection is resolved."""
     if not scan_session.active:
         raise HTTPException(status_code=409, detail="No active scan")
-    return scan_session.resume()
+    result = scan_session.resume()
+    _checkpoint()
+    return result
 
 
 @router.post("/forward")
@@ -384,6 +404,7 @@ def forward_scan():
     # on screen with no indication anything had gone wrong.
     conveyor_service.lock_machine_start(reason="forward jog re-lock")
     scan_session.pause_capture(delay_sec=1.0)
+    _checkpoint()
     if not (started and detected):
         raise HTTPException(
             status_code=502,
@@ -400,6 +421,7 @@ def forward_scan():
 def stop_belt():
     """Manual STOP. Counted separately from FM stops in looker_data."""
     scan_session.stop_belt_manually()
+    _checkpoint()
     return {"success": True, **scan_session.status()}
 
 
@@ -413,6 +435,7 @@ def cancel_scan():
     conveyor_service.send("all_stop")
     conveyor_service.unlock_machine_start(reason="scan cancelled")
     result = scan_session.cancel()
+    scan_progress.mark_discarded(result.get("folder_name"))
     return {"success": True, **result}
 
 
@@ -453,6 +476,7 @@ def submit_scan(
 
     status_before = scan_session.status()
     result_payload = scan_session.finish(blower, magnetic)
+    _checkpoint(awaiting_save=True)
 
     batch = None
     batch_id = (scan_session.batch or {}).get("id")
@@ -790,6 +814,7 @@ def confirm_scan(
         return {"success": True, "result_id": already.id, "duplicate": True}
 
     background_tasks.add_task(sync_result_to_cloud, saved.id, datagram)
+    scan_progress.mark_saved((pending.get("status_before") or {}).get("image_unique_id"))
 
     return {"success": True, "result_id": saved.id, "duplicate": False}
 
@@ -814,4 +839,129 @@ def discard_pending():
         _pending_submission = None
 
     result = scan_session.cancel()
+    scan_progress.mark_discarded(result.get("folder_name"))
     return {"success": True, **result}
+
+
+# ---------------------------------------------------------------------------
+# Held batches — see app/services/scan_progress.py
+# ---------------------------------------------------------------------------
+
+@router.post("/hold")
+def hold_pending():
+    """Put the batch on the results page on hold instead of Save or Cancel.
+
+    Nothing is saved to History or sent to Qualix, and nothing is moved: the
+    batch's crops and frames stay in its folders, and its scan_progress row is
+    marked held. The scan session is then cleared so the next batch can start.
+    The batch is continued later from Held Batches on Home.
+
+    Either the hold is recorded or nothing changes: if the database cannot
+    record it, the results page keeps its batch, so the operator can still Save
+    or Cancel instead of losing it.
+    """
+    global _pending_submission
+
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to hold — submit a result first.",
+            )
+        pending = _pending_submission
+        folder = (pending.get("status_before") or {}).get("image_unique_id")
+        if not folder:
+            raise HTTPException(status_code=409, detail="This batch has no folder to hold.")
+
+        try:
+            held = scan_progress.hold(folder)
+            if not held and scan_session.folder_name == folder:
+                # No row yet (an earlier checkpoint failed): write it now.
+                scan_progress.checkpoint(scan_session.progress_state(), awaiting_save=True)
+                held = scan_progress.hold(folder)
+        except Exception as exc:
+            logger.error("Could not hold batch %s: %s", folder, exc)
+            held = False
+        if not held:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not put this batch on hold. Save or Cancel it instead.",
+            )
+        _pending_submission = None
+
+    with scan_session._lock:
+        if scan_session.folder_name == folder:
+            scan_session.reset()
+    conveyor_service.unlock_machine_start(reason="batch held")
+    return {"success": True, "folder_name": folder}
+
+
+@router.get("/held")
+def list_held():
+    """Held and interrupted batches, for the Held Batches list on Home."""
+    return {"batches": scan_progress.list_open()}
+
+
+@router.post("/held/{progress_id}/resume")
+def resume_held(progress_id: int):
+    """Load a held or interrupted batch back into the scan session.
+
+    The frontend then opens the live scan screen for it: Start scans more
+    material into the same batch, Submit goes straight to the results page.
+    Refused while another batch is being scanned.
+    """
+    global _pending_submission
+
+    if scan_session.active:
+        raise HTTPException(
+            status_code=409,
+            detail="Another batch scan is in progress. Submit or cancel it first.",
+        )
+    state = scan_progress.get_open(progress_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="This held batch no longer exists.")
+    if not state.get("output_folder") or not os.path.isdir(state["output_folder"]):
+        raise HTTPException(
+            status_code=409,
+            detail="This batch's images are no longer on the device, so it cannot be "
+                   "continued. Discard it instead.",
+        )
+
+    # A results page left open for another batch (submitted, never saved,
+    # cancelled or held) would otherwise sit in front of this one. Keep that
+    # batch as interrupted instead of losing it.
+    with _pending_lock:
+        if _pending_submission is not None:
+            stale = (_pending_submission.get("status_before") or {}).get("image_unique_id")
+            _pending_submission = None
+            scan_progress.interrupt(stale)
+
+    with scan_session._lock:
+        if scan_session.folder_name and scan_session.folder_name != state["folder_name"]:
+            scan_progress.interrupt(scan_session.folder_name)
+        status = scan_session.restore(state)
+    scan_progress.mark_resumed(progress_id)
+    _checkpoint()
+    conveyor_service.unlock_machine_start(reason="held batch continued")
+    return {
+        "success": True,
+        "batch_id": state.get("batch_id"),
+        "prior_fo_count": scan_session.prior_fo_count,
+        **status,
+    }
+
+
+@router.post("/held/{progress_id}/discard")
+def discard_held(progress_id: int):
+    """Discard a held or interrupted batch, the same way Cancel discards a live
+    one: its crops go to rejected/ (or are deleted with REJECTED_SAVE_ENABLED=
+    false), and it leaves the Held Batches list."""
+    state = scan_progress.get_open(progress_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="This held batch no longer exists.")
+    if scan_session.folder_name == state["folder_name"]:
+        raise HTTPException(status_code=409, detail="This batch is open on the scan screen.")
+    archive_crops(state.get("output_folder"), state.get("commodity") or "",
+                  state.get("variety") or "", state["folder_name"])
+    scan_progress.mark_discarded(state["folder_name"])
+    return {"success": True, "sample_id": state.get("sample_id")}

@@ -83,6 +83,85 @@ def _slug(value: str) -> str:
     return (value or "").strip().lower().replace(" ", "_")
 
 
+def _numbering_on_disk(output_folder: str, output_frame_folder: str) -> Dict[str, int]:
+    """The next free number of each kind of file a run writes, from its folders.
+
+    Used by ScanSession.restore() so a continued run never reuses a number:
+        pending_index  one past the highest crop index (`..._<index>.png` in
+                       output/, `frame_<index>` in fm_full_frames/)
+        frame          one past the highest fm/ frame number
+        r_frame        one past the highest r_frame_<n>.jpg
+        crops          how many crops exist — the FMs reviewed so far
+    """
+    out = {"pending_index": 0, "frame": 0, "r_frame": 0, "crops": 0}
+
+    def trailing_int(stem: str):
+        tail = stem.rsplit("_", 1)[-1]
+        return int(tail) if tail.isdigit() else None
+
+    if output_folder and os.path.isdir(output_folder):
+        for name in os.listdir(output_folder):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in (".png", ".jpg", ".jpeg"):
+                continue
+            out["crops"] += 1
+            n = trailing_int(stem)
+            if n is not None:
+                out["pending_index"] = max(out["pending_index"], n + 1)
+
+    if output_frame_folder and os.path.isdir(output_frame_folder):
+        for name in os.listdir(output_frame_folder):
+            stem, ext = os.path.splitext(name)
+            if stem.startswith("r_frame_") and ext.lower() == ".jpg":
+                n = trailing_int(stem)
+                if n is not None:
+                    out["r_frame"] = max(out["r_frame"], n + 1)
+        for sub, key in (("fm", "frame"), (os.path.join("fm", "low_confidence_frames"), "frame"),
+                         ("fm_full_frames", "pending_index")):
+            folder = os.path.join(output_frame_folder, sub)
+            if not os.path.isdir(folder):
+                continue
+            for name in os.listdir(folder):
+                n = trailing_int(os.path.splitext(name)[0])
+                if n is not None:
+                    out[key] = max(out[key], n + 1)
+    return out
+
+
+def archive_crops(output_folder: str, commodity: str, variety: str, folder_name: str) -> None:
+    """Move a discarded run's crops to rejected/, or delete them.
+
+    Port of cancel_result (main.py:2033-2052): every file directly in
+    output_folder goes to <OUTPUT_DIR>/rejected/<commodity>/<variety>/
+    <folder_name>/. commodity/variety are used raw, NOT slugified, exactly as
+    legacy did (main.py:2039) — a literal legacy inconsistency reproduced
+    rather than "fixed". With REJECTED_SAVE_ENABLED=false they are deleted
+    instead. output_frame/ is never touched, in either case.
+
+    Shared by Cancel on a live batch and Discard on a held one.
+    """
+    if not output_folder or not os.path.isdir(output_folder):
+        return
+    if settings.REJECTED_SAVE_ENABLED:
+        rejected_folder = os.path.join(
+            settings.OUTPUT_DIR, "rejected", commodity, variety, folder_name,
+        )
+        os.makedirs(rejected_folder, exist_ok=True)
+        for name in os.listdir(output_folder):
+            src = os.path.join(output_folder, name)
+            if os.path.isfile(src):
+                shutil.move(src, rejected_folder)
+    else:
+        for name in os.listdir(output_folder):
+            src = os.path.join(output_folder, name)
+            if os.path.isfile(src):
+                os.remove(src)
+        logger.info(
+            "Batch %s discarded; crops deleted (REJECTED_SAVE_ENABLED=false)",
+            folder_name,
+        )
+
+
 def _write_fm_triple(stem: str, image: np.ndarray, detections: List) -> None:
     """Write <stem>.png / .txt / .conf — one frame's training artifacts.
 
@@ -205,6 +284,13 @@ class ScanSession:
         # since save_unselected/label_detection only ever act on self.pending.
         # See enhancements.md.
         self.counted_track_ids = set()
+        # FMs already reviewed before this session picked the batch up — set by
+        # restore() when a held or interrupted batch is continued. The tracker
+        # starts over on a continued batch (its ids restart, and the objects it
+        # knew are long gone from the belt), so the earlier reviews cannot live
+        # in counted_track_ids; they are carried as this number instead and
+        # added to the live count. Always 0 for a batch started fresh.
+        self.prior_fo_count = 0
         self.tracker = ObjectTracker(
             x_tolerance=settings.TRACK_X_TOLERANCE_PX,
             x_tolerance_ratio=settings.TRACK_X_TOLERANCE_RATIO,
@@ -372,6 +458,101 @@ class ScanSession:
             logger.info(
                 "Scan started: sample=%s commodity=%s variety=%s folder=%s",
                 sample_id, commodity, variety, self.output_folder,
+            )
+            return self.status()
+
+    # ------------------------------------------------------------------
+    # Hold / continue — see app/services/scan_progress.py
+    # ------------------------------------------------------------------
+
+    def progress_state(self) -> Dict:
+        """What scan_progress stores for this run, so it can be continued later.
+
+        Only the in-memory part of a run. Its results are on disk already: the
+        crops in output_folder are what create_results counts, and the r_frame
+        files are what Frame Count counts.
+        """
+        return {
+            "folder_name": self.folder_name,
+            "sample_id": self.sample_id,
+            "commodity": self.commodity,
+            "variety": self.variety,
+            "batch_id": (self.batch or {}).get("id"),
+            "analysis_parameters": list(self.analysis_parameters),
+            "start_date": self.start_date,
+            "start_time": self.start_time,
+            "output_folder": self.output_folder,
+            "output_frame_folder": self.output_frame_folder,
+            "frame_count": self.frame_count,
+            "saved_frame_count": self.saved_frame_count,
+            "clean_frame_count": self._clean_frame_count,
+            "next_pending_index": self._next_pending_index,
+            "conveyor_stop_count": dict(self.conveyor_stop_count),
+        }
+
+    def restore(self, state: Dict) -> Dict:
+        """Load a held or interrupted run back in, ready for Start or Submit.
+
+        The run continues in its own folders, so everything it captured before
+        is still counted at Submit. Three things make that safe:
+
+        * File numbering continues past what is on disk, not only past what the
+          stored state says. A crop's name ends in its pending index, and
+          re-labelling deletes `*_<index>.png` — reusing an index would delete
+          an earlier object's crop. fm/ and r_frame files are numbered the same
+          way and would be overwritten. The disk is checked too because a power
+          cut can land after a file was written but before its row was.
+        * The live FM count carries on from the earlier reviews (prior_fo_count).
+        * A stop that was in progress when the run was interrupted is closed at
+          its last recorded moment rather than left running, so the outage is
+          not counted as stop time. Time on hold is never stop time.
+
+        Detection stays suspended until Start, the same as after Submit, so the
+        objects still sitting under the camera are not reported the moment the
+        live view comes back.
+        """
+        with self._lock:
+            self.reset()
+            self.sample_id = state.get("sample_id") or ""
+            self.commodity = state.get("commodity") or ""
+            self.variety = state.get("variety") or ""
+            batch_id = state.get("batch_id")
+            self.batch = {"id": batch_id} if batch_id else {}
+            self.analysis_parameters = list(state.get("analysis_parameters") or [])
+            self.start_date = state.get("start_date") or ""
+            self.start_time = state.get("start_time") or ""
+            self.folder_name = state.get("folder_name") or ""
+            self.output_folder = state.get("output_folder") or ""
+            self.output_frame_folder = state.get("output_frame_folder") or ""
+            os.makedirs(self.output_folder, exist_ok=True)
+            os.makedirs(self.output_frame_folder, exist_ok=True)
+
+            disk = _numbering_on_disk(self.output_folder, self.output_frame_folder)
+            self.frame_count = max(int(state.get("frame_count") or 0), disk["frame"])
+            self.saved_frame_count = max(int(state.get("saved_frame_count") or 0), disk["r_frame"])
+            self._clean_frame_count = int(state.get("clean_frame_count") or 0)
+            self._next_pending_index = max(
+                int(state.get("next_pending_index") or 0), disk["pending_index"],
+            )
+
+            csc = {**self.conveyor_stop_count, **(state.get("conveyor_stop_count") or {})}
+            stopped_at = state.get("last_checkpoint_ts")
+            for running, total in (("fm_time", "total_fm_time"), ("stop_time", "total_stop_time")):
+                if csc.get(running):
+                    if stopped_at and stopped_at > csc[running]:
+                        csc[total] = csc.get(total, 0) + (stopped_at - csc[running])
+                    csc[running] = 0
+            self.conveyor_stop_count = csc
+
+            self.prior_fo_count = disk["crops"]
+            self.active = True
+            self.detection_suspended = True
+            self.capture_paused = False
+            logger.info(
+                "Scan restored: sample=%s folder=%s prior_fo=%s next_index=%s "
+                "frame=%s r_frame=%s",
+                self.sample_id, self.folder_name, self.prior_fo_count,
+                self._next_pending_index, self.frame_count, self.saved_frame_count,
             )
             return self.status()
 
@@ -1652,34 +1833,11 @@ class ScanSession:
         """
         with self._lock:
             sample_id = self.sample_id
-            if self.output_folder and os.path.isdir(self.output_folder):
-                if settings.REJECTED_SAVE_ENABLED:
-                    rejected_folder = os.path.join(
-                        settings.OUTPUT_DIR, "rejected", self.commodity, self.variety,
-                        self.folder_name,
-                    )
-                    os.makedirs(rejected_folder, exist_ok=True)
-                    for name in os.listdir(self.output_folder):
-                        src = os.path.join(self.output_folder, name)
-                        if os.path.isfile(src):
-                            shutil.move(src, rejected_folder)
-                else:
-                    # REJECTED_SAVE_ENABLED=false: the operator discarded this
-                    # batch and the device is told not to keep it, so its crops
-                    # are deleted rather than archived. Only the files directly
-                    # in this batch's own output folder — exactly what would
-                    # otherwise have been moved — and never output_frame/,
-                    # which Cancel has never touched in either direction.
-                    for name in os.listdir(self.output_folder):
-                        src = os.path.join(self.output_folder, name)
-                        if os.path.isfile(src):
-                            os.remove(src)
-                    logger.info(
-                        "Batch %s cancelled; crops deleted (REJECTED_SAVE_ENABLED=false)",
-                        sample_id,
-                    )
+            folder_name = self.folder_name
+            archive_crops(self.output_folder, self.commodity, self.variety, self.folder_name)
             self.reset()
-        return {"cancelled": True, "sample_id": sample_id}
+        return {"cancelled": True, "sample_id": sample_id, "folder_name": folder_name}
+
 
     # ------------------------------------------------------------------
     # Results
@@ -1946,7 +2104,7 @@ class ScanSession:
             # total_fo_detected below, which legacy only ever uses for the
             # final saved result/looker_data, never shown on this label.
             "frame_fm_count": len(self.pending),
-            "total_fo_detected": len(self.counted_track_ids),
+            "total_fo_detected": self.prior_fo_count + len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "machine_start_locked": conveyor_service.machine_start_locked,
             "capture_paused": self.capture_paused,
@@ -1971,7 +2129,7 @@ class ScanSession:
             "start_time": self.start_time,
             "image_unique_id": self.folder_name,
             "output_folder": self.output_folder,
-            "total_fo_detected": len(self.counted_track_ids),
+            "total_fo_detected": self.prior_fo_count + len(self.counted_track_ids),
             "frame_count": self.frame_count,
             "conveyor_stop_count": dict(self.conveyor_stop_count),
             "machine_start_locked": conveyor_service.machine_start_locked,

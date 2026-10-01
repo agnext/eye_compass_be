@@ -613,6 +613,24 @@ deliberately still open.
   over rather than raised: a read-only or full disk must not keep a machine
   whose job is the belt from starting.
 
+- **Held batches and power-cut recovery.** A batch scan used to live only in
+  memory, so leaving it — on purpose, by reloading the scan page, or by losing
+  power — lost it. Two features now share one `scan_progress` table, one row per
+  run, updated at every operator action and never from the per-frame loop:
+  **Hold Batch** on the results page (beside Save and Cancel) sets the batch
+  aside without saving or moving anything, and **Held Batches** on Home lists it
+  for **Continue** — back to the live scan screen with its FMs carried over,
+  where Start scans more into the same batch and Submit goes to its results —
+  or **Discard**. A batch still active when the backend stops (power cut, crash,
+  restart) is marked **Interrupted** at the next startup and continued the same
+  way. It works because a batch's results are on disk already (crops counted by
+  filename, Frame Count from `r_frame` files); only its in-memory bookkeeping is
+  stored. Continuing numbers new files past what is on disk, so no earlier crop
+  or frame is overwritten or deleted by a later relabel. Hold time is stored
+  (`hold_count`, `total_held_seconds`, `hold_history`) but deliberately not
+  counted in any stop metric and not shown. The S3 cleanup protects every open
+  batch. Legacy had none of this. See `13 - held_batches_and_power_cut_recovery.md`.
+
 ### Frontend
 - **The Home screen checks whether the backend has flagged the session for
   re-login** (`needs_relogin` from `/auth/me`) and, if so, signs the operator

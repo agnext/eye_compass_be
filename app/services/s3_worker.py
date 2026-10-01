@@ -254,8 +254,9 @@ class S3UploaderTask:
     def _protected_dirs() -> Set[str]:
         """Folders that are, or may still be, written to: never touched.
 
-        Set whenever a batch folder is known to the scan session, not only
-        while scanning: after Submit the results page can still reclassify
+        Includes every held or interrupted batch (scan_progress). The scan
+        session's own folders are set whenever a batch folder is known to it,
+        not only while scanning: after Submit the results page can still reclassify
         crops and rewrite result.json in it, and it stays set until the next
         batch starts.
         """
@@ -274,6 +275,17 @@ class S3UploaderTask:
                 dirs.add(os.path.realpath(d))
         except Exception:
             pass
+        # Every batch that is not finished: the active one, and every held or
+        # interrupted one waiting to be continued. A held batch is continued in
+        # its own folders, so uploading-and-removing them would take its
+        # captured FMs and frames away from under it. Unlike the two above this
+        # is deliberately NOT allowed to fail quietly: if the database cannot
+        # say which batches are open, the run is abandoned (the exception
+        # propagates) rather than treating "unknown" as "nothing protected".
+        from app.services.scan_progress import open_folders
+
+        for d in open_folders():
+            dirs.add(os.path.realpath(d))
         return dirs
 
     # ------------------------------------------------------------------

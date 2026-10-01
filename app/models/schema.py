@@ -318,3 +318,75 @@ class BatchDetails(Base):
     product_code = Column(String(150))
     sorter_name = Column(String(150))
     created_at = Column(String(50))
+
+
+class ScanProgress(Base):
+    """One row per batch scan run: the state needed to continue it later.
+
+    Not a legacy table. Legacy kept a running scan only in memory, so leaving
+    the scan — on purpose, or by losing power — lost it. A run's *results* are
+    mostly on disk already (create_results counts the crop files in its output
+    folder; Frame Count counts its r_frame files), so this row only has to hold
+    what is otherwise in memory: who the batch is, when it started, its folders,
+    the stop counters, and how far its file numbering has got.
+
+    status:
+        active       the batch currently loaded in the scan session
+        held         the operator put it on hold from the results page
+        interrupted  it was active when the backend stopped (power cut,
+                     restart) or was abandoned for another batch
+        saved        confirmed — it is in History now
+        discarded    cancelled; its crops went to rejected/
+
+    held and interrupted are the "open" states: listed under Held Batches on
+    Home, continuable, and protected from the S3 cleanup.
+
+    Written at operator actions (Start, Stop, each review, Submit, Hold) and
+    never from the per-frame detection loop, so it costs the scan nothing.
+    """
+
+    __tablename__ = "scan_progress"
+
+    id = Column(Integer, primary_key=True)
+    # The run's unique folder name, <sample_id>_<YYYYmmddHHMMSS> — the same
+    # value as image_unique_id in the Qualix datagram.
+    folder_name = Column(String(200), unique=True, nullable=False)
+    sample_id = Column(String(100), index=True)
+    commodity = Column(String(100))
+    variety = Column(String(100))
+    batch_id = Column(Integer, nullable=True)
+    analysis_parameters = Column(JSONType, default=list)
+    start_date = Column(String(20))
+    start_time = Column(String(20))
+    output_folder = Column(Text)
+    output_frame_folder = Column(Text)
+    status = Column(String(20), index=True, default="active")
+    # True once the run has been through Submit and is waiting on the results
+    # page (or was held from there). Submit counts an implicit stop of its own,
+    # so a run that is submitted, held and submitted again would count two;
+    # restore uses this to take the first one back out.
+    awaiting_save = Column(Boolean, default=False)
+
+    # Counters the in-memory session carries between frames. On restore these
+    # are a floor, not the answer: the files on disk are checked as well, since
+    # a power cut can land after a file was written but before this row was.
+    frame_count = Column(Integer, default=0)
+    saved_frame_count = Column(Integer, default=0)
+    clean_frame_count = Column(Integer, default=0)
+    next_pending_index = Column(Integer, default=0)
+    # ScanSession.conveyor_stop_count, verbatim.
+    conveyor_stop_count = Column(JSONType, default=dict)
+
+    # Time spent on hold. Kept for a possible later requirement; deliberately
+    # NOT counted in any stop metric and not shown in the UI.
+    hold_count = Column(Integer, default=0)
+    total_held_seconds = Column(Integer, default=0)
+    # Start of the current hold, while held or interrupted.
+    held_at = Column(DateTime, nullable=True)
+    # Every hold, as [{"held_at", "resumed_at", "reason"}], reason "held" or
+    # "interrupted".
+    hold_history = Column(JSONType, default=list)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    closed_at = Column(DateTime, nullable=True)

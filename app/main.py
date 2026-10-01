@@ -172,6 +172,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Could not read existing sessions at startup: %s", exc)
 
+    # A batch scan that was in progress when the backend last stopped (power
+    # cut, crash, restart) is still marked active. Nothing in this process is
+    # running it, so it is kept as interrupted: listed under Held Batches on
+    # Home and continued from there. See app/services/scan_progress.py.
+    from app.services import scan_progress
+
+    scan_progress.interrupt_all_active()
+
     # 2. Safety: the machine must never come up with the belt running.
     #    Legacy did this at main.py:505.
     if not settings.USE_MOCK_CAMERA:

@@ -216,6 +216,11 @@ levels under each tree). Skipped:
   scan session still refers to them (including the results page after Submit,
   which can still reclassify crops);
 - the current Data Collection folder;
+- every held or interrupted batch (and the active one), from the
+  `scan_progress` table — a held batch is continued in its own folders, so
+  removing them would take its FMs and frames away before it is finished. If
+  the database cannot be read the run is abandoned rather than guessing. See
+  `13 - held_batches_and_power_cut_recovery.md`;
 - any folder with anything changed in the last `S3_MIN_AGE_MINUTES` (default
   30) — a floor under retention, and the guard that still applies if
   `S3_RETENTION_DAYS` is set to 0.
