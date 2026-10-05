@@ -169,6 +169,21 @@ sudo systemctl stop eye-compass-backend.service
 sudo docker compose down           # or: docker compose stop, to keep the containers
 ```
 
+**Temporarily stop a single container without auto-starting on reboot:**
+
+```bash
+# Disable auto-restart and stop container (e.g. frontend):
+sudo docker update --restart=no eye_compass_new-frontend-1
+sudo docker stop eye_compass_new-frontend-1
+
+# Check status:
+sudo docker ps -a --filter "name=eye_compass_new-frontend-1"
+
+# When ready to restore and start it again:
+sudo docker update --restart=unless-stopped eye_compass_new-frontend-1
+sudo docker start eye_compass_new-frontend-1
+```
+
 **Restart after a backend code change** (`uvicorn` runs without `--reload`,
 so an edited file has no effect until the service is restarted):
 
@@ -202,14 +217,10 @@ DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority /home/nvidia/.local/bin/eye-
 # See whether it found the backend/frontend ready, and when:
 cat ~/.local/state/eye-compass-kiosk.log
 
-# Close it — the script now launches with --kiosk (full-screen, no title
-# bar/close button by request), so there is no on-screen way to close the
-# window; use Alt+F4, or from any terminal. The launch script relaunches
-# Firefox automatically if it closes or crashes (see below), so killing just
-# the browser process only closes it for ~3 seconds — stop the launch
-# script's own process too if you actually want it to stay closed:
-pkill -f eye-compass-kiosk.sh
-pkill -f "firefox --profile /home/nvidia/.local/opt/firefox-kiosk-profile"
+# Close it — the script launches with --kiosk (full-screen, no title
+# bar/close button), so there is no on-screen close button; use Alt+F4,
+# or stop both the kiosk script and the browser process from terminal:
+pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
 ```
 
 **The browser relaunches itself if closed or crashed.** `eye-compass-kiosk.sh`
