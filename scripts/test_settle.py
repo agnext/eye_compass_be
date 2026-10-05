@@ -13,6 +13,9 @@ import numpy as np
 from app.core.config import settings
 settings.OUTPUT_DIR = tempfile.mkdtemp()
 settings.DETECTION_SETTLE_SECONDS = 0.0      # no real waiting in a test
+# The belt-start grace would otherwise suppress detection for the first
+# seconds of every run started here; these tests feed frames immediately.
+settings.DETECTION_START_GRACE_SECONDS = 0.0
 settings.DETECTION_SAMPLE_FRAMES = 3
 # Pin the clean-belt frame interval so step 5's "a raw frame reached disk"
 # check is deterministic: it generates only a few empty frames, and the

@@ -89,6 +89,10 @@ def checkpoint(state: Dict, awaiting_save: bool = False) -> None:
                       .all()):
             other.status = "interrupted"
             _open_hold(other, "interrupted", other.updated_at or now)
+            # Nothing to announce: the operator did this themselves, by going
+            # on to another batch, and is standing in front of the machine.
+            # Only a run cut off while nobody could be told is announced.
+            other.interrupt_notified = True
             logger.info("Batch %s left unfinished — kept as interrupted", other.folder_name)
 
         row = db.query(ScanProgress).filter(ScanProgress.folder_name == folder).first()
@@ -156,6 +160,9 @@ def interrupt(folder: str) -> None:
         if row is not None:
             row.status = "interrupted"
             _open_hold(row, "interrupted", row.updated_at or _now())
+            # Deliberate and in front of the operator (the scan page was
+            # reloaded or left), so there is nothing to announce later.
+            row.interrupt_notified = True
             db.commit()
             logger.info("Batch %s dropped unfinished — kept as interrupted", folder)
     except Exception as exc:
@@ -197,6 +204,10 @@ def interrupt_all_active() -> int:
         for row in rows:
             row.status = "interrupted"
             _open_hold(row, "interrupted", row.updated_at or _now())
+            # The one case where nobody could be told at the time: announce it
+            # on Home the next time an operator is there. See
+            # pending_interrupt_notice().
+            row.interrupt_notified = False
         db.commit()
         for row in rows:
             logger.warning(
@@ -263,6 +274,77 @@ def count_open() -> int:
         db.close()
 
 
+def pending_interrupt_notice() -> Optional[Dict]:
+    """The interrupted run the operator has not been told about yet, if any.
+
+    Answers the Home screen's "was a scan cut off while the machine was away?"
+    question. Only ever one batch — the most recent — because a prompt listing
+    several is a prompt nobody reads; `others` says how many more are waiting
+    under Held Batches, which is where they are all dealt with anyway.
+
+    Deliberately narrow:
+
+    * `interrupted` only. A `held` batch was the operator's own decision and
+      needs no announcement.
+    * Unannounced only. Continue and Later both mark it told, so a batch left
+      for later never reopens the same prompt on the next boot.
+    * Its images must still be on the device. Continue is impossible without
+      them, so a prompt offering it would be a dead end; the row stays listed
+      under Held Batches, where it can be discarded.
+
+    Never raises: a database problem must not keep the operator off Home.
+    """
+    db = SessionLocal()
+    try:
+        rows = (db.query(ScanProgress)
+                .filter(ScanProgress.status == "interrupted",
+                        ScanProgress.interrupt_notified.is_(False))
+                .order_by(ScanProgress.held_at.desc().nullslast(),
+                          ScanProgress.id.desc())
+                .all())
+        # Latest first, so the first one whose images survived is the newest
+        # continuable run. Ties break on id, so the answer is stable.
+        row = next((r for r in rows
+                    if r.output_folder and os.path.isdir(r.output_folder)), None)
+        if row is None:
+            return None
+        batch = (db.query(BatchDetails).filter(BatchDetails.id == row.batch_id).first()
+                 if row.batch_id else None)
+        others = (db.query(ScanProgress)
+                  .filter(ScanProgress.status.in_(OPEN_STATUSES),
+                          ScanProgress.id != row.id)
+                  .count())
+        return {**_summary(row, batch), "others": others}
+    except Exception as exc:
+        logger.error("Could not check for an unannounced interrupted scan: %s", exc)
+        return None
+    finally:
+        db.close()
+
+
+def mark_interrupt_notified(progress_id: int) -> bool:
+    """The operator has been told about this run — never prompt for it again.
+
+    Called by Later and by Continue alike. Returns False if there is no such
+    row. Never raises: failing to record the acknowledgement must not block
+    either action, and the worst case is the prompt appearing once more.
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(ScanProgress).filter(ScanProgress.id == progress_id).first()
+        if row is None:
+            return False
+        row.interrupt_notified = True
+        db.commit()
+        return True
+    except Exception as exc:
+        db.rollback()
+        logger.error("Could not record the interrupt notice for %s: %s", progress_id, exc)
+        return False
+    finally:
+        db.close()
+
+
 def get_open(progress_id: int) -> Optional[Dict]:
     """The stored state of an open run, in ScanSession.restore()'s shape."""
     db = SessionLocal()
@@ -314,6 +396,10 @@ def mark_resumed(progress_id: int) -> None:
         _close_hold(row, now)
         row.status = "active"
         row.awaiting_save = False
+        # Continuing it is itself an acknowledgement: if it is interrupted
+        # again later, that is a new interruption worth announcing, but this
+        # one has been dealt with.
+        row.interrupt_notified = True
         row.updated_at = now
         db.commit()
     finally:

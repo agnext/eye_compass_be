@@ -902,6 +902,36 @@ def list_held():
     return {"batches": scan_progress.list_open()}
 
 
+@router.get("/interrupted-notice")
+def interrupted_notice():
+    """The batch cut off by a power cut or crash that nobody has been told about.
+
+    Home asks on arrival and shows a prompt if there is one: continue it now, or
+    leave it for later in Held Batches. `{"batch": null}` when there is nothing
+    to announce, which is the normal case.
+
+    Suppressed while a scan is in progress. The question is "did something
+    happen while the machine was away", and an operator mid-batch is neither
+    able to act on it nor in a position to be interrupted by it; the batch stays
+    unannounced and comes up the next time they are back on Home with nothing
+    running.
+    """
+    if scan_session.active:
+        return {"batch": None}
+    return {"batch": scan_progress.pending_interrupt_notice()}
+
+
+@router.post("/interrupted-notice/{progress_id}/ack")
+def ack_interrupted_notice(progress_id: int):
+    """The operator has seen the prompt — do not raise it for this batch again.
+
+    Sent by "Continue later". Continue does not need it: resuming the batch
+    records the acknowledgement itself.
+    """
+    scan_progress.mark_interrupt_notified(progress_id)
+    return {"status": "ok"}
+
+
 @router.post("/held/{progress_id}/resume")
 def resume_held(progress_id: int):
     """Load a held or interrupted batch back into the scan session.

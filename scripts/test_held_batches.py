@@ -22,6 +22,9 @@ from app.core.config import settings  # noqa: E402
 
 settings.OUTPUT_DIR = tempfile.mkdtemp()
 settings.DETECTION_SETTLE_SECONDS = 0.0
+# The belt-start grace would otherwise suppress detection for the first
+# seconds of every run started here; these tests feed frames immediately.
+settings.DETECTION_START_GRACE_SECONDS = 0.0
 settings.DETECTION_SAMPLE_FRAMES = 3
 settings.RAW_FRAME_EVERY = 1
 settings.FM_FRAMES_ENABLED = True

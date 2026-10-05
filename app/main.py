@@ -43,6 +43,12 @@ def _add_missing_columns():
             "refresh_token": "TEXT",
             "operator_id": "VARCHAR(64) DEFAULT ''",
         },
+        "scan_progress": {
+            # Existing interrupted rows are marked notified so that adding this
+            # feature does not greet the operator with a prompt about a batch
+            # they have already seen sitting in Held Batches.
+            "interrupt_notified": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
         "result": {
             "sync_error": "TEXT DEFAULT ''",
             # No DEFAULT: existing rows must stay NULL. A default of '' would

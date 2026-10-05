@@ -807,6 +807,7 @@ out there.
 | `DETECTION_QUEUE_MAX` | `20` | Most detections that may wait behind the one on screen |
 | `DETECTION_SETTLE_SECONDS` | `1.0` | How long to let the belt stop before looking |
 | `DETECTION_SAMPLE_FRAMES` | `3` | Stationary frames combined into one review screen; 1 disables |
+| `DETECTION_START_GRACE_SECONDS` | `2.0` | How long to let the belt get moving on a batch's first Start before detecting; 0 disables |
 | `REVIEW_JPEG_QUALITY` | `88` | Quality of the frozen review frame, which is sent at full sensor width rather than `STREAM_MAX_WIDTH` |
 
 `CAMERA_FRAME_QUEUE_SIZE` remains declared and **read nowhere**. It
@@ -859,6 +860,46 @@ Nothing else needs changing, and no other fix in this document is affected —
 the identity filtering, the duplicate merging and the tracker changes all
 continue to apply. What comes back is the old symptom: one group of objects
 spread across several review screens, arriving through `detection_queue`.
+
+### 8.2 `DETECTION_START_GRACE_SECONDS` — not looking until the belt moves
+
+The belt is physically at rest at the moment Start is pressed: `machine_start`
+has just gone down the serial line and the motor has not yet taken up. An object
+already lying under the camera was therefore detected where it sat, and the
+whole stop/settle/look cycle ran against a belt that had never moved.
+
+That alone would be harmless — a stop is a stop. What made it a bug is what came
+next. The stationary re-look a second later found nothing, because the model
+does not return the same set of objects in every frame and had lost the one it
+saw; the box that triggered the stop was shown as the fallback (§4); the
+operator dismissed it and pressed Start; the belt finally carried the object
+into view properly, and it was detected **again**. Not as the same object —
+`TRACK_STALE_AFTER_SECONDS` is `0.3`, so the id it held at rest was evicted long
+before — but as a new one, with a new id, uncounted and therefore countable. One
+piece of foreign matter, two entries in the count, from a stop that should never
+have happened.
+
+Detection is now skipped until `DETECTION_START_GRACE_SECONDS` (default `2.0`)
+has elapsed from a batch's first Start. The live preview is not skipped; the
+operator sees the belt the whole time. There is simply nothing to detect at
+rest, so the object is counted once, on its way past.
+
+**The first Start of a batch only.** `start()` is also the resume after every
+review, and the grace is deliberately not armed there: a resume happens many
+times in a scan, and a blind window after each one is a window in which an
+object can cross the field of view unseen — at the measured belt speeds, well
+within one. The cost of the grace is paid once, when nothing is moving anyway.
+
+- Raise it if the conveyor is slow to take up and objects are still being
+  reported before it moves.
+- Lower it if a batch's first object is being missed because the belt is
+  already at speed by the time Start is pressed.
+- `0` restores the previous behaviour: detection from the first frame after
+  Start.
+
+The §4 fallback is untouched by this. It is the safety net for a real object the
+model briefly loses, and removing it would trade a box the operator can dismiss
+for an object nobody ever sees.
 
 ---
 
@@ -986,6 +1027,7 @@ Runnable with the service virtualenv from the backend root:
 | `test_merge.py` | Both live class-confusion pairs merged, genuinely adjacent objects kept separate |
 | `test_identity.py` | An already-reviewed object not shown again when a different object arrives; a left-edge object reported once and not again |
 | `test_settle.py` | Nothing shown until the belt has stopped; three stationary frames finding different subsets combined into one screen carrying all five objects; fallback when the stationary frames find nothing; an object leaving the view mid-stop held and shown afterwards; raw frames written off the loop |
+| `test_start_grace.py` | An object under the camera at the first Start is not detected, does not stop the belt and is not counted while the belt is at rest; the same object is detected once the belt moves and reaches the count exactly once; a mid-batch resume still detects immediately; `DETECTION_START_GRACE_SECONDS=0` restores the previous behaviour |
 
 Several assert against coordinates taken verbatim from production logs, so a
 regression reproduces the original failure rather than an approximation of it.
@@ -1076,6 +1118,36 @@ forgets you the second they finish serving you.
 
 It now **remembers the numbers**. Once an object has been put in front of you,
 it is never shown again for the rest of that scan.
+
+### Why pressing Start sometimes showed something that was not there
+
+When you press Start, the belt has not actually begun to move yet — the
+instruction has gone to the motor, but for a moment everything is still sitting
+exactly where it was. The machine was already looking during that moment. So if
+a piece of foreign matter happened to be lying under the camera, it was spotted
+where it lay and the belt was stopped before it had moved an inch.
+
+A second later the machine takes another look to build your review screen, and
+often found nothing — the AI does not spot the same thing in every photo. Rather
+than lose it, the machine fell back to showing the box that had stopped the
+belt. So you got a review screen for something it could no longer see.
+
+Then you dismissed it and pressed Start again, the belt finally carried that
+same object past the camera, and it was spotted a second time. The machine did
+not recognise it as the one you had just dealt with: it only remembers an object
+for about a third of a second once it stops seeing it, and the belt had been
+stopped far longer than that. **One piece of foreign matter, counted twice.**
+
+The machine now **waits a couple of seconds after Start before it looks at
+anything**, so the belt is genuinely moving before it starts judging. You still
+see the live picture the whole time — it just does not report anything until
+there is movement to report on. The object then goes past once, and is counted
+once.
+
+It waits only on the first Start of a batch, not when you press Start again
+after dealing with a detection. Those happen many times in a scan, and a couple
+of seconds of not looking each time is long enough for something to travel right
+past the camera unseen.
 
 ### Why one group of objects arrived across several screens
 

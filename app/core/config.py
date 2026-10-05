@@ -222,6 +222,17 @@ class Settings:
     # stationary when they are finally looked at.
     DETECTION_SETTLE_SECONDS: float = _as_float(os.getenv("DETECTION_SETTLE_SECONDS"), 1.0)
 
+    # How long to let the belt get moving on the FIRST Start of a batch before
+    # detection begins. The belt is physically at rest when Start is pressed, so
+    # anything already lying under the camera is detected where it sits, stops
+    # the belt before it has moved at all, and — because a track id is evicted
+    # after a fraction of a second unseen — is detected a second time as a new
+    # object once the belt finally carries it on. Only the first Start of a
+    # batch: a resume mid-batch must not open a window in which an object can
+    # cross the view unseen. 0 disables the behaviour.
+    DETECTION_START_GRACE_SECONDS: float = _as_float(
+        os.getenv("DETECTION_START_GRACE_SECONDS"), 2.0)
+
     # How many stationary frames to combine into one review screen. The model's
     # output is not the same from frame to frame — an object at 0.15 confidence
     # is found in one frame and missed in the next — so a single frame shows

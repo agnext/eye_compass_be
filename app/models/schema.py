@@ -387,6 +387,14 @@ class ScanProgress(Base):
     # "interrupted".
     hold_history = Column(JSONType, default=list)
 
+    # True once the operator has been told, on Home, that this run was cut off.
+    # Only `interrupted` rows are ever announced, and only once: a batch the
+    # operator chose to leave for later must not reopen the same prompt on
+    # every boot. Set by Continue and by Later alike — the Held Batches card on
+    # Home carries the count from then on. Set at the moment a row is marked
+    # interrupted too, when there is nobody to tell: see interrupt().
+    interrupt_notified = Column(Boolean, default=False)
+
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     closed_at = Column(DateTime, nullable=True)

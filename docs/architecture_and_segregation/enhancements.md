@@ -631,6 +631,26 @@ deliberately still open.
   counted in any stop metric and not shown. The S3 cleanup protects every open
   batch. Legacy had none of this. See `13 - held_batches_and_power_cut_recovery.md`.
 
+- **Detection waits for the belt to get moving on the first Start of a batch**
+  (`DETECTION_START_GRACE_SECONDS`, default 2.0s; `0` disables). The belt is
+  physically at rest at the moment Start is pressed, so an object already lying
+  under the camera was detected where it sat: the belt was stopped before it had
+  moved at all, the stationary re-look a second later found nothing (the model
+  loses an object it saw once), and the box that triggered the stop was shown as
+  a fallback. The operator dismissed it and pressed Start, the belt finally
+  carried the object on, and it was detected a second time — as a *new* object,
+  because a track id is evicted after a fraction of a second unseen and the one
+  it had at rest was long gone. The same piece of foreign matter therefore
+  reached the count twice, from one spurious stop.
+
+  Detection is now skipped (the live preview is not) until the grace elapses, so
+  there is nothing to detect at rest and the object is counted once, on its way
+  past. The first Start of a batch only, never a resume mid-batch: a resume
+  happens after every review, and a blind window there is a window in which an
+  object can cross the view unseen. The existing fallback is untouched — it is
+  the safety net for a real object the model briefly loses, and dropping it
+  would trade a dismissable box for a missed one.
+
 ### Frontend
 - **The Home screen checks whether the backend has flagged the session for
   re-login** (`needs_relogin` from `/auth/me`) and, if so, signs the operator

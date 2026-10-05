@@ -14,6 +14,9 @@ sys.path.insert(0, '.')
 import numpy as np
 from app.core.config import settings
 settings.OUTPUT_DIR = tempfile.mkdtemp()
+# The belt-start grace would otherwise suppress detection for the first
+# seconds of every run started here; these tests feed frames immediately.
+settings.DETECTION_START_GRACE_SECONDS = 0.0
 from app.services.scan_session import ScanSession
 from app.services.conveyor_service import conveyor_service
 

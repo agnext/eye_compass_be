@@ -20,6 +20,9 @@ def box(x, y, w=40):
     return (x, y, x + w, y + w, 0.9, 0)
 
 settings.DETECTION_SETTLE_SECONDS = 0.01
+# The belt-start grace would otherwise suppress detection for the first
+# seconds of every run started here; these tests feed frames immediately.
+settings.DETECTION_START_GRACE_SECONDS = 0.0
 s = ScanSession()
 s.start("T1PARKED", "toor", "", analysis_parameters=["Stones"])
 

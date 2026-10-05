@@ -384,6 +384,11 @@ class ScanSession:
         # See enhancements.md.
         self.detection_suspended = False
 
+        # Monotonic deadline until which detection is skipped because the belt
+        # has only just been told to start and is still physically at rest.
+        # Set by the first Start of a batch; see DETECTION_START_GRACE_SECONDS.
+        self._start_grace_deadline = 0.0
+
         # Port of cam_thread.capture_paused (GrabImage.py:82/95). While set,
         # legacy's capture loop grabs nothing at all, so no frames reach
         # inference and the display stays frozen on the detection frame.
@@ -455,6 +460,10 @@ class ScanSession:
             self.active = True
             # start_process clears capture_paused (main.py:812/844).
             self.resume_capture()
+            self._start_grace_deadline = (
+                time.monotonic() + settings.DETECTION_START_GRACE_SECONDS
+                if settings.DETECTION_START_GRACE_SECONDS > 0 else 0.0
+            )
             logger.info(
                 "Scan started: sample=%s commodity=%s variety=%s folder=%s",
                 sample_id, commodity, variety, self.output_folder,
@@ -1041,6 +1050,21 @@ class ScanSession:
             # see detection_suspended's comment in reset().
             if self.detection_suspended:
                 return self._snapshot(fm_detected=False)
+
+            # Live view only, no detection, until the belt has had a moment to
+            # get moving after the batch's first Start — see
+            # DETECTION_START_GRACE_SECONDS. Without this, an object already
+            # lying under the camera is detected at rest, stops the belt before
+            # it has moved, and is then detected again as a new object once the
+            # belt carries it on, because its track id is evicted while stopped.
+            if self._start_grace_deadline:
+                if time.monotonic() < self._start_grace_deadline:
+                    return self._snapshot(fm_detected=False)
+                self._start_grace_deadline = 0.0
+                logger.info(
+                    "Belt start grace of %.1fs elapsed — detection active.",
+                    settings.DETECTION_START_GRACE_SECONDS,
+                )
 
             h, w = frame.shape[:2]
 
