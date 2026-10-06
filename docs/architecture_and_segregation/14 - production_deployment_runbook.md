@@ -1,9 +1,14 @@
 # 14. Production Deployment Runbook — Setting Up a Device From Start to End
 
-Everything needed to take a production Jetson from "nothing installed" (or
-"running the legacy PyQt5 app") to "this stack running unattended, full-screen,
-surviving reboots". Follow it top to bottom; each step says how to confirm it
-worked before you move on.
+Every production device is currently running the legacy PyQt5 app under
+`/home/nvidia/eye_compass`. This procedure installs the new stack **alongside
+it** at `/home/nvidia/eye_compass_new` — the same layout as the dev unit. The
+legacy folder is left exactly as it is; you stop it but do not move or rename
+it. The new backend reads inference code and model files from it via
+`EYE_COMPASS_SRC=/home/nvidia/eye_compass`.
+
+Follow it top to bottom; each step says how to confirm it worked before you
+move on.
 
 This is an installation procedure, not a design document. For *why* the pieces
 are split the way they are, read `5 - infrastructure_and_deployment.md` first —
@@ -12,7 +17,7 @@ reasoning, `10 - pwa_and_deployment_rollout.md`.
 
 > **The one difference from the dev unit:** on dev, the frontend container runs
 > Vite's **dev server** (`npm run dev`, port 5173). Production serves a **built
-> bundle behind Nginx on port 80** instead. Step 6 covers that; it is the only
+> bundle behind Nginx on port 80** instead. Step 7 covers that; it is the only
 > part of this stack that genuinely differs between dev and prod. The backend
 > and database are identical in both.
 
@@ -36,7 +41,49 @@ adjust.
 
 ---
 
-## 1. Before you start — collect these
+## 1. Stop the legacy app
+
+The legacy PyQt5 app runs from `/home/nvidia/eye_compass`. Leave that folder
+exactly where it is — the new backend reads `run_inference.py`, `config.INI`,
+`FeatureFile_new.ini`, and the model files from it via
+`EYE_COMPASS_SRC=/home/nvidia/eye_compass`. Only the running process needs to
+stop.
+
+**Stop the legacy app.** How it runs varies by device — it may be a systemd
+service, a cron-launched script, or a manually started process. Find and stop
+whatever is running:
+
+```bash
+# Check what's running from the legacy tree
+ps aux | grep eye_compass | grep -v grep
+
+# If it's a systemd service (common name varies per device):
+sudo systemctl stop eye-compass.service      # or whatever the legacy unit is called
+sudo systemctl disable eye-compass.service   # prevent it from starting on reboot
+```
+
+**Back up the legacy SQLite database** — the migration script in step 9 reads
+it, and you want a known-good copy before anything else runs:
+
+```bash
+mkdir -p /home/nvidia/eye_compass_new/db_backups
+cp /home/nvidia/eye_compass/eye_compass.db \
+   /home/nvidia/eye_compass_new/db_backups/eye_compass.db.$(date +%Y%m%d_%H%M%S).bak
+```
+
+**Rollback** is straightforward at any point — the legacy folder was never
+touched, so it is enough to stop the new stack and restart whatever the legacy
+app's own launch mechanism was:
+
+```bash
+sudo systemctl stop eye-compass-backend.service
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
+# restart legacy
+```
+
+---
+
+## 2. Before you start — collect these
 
 Do not begin until you have all of it. Half of a deployment is worse than none.
 
@@ -53,7 +100,7 @@ Do not begin until you have all of it. Half of a deployment is worse than none.
   login that works with no network and no cached password. Give it its own
   credentials; do not reuse a real operator's.
 - `AWS_IDENTITY_POOL_ID` and the S3 bucket/folder, if S3 upload is on.
-- A new PostgreSQL password (see step 3 — do not ship the dev default).
+- A new PostgreSQL password (see step 4 — do not ship the dev default).
 - If this device uses Keycloak: `KEYCLOAK_CLIENT_SECRET` and
   `ASSURANCE_API_URL`. Otherwise leave `AUTH_PROVIDER=legacy`.
 
@@ -61,7 +108,8 @@ Do not begin until you have all of it. Half of a deployment is worse than none.
 
 - The legacy tree at `/home/nvidia/eye_compass` — still the source of
   `run_inference.py`, `config.INI`, `FeatureFile_new.ini`, and the model files.
-  This stack does not replace it; it reads from it.
+  This stack does not replace it; it reads from it. The folder stays at its
+  original path; only the legacy process was stopped in step 1.
 - `models/` containing the `.optimized` / `.engine` TensorRT files for every
   commodity this device will scan. These are data, not code, and are not in the
   repository.
@@ -69,13 +117,24 @@ Do not begin until you have all of it. Half of a deployment is worse than none.
 
 ---
 
-## 2. Host prerequisites
+## 3. Host prerequisites
 
 Confirm each of these on the device before installing anything.
+
+**If Docker is not installed (e.g. fresh Jetson), install Docker CE:**
+```bash
+cd ~
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo systemctl enable --now docker
+sudo usermod -aG docker nvidia
+```
+*(You may need to log out and log back in for the `nvidia` user group change to take effect).*
 
 ```bash
 # Docker present and enabled at boot
 docker --version
+docker compose version
 systemctl is-enabled docker          # must print: enabled
 
 # The deployment virtualenv has BOTH stacks in one interpreter
@@ -104,16 +163,16 @@ every later step assumes this interpreter is complete.
 
 ---
 
-## 3. Create the database
+## 4. Create the database
 
 The database is created automatically the first time the `db` container starts
 against an empty volume: `POSTGRES_DB: eye_compass` in `docker-compose.yml` is
 what creates it. You do **not** run any `CREATE DATABASE` by hand, and you do
-not create any tables — the backend does that at startup (step 5).
+not create any tables — the backend does that at startup (step 6).
 
 **First, change the password.** The committed `docker-compose.yml` carries the
 dev default `password`. Edit the `db` service's `POSTGRES_PASSWORD` to a real
-one, and remember it — step 4's `DATABASE_URL` must match exactly or the
+one, and remember it — step 5's `DATABASE_URL` must match exactly or the
 backend cannot connect.
 
 ```bash
@@ -127,7 +186,7 @@ Verify the empty database exists and is reachable:
 ```bash
 sudo docker compose exec db psql -U postgres -d eye_compass -c '\dt'
 # Expect: "Did not find any relations." — correct at this point. The backend
-# has not started yet, so there are no tables.
+# has not started yet, so there are no tables. The backend creates them in step 6.
 ```
 
 > **Changing `POSTGRES_PASSWORD` only works on a volume that has never been
@@ -139,7 +198,7 @@ sudo docker compose exec db psql -U postgres -d eye_compass -c '\dt'
 
 ---
 
-## 4. Configure the backend (`.env`)
+## 5. Configure the backend (`.env`)
 
 ```bash
 cd /home/nvidia/eye_compass_new/eye_compass_be
@@ -155,7 +214,7 @@ documented default on a first install.
 # mistake here cannot put a production device into mock mode — but set it right.
 USE_MOCK_CAMERA=false
 
-# Must match the password you set in docker-compose.yml in step 3.
+# Must match the password you set in docker-compose.yml in step 4.
 DATABASE_URL=postgresql://postgres:<YOUR_PASSWORD>@localhost:5432/eye_compass
 
 # Point at production Qualix, not dev/qa.
@@ -194,7 +253,7 @@ chmod 600 .env
 
 ---
 
-## 5. Install and start the backend
+## 6. Install and start the backend
 
 ```bash
 cd /home/nvidia/eye_compass_new/eye_compass_be
@@ -229,7 +288,7 @@ most common bad install.
 
 ---
 
-## 6. Build and serve the frontend (production mode)
+## 7. Build and serve the frontend (production mode)
 
 This is the step that differs from the dev unit. **Do not ship the Vite dev
 server**: it recompiles on file changes, serves unminified assets, and has none
@@ -284,7 +343,7 @@ sudo docker compose build frontend && sudo docker compose up -d frontend
 
 ---
 
-## 7. Kiosk browser
+## 8. Kiosk browser
 
 Full detail and reasoning in `10 - pwa_and_deployment_rollout.md`; the
 production-specific part is the **URL**.
@@ -328,18 +387,10 @@ pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
 
 ---
 
-## 8. Legacy data, if this device is replacing a running legacy install
+## 9. Migrate legacy data
 
-Only for a device that already has a legacy SQLite database worth keeping.
-Skip entirely on a brand-new device.
-
-**Back up first, both sides:**
-
-```bash
-mkdir -p ~/db_backups
-cp /home/nvidia/eye_compass/eye_compass.db \
-   ~/db_backups/eye_compass.db.$(date +%Y%m%d_%H%M%S).bak
-```
+The SQLite database was already backed up in step 1. Now migrate it into
+PostgreSQL.
 
 **Preview, then run.** The script opens the SQLite file read-only, never
 deletes or overwrites anything in PostgreSQL, and runs as a single transaction
@@ -356,7 +407,7 @@ Read the table it prints. When the counts look right, re-run without
 `--dry-run`. It is safe to run twice — the second run adds nothing.
 
 **The images are files, not database rows**, and the script does not touch
-them. Copy the legacy tree across separately; the folder layout
+them. Copy the legacy output tree across separately; the folder layout
 (`output/<commodity>/<variety>/<image_unique_id>/`) is identical:
 
 ```bash
@@ -369,7 +420,7 @@ missing.
 
 ---
 
-## 9. Final verification
+## 10. Final verification
 
 Work through all of it before handing the device over.
 
@@ -416,7 +467,7 @@ physical display.
 
 ---
 
-## 10. Day-to-day operations
+## 11. Day-to-day operations
 
 ```bash
 # Start everything (containers come back on their own after a reboot)
@@ -455,12 +506,12 @@ failure:
 
 ```bash
 sudo docker compose exec -T db pg_dump -U postgres eye_compass \
-  | gzip > ~/db_backups/eye_compass_$(date +%Y%m%d).sql.gz
+  | gzip > /home/nvidia/eye_compass_new/db_backups/eye_compass_$(date +%Y%m%d).sql.gz
 ```
 
 ---
 
-## 11. If it goes wrong
+## 12. If it goes wrong
 
 | Symptom | Cause to check first |
 |---|---|
@@ -473,8 +524,17 @@ sudo docker compose exec -T db pg_dump -U postgres eye_compass \
 | `docker compose up` fails with "Unable to enable DIRECT ACCESS FILTERING" | A service lost its `network_mode: host`; this kernel has no `iptable_raw.ko` |
 | Kiosk shows a blank page or connection error | The script still targets `:5173` (the dev server) instead of port 80 |
 
-**Rolling back to the legacy app** is possible at any point, because nothing in
-this procedure modifies `/home/nvidia/eye_compass`: stop the three services
-here (`systemctl stop` the backend, `docker compose stop`), disable the kiosk
-autostart entry, and start legacy as before. The legacy SQLite file is read
-read-only by the migration and is never written to.
+**Rolling back to the legacy app** is possible at any point — the legacy folder
+at `/home/nvidia/eye_compass` was never touched, and nothing in this procedure
+modifies it:
+
+```bash
+sudo systemctl stop eye-compass-backend.service
+sudo systemctl disable eye-compass-backend.service
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
+# restart legacy's own launch mechanism
+```
+
+The legacy SQLite file was never written to — the migration script opens it
+read-only, and the backup from step 1 is at
+`/home/nvidia/eye_compass_new/db_backups/` as well.

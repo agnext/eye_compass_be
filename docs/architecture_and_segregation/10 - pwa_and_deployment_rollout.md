@@ -120,9 +120,8 @@ Tying together `5 - infrastructure_and_deployment.md`'s hybrid split:
    `--kiosk` flag in `~/.local/bin/eye-compass-kiosk.sh` actually switches
    between the two — see `5 - infrastructure_and_deployment.md`'s Kiosk
    browser section for the exact toggle and how to close a `--kiosk` window
-   (`Alt+F4`, or `pkill -f "firefox --profile
-   ~/.local/opt/firefox-kiosk-profile"` from any terminal, since there's no
-   on-screen close button in this mode).
+   (`Alt+F4`, or `pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile`
+   from any terminal, since there's no on-screen close button in this mode).
 
    Launching the script manually from a plain (non-graphical-autostart)
    terminal also needs `DISPLAY`/`XAUTHORITY` set explicitly — they aren't
