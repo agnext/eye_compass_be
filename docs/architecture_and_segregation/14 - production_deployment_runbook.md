@@ -161,24 +161,74 @@ python3 -m venv --system-site-packages /home/nvidia/.virtualenvs/eye_compass
 Then re-run both import checks above. Do not continue until they both pass —
 every later step assumes this interpreter is complete.
 
+**Troubleshooting ML Stack Failures:**
+If the ML stack check fails with `ModuleNotFoundError: No module named 'pycuda'`, run:
+```bash
+/home/nvidia/.virtualenvs/eye_compass/bin/pip install pycuda
+```
+
+If it fails with `ModuleNotFoundError: No module named 'torch'` (or `tensorrt`, `cv2`), this means they weren't installed globally in the system packages, but were instead installed manually in the legacy environment (e.g. `m38`). Since compiling PyTorch for a Jetson takes hours, simply copy them from the old legacy environment directly into the new one:
+```bash
+cp -r /home/nvidia/.virtualenvs/m38/lib/python3.*/site-packages/torch* /home/nvidia/.virtualenvs/eye_compass/lib/python3.*/site-packages/
+# (Repeat for cv2 or tensorrt if needed)
+```
+
 ---
 
-## 4. Create the database
+## 4. Create `docker-compose.yml` (Database & Frontend)
 
-The database is created automatically the first time the `db` container starts
-against an empty volume: `POSTGRES_DB: eye_compass` in `docker-compose.yml` is
-what creates it. You do **not** run any `CREATE DATABASE` by hand, and you do
-not create any tables — the backend does that at startup (step 6).
-
-**First, change the password.** The committed `docker-compose.yml` carries the
-dev default `password`. Edit the `db` service's `POSTGRES_PASSWORD` to a real
-one, and remember it — step 5's `DATABASE_URL` must match exactly or the
-backend cannot connect.
+If the `docker-compose.yml` file is not already present on the device, create it manually:
 
 ```bash
 cd /home/nvidia/eye_compass_new
-sudo docker compose up -d db
-sudo docker compose ps                       # db must show Up
+nano docker-compose.yml
+```
+
+Paste the following configuration into the file. **Important:** Change `POSTGRES_PASSWORD` to a real password before saving, and notice that you can comment/uncomment the `frontend` sections depending on whether you are doing a development or production build:
+
+```yaml
+services:
+  db:
+    image: postgres:18-alpine
+    restart: always
+    network_mode: host
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: eye_compass
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PGPORT: 5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Uncomment below for bind mount development
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    restart: always
+    network_mode: host
+    volumes:
+      - ./eye_compass_fe:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+
+  # Uncomment below for production Docker build instead
+  # frontend:
+  #   build:
+  #     context: ./eye_compass_fe
+  #   restart: always
+  #   network_mode: host
+
+volumes:
+  postgres_data:
+```
+
+Save and exit. The database is created automatically the first time the `db` container starts against an empty volume. You do **not** run any `CREATE DATABASE` by hand.
+
+Start the containers (this will spin up both the database and the frontend):
+
+```bash
+sudo docker compose up -d
+sudo docker compose ps                       # Both must show Up
 ```
 
 Verify the empty database exists and is reachable:
@@ -188,13 +238,6 @@ sudo docker compose exec db psql -U postgres -d eye_compass -c '\dt'
 # Expect: "Did not find any relations." — correct at this point. The backend
 # has not started yet, so there are no tables. The backend creates them in step 6.
 ```
-
-> **Changing `POSTGRES_PASSWORD` only works on a volume that has never been
-> initialised.** Postgres reads it once, at first start. If you started the
-> container before setting it and need to change it afterwards, either `ALTER
-> USER postgres WITH PASSWORD '...'` inside psql, or destroy the volume
-> (`sudo docker compose down -v`) — which erases the database, so only on a
-> device with no data yet.
 
 ---
 
