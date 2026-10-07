@@ -57,9 +57,13 @@ whatever is running:
 # Check what's running from the legacy tree
 ps aux | grep eye_compass | grep -v grep
 
-# If it's a systemd service (common name varies per device):
-sudo systemctl stop eye-compass.service      # or whatever the legacy unit is called
-sudo systemctl disable eye-compass.service   # prevent it from starting on reboot
+# If it is restarting automatically, find its systemd service name:
+systemctl list-units --type=service | grep -i eye
+# (It might be called eye-compass.service, run_app.service, etc.)
+
+# Stop and disable it so it stays dead:
+sudo systemctl stop <SERVICE_NAME>
+sudo systemctl disable <SERVICE_NAME>
 ```
 
 **Back up the legacy SQLite database** — the migration script in step 9 reads
@@ -72,12 +76,26 @@ cp /home/nvidia/eye_compass/eye_compass.db \
 ```
 
 **Rollback** is straightforward at any point — the legacy folder was never
-touched, so it is enough to stop the new stack and start the legacy app again:
+touched. If you need to revert to the legacy app, turn the new stack off and
+turn the legacy stack back on:
 
+1. **Stop the new stack:**
 ```bash
 sudo systemctl stop eye-compass-backend.service
-sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
+sudo systemctl disable eye-compass-backend.service
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml down
+pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
+mv ~/.config/autostart/eye-compass-kiosk.desktop ~/.config/autostart/eye-compass-kiosk.desktop.disabled
+```
 
+2. **Start the legacy app back up:**
+```bash
+sudo systemctl enable <SERVICE_NAME>   # the legacy unit from above
+sudo systemctl start <SERVICE_NAME>
+```
+
+If the legacy app was not managed by systemd, start it manually:
+```bash
 cd /home/nvidia/eye_compass
 DISPLAY=:0 \
 XAUTHORITY=/home/nvidia/.Xauthority \
@@ -156,9 +174,9 @@ ls /opt/MVS/lib
 ls -l /dev/ttyTHS1 /dev/ttyUSB*      # at least one must be the conveyor
 ```
 
-If the virtualenv does not exist yet, create it **with system site packages**,
-or it will not see JetPack's TensorRT/torch/cv2 — which cannot be installed
-with pip on aarch64:
+If the virtualenv does not exist yet, you must create it. **Do not reuse the legacy environment (e.g. `m38`)**. We create a brand new, isolated environment (`eye_compass`) so we do not pollute the legacy app with web dependencies, ensuring safe rollbacks.
+
+Create it **with system site packages**, or it will not see JetPack's TensorRT/torch/cv2 — which cannot be installed with pip on aarch64:
 
 ```bash
 python3 -m venv --system-site-packages /home/nvidia/.virtualenvs/eye_compass
