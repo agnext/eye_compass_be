@@ -72,14 +72,22 @@ cp /home/nvidia/eye_compass/eye_compass.db \
 ```
 
 **Rollback** is straightforward at any point — the legacy folder was never
-touched, so it is enough to stop the new stack and restart whatever the legacy
-app's own launch mechanism was:
+touched, so it is enough to stop the new stack and start the legacy app again:
 
 ```bash
 sudo systemctl stop eye-compass-backend.service
 sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
-# restart legacy
+
+cd /home/nvidia/eye_compass
+DISPLAY=:0 \
+XAUTHORITY=/home/nvidia/.Xauthority \
+PYTHONPATH=/usr/lib/python3.8/dist-packages \
+MVCAM_COMMON_RUNENV=/opt/MVS/lib \
+  nohup /home/nvidia/.virtualenvs/m38/bin/python main.py \
+    >> /tmp/legacy_stdout.log 2>&1 &
 ```
+
+> **Note on the legacy command:** It must run from `/home/nvidia/eye_compass`. It uses the `m38` venv (where the legacy ML stack lives). It injects `PYTHONPATH` for system TensorRT, sets `MVCAM_COMMON_RUNENV` for the camera SDK (needed over SSH), and sets `DISPLAY=:0` to send the Qt GUI to the device's screen.
 
 ---
 
@@ -167,10 +175,36 @@ If the ML stack check fails with `ModuleNotFoundError: No module named 'pycuda'`
 /home/nvidia/.virtualenvs/eye_compass/bin/pip install pycuda
 ```
 
-If it fails with `ModuleNotFoundError: No module named 'torch'` (or `tensorrt`, `cv2`), this means they weren't installed globally in the system packages, but were instead installed manually in the legacy environment (e.g. `m38`). Since compiling PyTorch for a Jetson takes hours, simply copy them from the old legacy environment directly into the new one:
+If it fails with `ModuleNotFoundError: No module named 'torch'` (or `tensorrt`, `cv2`), this means they weren't installed globally in the system packages, but were instead installed manually in the legacy environment (e.g. `m38`). Rather than copying hundreds of MB of files, add a `.pth` file so the `eye_compass` venv can see `m38`'s packages directly:
 ```bash
-cp -r /home/nvidia/.virtualenvs/m38/lib/python3.*/site-packages/torch* /home/nvidia/.virtualenvs/eye_compass/lib/python3.*/site-packages/
-# (Repeat for cv2 or tensorrt if needed)
+echo '/home/nvidia/.virtualenvs/m38/lib/python3.8/site-packages' \
+  > /home/nvidia/.virtualenvs/eye_compass/lib/python3.8/site-packages/zz_m38_ml_stack.pth
+```
+
+**JetPack 5 devices (Python 3.8) — additional fixes:**
+
+JetPack 5 (L4T R35) ships Python 3.8; the codebase targets Python 3.10+.
+These extra packages bridge the gap — install them in the `eye_compass` venv:
+
+```bash
+/home/nvidia/.virtualenvs/eye_compass/bin/pip install eval_type_backport tqdm
+```
+
+- `eval_type_backport` — the codebase uses `str | None` union syntax (Python
+  3.10+); this package teaches pydantic to evaluate those annotations on 3.8.
+- `tqdm` — needed by the legacy `run_inference.py`; already present on 3.10
+  dev units but not in a fresh 3.8 venv.
+
+`asyncio.to_thread` (added in Python 3.9) is polyfilled in `app/main.py` —
+no action needed, but be aware if you see references to it.
+
+**`.env` DATABASE_URL — special characters in the password:**
+
+If the Postgres password contains `@`, `#`, `/`, or other URL-reserved
+characters, they must be percent-encoded in `DATABASE_URL`. For example,
+password `nvidia@123` becomes:
+```
+DATABASE_URL=postgresql://postgres:nvidia%40123@localhost:5432/eye_compass
 ```
 
 ---
@@ -575,7 +609,14 @@ modifies it:
 sudo systemctl stop eye-compass-backend.service
 sudo systemctl disable eye-compass-backend.service
 sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
-# restart legacy's own launch mechanism
+
+cd /home/nvidia/eye_compass
+DISPLAY=:0 \
+XAUTHORITY=/home/nvidia/.Xauthority \
+PYTHONPATH=/usr/lib/python3.8/dist-packages \
+MVCAM_COMMON_RUNENV=/opt/MVS/lib \
+  nohup /home/nvidia/.virtualenvs/m38/bin/python main.py \
+    >> /tmp/legacy_stdout.log 2>&1 &
 ```
 
 The legacy SQLite file was never written to — the migration script opens it

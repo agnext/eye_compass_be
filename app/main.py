@@ -2,6 +2,17 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+if not hasattr(asyncio, "to_thread"):  # Python 3.8 lacks asyncio.to_thread (added in 3.9)
+    import contextvars
+    import functools
+
+    async def _to_thread(func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, functools.partial(ctx.run, func, *args, **kwargs))
+
+    asyncio.to_thread = _to_thread
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
