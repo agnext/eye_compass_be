@@ -52,6 +52,26 @@ from app.services.sort import ObjectTracker
 
 logger = logging.getLogger(__name__)
 
+
+def _fmt_boxes(boxes: List) -> str:
+    """Detections as legacy printed them: (x1, y1, x2, y2, conf, class).
+
+    Legacy logged the raw tuple, so the confidence came out at full float
+    precision (`0.5370410680770874`). Rounded to 3 places here — the extra
+    digits are noise from the model's float32 output, and the line is much
+    easier to scan without them. Coordinates stay exact.
+    """
+    out = []
+    for b in boxes:
+        if len(b) >= 6:
+            out.append("({}, {}, {}, {}, {:.3f}, {})".format(
+                int(b[0]), int(b[1]), int(b[2]), int(b[3]), float(b[4]), int(b[5])))
+        elif len(b) >= 4:
+            out.append("({}, {}, {}, {})".format(
+                int(b[0]), int(b[1]), int(b[2]), int(b[3])))
+    return "[" + ", ".join(out) + "]"
+
+
 # _COLOR_ORDER_NOTE — why the three save sites below write their frame/crop
 # as-is, dropping the cv2.COLOR_BGR2RGB conversion legacy applies at each of
 # its own (main.py:1361 submit_fm_type, main.py:2464 save_raw_image).
@@ -1038,6 +1058,9 @@ class ScanSession:
 
         Returns a dict describing what the client should show.
         """
+        # Start of the clock for LATENCY_DETECT_TO_STOP_SEND below.
+        _t_frame_start = time.perf_counter()
+
         # Idle preview (no scan started): stream frames but change no state.
         # The message shape stays identical so the client never has to branch.
         if not self.active:
@@ -1111,6 +1134,10 @@ class ScanSession:
             # One box per object before anything downstream sees them — the
             # tracker, the counted ids and the operator's boxes all come off
             # this list. See _merge_overlapping_detections.
+            # Kept for the detection log below, so the line can separate what
+            # a suppression rule dropped from what merging combined — by the
+            # time it runs, `detections` has been through both.
+            _n_after_suppression = len(detections)
             detections = self._merge_overlapping_detections(detections)
 
             # 2. Pad boxes the way emit_results does before anything downstream
@@ -1131,9 +1158,44 @@ class ScanSession:
             boxes = [enlarge_bbox(b, pad=20, img_w=w, img_h=h) for b in detections]
 
             # 3. Track, then take only ids we have never seen in this run.
+            _t_track = time.perf_counter()
             self.tracker.update(detections, self.frame_count, (h, w))
+            _track_ms = (time.perf_counter() - _t_track) * 1000.0
             track_ids = list(self.tracker.get_tracked_objects().keys())
             new_ids = set(track_ids) - self.existing_track_ids
+
+            # Legacy's per-frame pair: "Tracker update time" (GrabImage.py:545)
+            # and the tracking line in handle_detection (main.py:2578). Both
+            # fire on every inferred frame, so both sit behind DETECTION_TRACE
+            # — see that setting's comment for the volume this would otherwise
+            # add. `intersection` is legacy's name for the ids carried over
+            # from earlier frames, i.e. objects still in view.
+            if settings.DETECTION_TRACE:
+                logger.info(
+                    "Tracker update time: %.4f s | frame=%s tracked=%s "
+                    "diff_list=%s intersection=%s queue=%s",
+                    _track_ms / 1000.0, self.frame_count, sorted(track_ids),
+                    sorted(new_ids),
+                    sorted(set(track_ids) & self.existing_track_ids),
+                    len(self.detection_queue),
+                )
+
+            # The detection-event line, always on. Unlike the two above this
+            # only fires on a frame the model actually found something in, so
+            # it is rare enough to leave at INFO permanently — and it is the
+            # one that carries the confidence scores, which nothing else in
+            # this pipeline logged. Legacy's "fm detected >>>" (main.py:2584),
+            # with its raw/suppressed split made explicit: legacy logged the
+            # surviving boxes only, so a frame dropped by a suppression rule
+            # looked identical to a frame the model saw nothing in.
+            if raw_detections:
+                logger.info(
+                    "Detections on frame %s: model=%s after_suppression=%s "
+                    "after_merge=%s boxes=%s",
+                    self.frame_count, len(raw_detections),
+                    _n_after_suppression, len(detections),
+                    _fmt_boxes(raw_detections),
+                )
 
             # No belt-motion check here, deliberately. It is tempting (and an
             # earlier version of this file did it) to refuse new ids while
@@ -1251,6 +1313,40 @@ class ScanSession:
                 csc = self.conveyor_stop_count
                 csc["fm_count"] += 1
                 csc["fm_time"] = time.time()
+
+                # Legacy's per-object line (main.py:2589's "@@@@..."): one row
+                # per object with the box that triggered it, its confidence and
+                # the track id it was given. The id is what decides whether this
+                # object is ever shown again (see counted_track_ids), so it is
+                # the single most useful field when an object is shown twice or
+                # not at all — and it is only knowable here, after assignment.
+                for n, (track_id, _box, raw) in enumerate(candidates, 1):
+                    logger.info(
+                        "FM object %s/%s: box=%s track_id=%s",
+                        n, len(candidates), _fmt_boxes([raw]), track_id,
+                    )
+                logger.info(
+                    "Total number of bounding boxes found: %s", len(candidates)
+                )
+
+                # Legacy's LATENCY_CAPTURE_TO_STOP_SEND (main.py:2699), logged
+                # in the same place: BEFORE the send, so it measures how long
+                # the decision took, not how long the serial round-trip took.
+                # The round-trip is already reported by conveyor_service's own
+                # CONTROL_CMD_TIMING-equivalent lines.
+                #
+                # Measured from the start of process_frame, not from the grab:
+                # this function is handed a frame and never learns when it was
+                # captured. The grab and inference legs are reported separately
+                # by camera.py's "Latency breakdown", so the two together cover
+                # what legacy's single number did.
+                logger.info(
+                    "LATENCY_DETECT_TO_STOP_SEND frame_id=%s latency_ms=%.2f "
+                    "fm_count=%s",
+                    self.frame_count,
+                    (time.perf_counter() - _t_frame_start) * 1000.0,
+                    csc["fm_count"],
+                )
                 conveyor_service.lock_machine_start(reason="FM_detected")
                 conveyor_service.send("FM_detected")
                 self.review_phase = "settling"
@@ -1438,6 +1534,36 @@ class ScanSession:
         self._queue_escapes(still_visible=combined)
 
         if not combined and trigger is not None:
+            # Gate the fallback on how confident the original sighting was.
+            # The stationary frames are the easiest ones the model ever gets,
+            # so a sighting it cannot reproduce in any of them is more likely
+            # to have been blur or noise on a moving frame than a real object.
+            # Below the floor that is treated as a false positive and dropped;
+            # above it the old always-show behaviour stands. See
+            # DETECTION_FALLBACK_MIN_CONF — at its default of 0 this branch
+            # never fires and nothing changes.
+            floor = settings.DETECTION_FALLBACK_MIN_CONF
+            if floor > 0:
+                raw = trigger.get("raw_boxes") or []
+                best = max(
+                    (float(b[4]) for b in raw if len(b) >= 5), default=0.0
+                )
+                if best < floor:
+                    logger.info(
+                        "Discarded as a false positive: the re-look found "
+                        "nothing in %s stationary frame(s) and the sighting "
+                        "that stopped the belt reached only %.2f confidence "
+                        "(floor %.2f). Not counted, not shown.",
+                        len(samples), best, floor,
+                    )
+                    # Same two-step exit as the "nothing to fall back on" case
+                    # below: anything that escaped during the stop is still
+                    # owed a screen, and only if there is none do we release.
+                    if self._promote_next_detection(immediate=True):
+                        return
+                    self._release()
+                    return
+
             # The stationary frames found nothing — the model lost whatever it
             # saw a moment ago. Fall back to the sighting that stopped the belt
             # rather than dropping it: a spurious box the operator dismisses is

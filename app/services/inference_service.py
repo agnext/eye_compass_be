@@ -284,6 +284,9 @@ class TensorRTInferenceService(BaseInferenceService):
         self._commodity = ""
         self._variety = ""
         self._conf_threshold = 0.2
+        # Latches the "no model loaded" warning in predict() so it is said
+        # once rather than on every frame; cleared again by load_model.
+        self._warned_no_model = False
 
     def load_model(self, commodity: str, variety: str) -> bool:
         model_key, conf = resolve_model(commodity, variety)
@@ -318,6 +321,9 @@ class TensorRTInferenceService(BaseInferenceService):
         self._commodity = commodity
         self._variety = variety
         self._conf_threshold = conf
+        # Armed again, so a later cleanup() that drops the model still gets
+        # its own warning instead of being masked by this earlier one.
+        self._warned_no_model = False
         logger.info(
             "Active model: %s (%s) conf=%.2f for %s/%s",
             model_key, filename, conf, commodity, variety,
@@ -332,6 +338,24 @@ class TensorRTInferenceService(BaseInferenceService):
         Legacy call: predict(frame, conf_threshold=self.conf_threshold, iou_threshold=0.45)
         """
         if self._model is None:
+            # Silence here is dangerous: zero detections and a genuinely clean
+            # sample look identical, on screen and in the saved result. The
+            # model lives in this process's memory, so every backend restart
+            # clears it, and it is only reloaded when the Dashboard mounts and
+            # calls POST /api/camera/model — a page left open across a restart
+            # never does. Twice in one hour that produced a scan that found
+            # nothing and looked fine. Logged once per occurrence rather than
+            # per frame: at 20-40 fps a plain warning here would be thousands
+            # of identical lines a minute.
+            if not self._warned_no_model:
+                self._warned_no_model = True
+                logger.warning(
+                    "predict() called with NO MODEL LOADED — returning zero "
+                    "detections. This scan will find nothing and will look "
+                    "like a clean sample. Load one with POST /api/camera/model "
+                    "(the Dashboard does this on mount, so reloading the page "
+                    "fixes it). Expected after any backend restart."
+                )
             return [], frame.copy()
         try:
             detections, annotated = self._model.predict(

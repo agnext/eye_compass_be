@@ -242,6 +242,38 @@ class Settings:
     # because nothing is moving. 1 disables the behaviour.
     DETECTION_SAMPLE_FRAMES: int = _as_int(os.getenv("DETECTION_SAMPLE_FRAMES"), 3)
 
+    # False-positive control for the stop/settle/look fallback.
+    #
+    # When the belt stops and the re-look finds nothing, the sighting that
+    # stopped the belt is shown anyway, on the principle that a box the
+    # operator dismisses is recoverable but a missed object is not. On the
+    # prod device that fallback accounted for 15 of 23 review screens — the
+    # model could not reproduce the object across DETECTION_SAMPLE_FRAMES
+    # stationary frames, which are the easiest frames it ever gets: the object
+    # is still, centred and unblurred. A sighting it cannot repeat there was
+    # most likely motion blur or sensor noise on a moving frame.
+    #
+    # This is the confidence the ORIGINAL sighting must have reached for that
+    # fallback to still fire. 0 keeps the old always-fall-back behaviour, so
+    # the default changes nothing for an existing device. Raise it to trade
+    # recall for precision: at 0.35 a 0.12-confidence blip the re-look could
+    # not confirm is dropped, while a confident sighting that merely rolled
+    # out of frame still reaches the operator.
+    DETECTION_FALLBACK_MIN_CONF: float = _as_float(
+        _env("DETECTION_FALLBACK_MIN_CONF", default="0"), 0.0
+    )
+
+    # Per-FRAME detection tracing, off by default. The per-detection lines
+    # (boxes with their confidences, track ids, queue depth) are always
+    # logged — a detection is a rare event, so they cost nothing. This flag
+    # adds the lines that fire on every inferred frame instead: tracker
+    # timing and the full tracked-id set, legacy's "Tracker update time" and
+    # its per-frame tracking line. At 20-40 inferred fps that is 1-2 million
+    # journal lines an hour, which is why it is opt-in rather than matching
+    # legacy's unconditional logging. Turn it on to debug tracking, off again
+    # afterwards.
+    DETECTION_TRACE: bool = _as_bool(_env("DETECTION_TRACE", default="false"), False)
+
     # ---------------- Streaming ----------------
     STREAM_FPS: int = _as_int(os.getenv("STREAM_FPS"), 20)
     STREAM_JPEG_QUALITY: int = _as_int(os.getenv("STREAM_JPEG_QUALITY"), 70)
