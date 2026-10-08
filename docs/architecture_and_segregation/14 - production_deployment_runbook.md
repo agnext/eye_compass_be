@@ -39,6 +39,14 @@ sudo systemctl disable <SERVICE_NAME>
 
 # If started manually (SIGKILL — PyQt5 ignores SIGTERM):
 kill -KILL $(pgrep -f "eye_compass/main.py" | head -1)
+
+# If it is restarting automatically, find its systemd service name:
+systemctl list-units --type=service | grep -i eye
+# (It might be called eye-compass.service, run_app.service, etc.)
+
+# Stop and disable it so it stays dead:
+sudo systemctl stop <SERVICE_NAME>
+sudo systemctl disable <SERVICE_NAME>
 ```
 
 **Legacy cron jobs** (`crontab -l`) — leave them running during migration.
@@ -51,6 +59,38 @@ mkdir -p /home/nvidia/eye_compass_new/db_backups
 cp /home/nvidia/eye_compass/eye_compass.db \
    /home/nvidia/eye_compass_new/db_backups/eye_compass.db.$(date +%Y%m%d_%H%M%S).bak
 ```
+
+**Rollback** is straightforward at any point — the legacy folder was never
+touched. If you need to revert to the legacy app, turn the new stack off and
+turn the legacy stack back on:
+
+1. **Stop the new stack:**
+```bash
+sudo systemctl stop eye-compass-backend.service
+sudo systemctl disable eye-compass-backend.service
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml down
+pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
+mv ~/.config/autostart/eye-compass-kiosk.desktop ~/.config/autostart/eye-compass-kiosk.desktop.disabled
+```
+
+2. **Start the legacy app back up:**
+```bash
+sudo systemctl enable <SERVICE_NAME>   # the legacy unit from above
+sudo systemctl start <SERVICE_NAME>
+```
+
+If the legacy app was not managed by systemd, start it manually:
+```bash
+cd /home/nvidia/eye_compass
+DISPLAY=:0 \
+XAUTHORITY=/home/nvidia/.Xauthority \
+PYTHONPATH=/usr/lib/python3.8/dist-packages \
+MVCAM_COMMON_RUNENV=/opt/MVS/lib \
+  nohup /home/nvidia/.virtualenvs/m38/bin/python main.py \
+    >> /tmp/legacy_stdout.log 2>&1 &
+```
+
+> **Note on the legacy command:** It must run from `/home/nvidia/eye_compass`. It uses the `m38` venv (where the legacy ML stack lives). It injects `PYTHONPATH` for system TensorRT, sets `MVCAM_COMMON_RUNENV` for the camera SDK (needed over SSH), and sets `DISPLAY=:0` to send the Qt GUI to the device's screen.
 
 ---
 
@@ -94,6 +134,10 @@ systemctl is-enabled docker   # enabled
 ```
 
 **Create the deployment virtualenv** (do not reuse the legacy `m38` venv):
+
+If the virtualenv does not exist yet, you must create it. **Do not reuse the legacy environment (e.g. `m38`)**. We create a brand new, isolated environment (`eye_compass`) so we do not pollute the legacy app with web dependencies, ensuring safe rollbacks.
+
+Create it **with system site packages**, or it will not see JetPack's TensorRT/torch/cv2 — which cannot be installed with pip on aarch64:
 
 ```bash
 python3 -m venv --system-site-packages /home/nvidia/.virtualenvs/eye_compass
