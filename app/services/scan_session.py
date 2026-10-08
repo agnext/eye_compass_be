@@ -1134,10 +1134,6 @@ class ScanSession:
             # One box per object before anything downstream sees them — the
             # tracker, the counted ids and the operator's boxes all come off
             # this list. See _merge_overlapping_detections.
-            # Kept for the detection log below, so the line can separate what
-            # a suppression rule dropped from what merging combined — by the
-            # time it runs, `detections` has been through both.
-            _n_after_suppression = len(detections)
             detections = self._merge_overlapping_detections(detections)
 
             # 2. Pad boxes the way emit_results does before anything downstream
@@ -1190,12 +1186,16 @@ class ScanSession:
             # looked identical to a frame the model saw nothing in.
             if raw_detections:
                 logger.info(
-                    "Detections on frame %s: model=%s after_suppression=%s "
-                    "after_merge=%s boxes=%s",
+                    "Frame %s — model found %s: %s",
                     self.frame_count, len(raw_detections),
-                    _n_after_suppression, len(detections),
                     _fmt_boxes(raw_detections),
                 )
+                if len(detections) != len(raw_detections):
+                    logger.info(
+                        "Frame %s — after filters: %s remaining: %s",
+                        self.frame_count, len(detections),
+                        _fmt_boxes(detections),
+                    )
 
             # No belt-motion check here, deliberately. It is tempting (and an
             # earlier version of this file did it) to refuse new ids while
