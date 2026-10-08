@@ -1,69 +1,50 @@
-# 14. Production Deployment Runbook — Setting Up a Device From Start to End
+# 14. Production Deployment Runbook
 
-Every production device is currently running the legacy PyQt5 app under
-`/home/nvidia/eye_compass`. This procedure installs the new stack **alongside
-it** at `/home/nvidia/eye_compass_new` — the same layout as the dev unit. The
-legacy folder is left exactly as it is; you stop it but do not move or rename
-it. The new backend reads inference code and model files from it via
-`EYE_COMPASS_SRC=/home/nvidia/eye_compass`.
+Set up the new eye_compass stack on a Jetson device (JetPack 5 or 6).
+Follow top to bottom; each step says how to verify before moving on.
 
-Follow it top to bottom; each step says how to confirm it worked before you
-move on.
-
-This is an installation procedure, not a design document. For *why* the pieces
-are split the way they are, read `5 - infrastructure_and_deployment.md` first —
-it explains why the backend is not in Docker. For the kiosk browser's
-reasoning, `10 - pwa_and_deployment_rollout.md`.
-
-> **The one difference from the dev unit:** on dev, the frontend container runs
-> Vite's **dev server** (`npm run dev`, port 5173). Production serves a **built
-> bundle behind Nginx on port 80** instead. Step 7 covers that; it is the only
-> part of this stack that genuinely differs between dev and prod. The backend
-> and database are identical in both.
+For architecture rationale see `5 - infrastructure_and_deployment.md`.
+For kiosk design see `10 - pwa_and_deployment_rollout.md`.
+For JetPack 5 / Python 3.8 specifics see `15 - jetpack5_python38_compatibility.md`.
 
 ---
 
 ## 0. What you are installing
 
-Three independent pieces. They do not start as one command, and they do not
-depend on each other's startup order.
-
-| Piece | Runs as | Where it listens | Survives reboot via |
+| Piece | Runs as | Port | Survives reboot via |
 |---|---|---|---|
-| **PostgreSQL** | Docker container (`db`) | host port 5432 | `restart: always` + Docker enabled at boot |
-| **Backend** (FastAPI) | native systemd service | host port 8000 | `systemctl enable` |
-| **Frontend** (Nginx + built bundle) | Docker container (`frontend`) | host port 80 | `restart: always` |
+| **PostgreSQL** | Docker container (`db`) | 5432 | `restart: always` |
+| **Backend** (FastAPI) | systemd service | 8000 | `systemctl enable` |
+| **Frontend** (Nginx) | Docker container (`frontend`) | 80 | `restart: always` |
 
-All containers use `network_mode: host` — this Jetson's kernel has no
-`iptable_raw.ko`, so Docker's bridge networking fails outright. Consequence:
-every service binds a real host port directly; there is no port mapping to
-adjust.
+All containers use `network_mode: host` — the Jetson kernel has no
+`iptable_raw.ko`, so Docker bridge networking does not work.
 
 ---
 
 ## 1. Stop the legacy app
 
-The legacy PyQt5 app runs from `/home/nvidia/eye_compass`. Leave that folder
-exactly where it is — the new backend reads `run_inference.py`, `config.INI`,
-`FeatureFile_new.ini`, and the model files from it via
-`EYE_COMPASS_SRC=/home/nvidia/eye_compass`. Only the running process needs to
-stop.
-
-**Stop the legacy app.** How it runs varies by device — it may be a systemd
-service, a cron-launched script, or a manually started process. Find and stop
-whatever is running:
+The legacy PyQt5 app at `/home/nvidia/eye_compass` must be stopped but
+**not removed** — the new backend reads `run_inference.py`, `config.INI`,
+`FeatureFile_new.ini`, and model files from it.
 
 ```bash
-# Check what's running from the legacy tree
+# Find and stop whatever is running
 ps aux | grep eye_compass | grep -v grep
+systemctl list-units --type=service | grep -i eye
 
-# If it's a systemd service (common name varies per device):
-sudo systemctl stop eye-compass.service      # or whatever the legacy unit is called
-sudo systemctl disable eye-compass.service   # prevent it from starting on reboot
+# If managed by systemd:
+sudo systemctl stop <SERVICE_NAME>
+sudo systemctl disable <SERVICE_NAME>
+
+# If started manually (SIGKILL — PyQt5 ignores SIGTERM):
+kill -KILL $(pgrep -f "eye_compass/main.py" | head -1)
 ```
 
-**Back up the legacy SQLite database** — the migration script in step 9 reads
-it, and you want a known-good copy before anything else runs:
+**Legacy cron jobs** (`crontab -l`) — leave them running during migration.
+Disable them once the new stack's S3 upload is verified.
+
+**Back up the legacy SQLite database:**
 
 ```bash
 mkdir -p /home/nvidia/eye_compass_new/db_backups
@@ -71,94 +52,48 @@ cp /home/nvidia/eye_compass/eye_compass.db \
    /home/nvidia/eye_compass_new/db_backups/eye_compass.db.$(date +%Y%m%d_%H%M%S).bak
 ```
 
-**Rollback** is straightforward at any point — the legacy folder was never
-touched, so it is enough to stop the new stack and start the legacy app again:
-
-```bash
-sudo systemctl stop eye-compass-backend.service
-sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
-
-cd /home/nvidia/eye_compass
-DISPLAY=:0 \
-XAUTHORITY=/home/nvidia/.Xauthority \
-PYTHONPATH=/usr/lib/python3.8/dist-packages \
-MVCAM_COMMON_RUNENV=/opt/MVS/lib \
-  nohup /home/nvidia/.virtualenvs/m38/bin/python main.py \
-    >> /tmp/legacy_stdout.log 2>&1 &
-```
-
-> **Note on the legacy command:** It must run from `/home/nvidia/eye_compass`. It uses the `m38` venv (where the legacy ML stack lives). It injects `PYTHONPATH` for system TensorRT, sets `MVCAM_COMMON_RUNENV` for the camera SDK (needed over SSH), and sets `DISPLAY=:0` to send the Qt GUI to the device's screen.
-
 ---
 
-## 2. Before you start — collect these
+## 2. Collect these values first
 
-Do not begin until you have all of it. Half of a deployment is worse than none.
+Do not begin until you have all of them.
 
-**Values you must have in hand:**
-
-- `DEVICE_ID` — exactly 2 characters (A–Z / 0–9), **unique to this physical
-  device**. Batch creation refuses to run until it is set. Two devices sharing
-  one `DEVICE_ID` will eventually produce identical batch numbers.
-- `DEVICE_CODE` — the `device_serial_no` sent to Qualix on every scan.
-- `WAREHOUSE_NAME` — sent alongside it.
-- `SYNC_SERVICE_USERNAME` / `SYNC_SERVICE_PASSWORD` — the fixed account every
-  outbound scan POST authenticates as. Never an operator's own account.
-- `EMERGENCY_LOGIN_USERNAME` / `EMERGENCY_LOGIN_PASSWORD` — the break-glass
-  login that works with no network and no cached password. Give it its own
-  credentials; do not reuse a real operator's.
-- `AWS_IDENTITY_POOL_ID` and the S3 bucket/folder, if S3 upload is on.
-- A new PostgreSQL password (see step 4 — do not ship the dev default).
-- If this device uses Keycloak: `KEYCLOAK_CLIENT_SECRET` and
-  `ASSURANCE_API_URL`. Otherwise leave `AUTH_PROVIDER=legacy`.
+- `DEVICE_ID` — exactly 2 characters (A–Z / 0–9), unique per device
+- `DEVICE_CODE` — the `device_serial_no` sent to Qualix
+- The conveyor serial port — confirm it with the probe in section 12
+  ("Belt does not start"); do not copy it from another device
+- `WAREHOUSE_NAME`
+- `SYNC_SERVICE_USERNAME` / `SYNC_SERVICE_PASSWORD`
+- `EMERGENCY_LOGIN_USERNAME` / `EMERGENCY_LOGIN_PASSWORD`
+- `AWS_IDENTITY_POOL_ID` and S3 bucket/folder (if S3 is on)
+- A new PostgreSQL password (do not ship the dev default)
+- If Keycloak: `KEYCLOAK_CLIENT_SECRET` and `ASSURANCE_API_URL`
 
 **Files that must already be on the device:**
 
-- The legacy tree at `/home/nvidia/eye_compass` — still the source of
-  `run_inference.py`, `config.INI`, `FeatureFile_new.ini`, and the model files.
-  This stack does not replace it; it reads from it. The folder stays at its
-  original path; only the legacy process was stopped in step 1.
-- `models/` containing the `.optimized` / `.engine` TensorRT files for every
-  commodity this device will scan. These are data, not code, and are not in the
-  repository.
-- Google service-account JSON, if `SHEETS_ENABLED=true`.
+- Legacy tree at `/home/nvidia/eye_compass` (source of inference code + models)
+- `models/` with `.optimized` / `.engine` TensorRT files for each commodity
+- Google service-account JSON (if `SHEETS_ENABLED=true`)
 
 ---
 
 ## 3. Host prerequisites
 
-Confirm each of these on the device before installing anything.
-
-**If Docker is not installed (e.g. fresh Jetson), install Docker CE:**
+**Install Docker if not present:**
 ```bash
-cd ~
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
 sudo systemctl enable --now docker
-sudo usermod -aG docker nvidia
+sudo usermod -aG docker nvidia   # log out/in for group to take effect
 ```
-*(You may need to log out and log back in for the `nvidia` user group change to take effect).*
 
+**Verify:**
 ```bash
-# Docker present and enabled at boot
-docker --version
-docker compose version
-systemctl is-enabled docker          # must print: enabled
-
-# The deployment virtualenv has BOTH stacks in one interpreter
-/home/nvidia/.virtualenvs/eye_compass/bin/python -c \
-  "import tensorrt, pycuda.driver, torch, cv2, numpy; print('ML stack OK')"
-/home/nvidia/.virtualenvs/eye_compass/bin/python -c \
-  "import fastapi, sqlalchemy, boto3; print('web stack OK')"
-
-# Camera SDK libraries and the serial port
-ls /opt/MVS/lib
-ls -l /dev/ttyTHS1 /dev/ttyUSB*      # at least one must be the conveyor
+docker --version && docker compose version
+systemctl is-enabled docker   # enabled
 ```
 
-If the virtualenv does not exist yet, create it **with system site packages**,
-or it will not see JetPack's TensorRT/torch/cv2 — which cannot be installed
-with pip on aarch64:
+**Create the deployment virtualenv** (do not reuse the legacy `m38` venv):
 
 ```bash
 python3 -m venv --system-site-packages /home/nvidia/.virtualenvs/eye_compass
@@ -166,59 +101,53 @@ python3 -m venv --system-site-packages /home/nvidia/.virtualenvs/eye_compass
   /home/nvidia/eye_compass_new/eye_compass_be/requirements.txt
 ```
 
-Then re-run both import checks above. Do not continue until they both pass —
-every later step assumes this interpreter is complete.
+**Verify both stacks are visible:**
 
-**Troubleshooting ML Stack Failures:**
-If the ML stack check fails with `ModuleNotFoundError: No module named 'pycuda'`, run:
 ```bash
-/home/nvidia/.virtualenvs/eye_compass/bin/pip install pycuda
+/home/nvidia/.virtualenvs/eye_compass/bin/python -c \
+  "import tensorrt, pycuda.driver, torch, cv2, numpy; print('ML stack OK')"
+/home/nvidia/.virtualenvs/eye_compass/bin/python -c \
+  "import fastapi, sqlalchemy, boto3; print('web stack OK')"
 ```
 
-If it fails with `ModuleNotFoundError: No module named 'torch'` (or `tensorrt`, `cv2`), this means they weren't installed globally in the system packages, but were instead installed manually in the legacy environment (e.g. `m38`). Rather than copying hundreds of MB of files, add a `.pth` file so the `eye_compass` venv can see `m38`'s packages directly:
+If `torch`/`tensorrt`/`cv2` are missing — they live in the legacy `m38` venv.
+Add a `.pth` file so `eye_compass` can see them:
+
 ```bash
 echo '/home/nvidia/.virtualenvs/m38/lib/python3.8/site-packages' \
   > /home/nvidia/.virtualenvs/eye_compass/lib/python3.8/site-packages/zz_m38_ml_stack.pth
 ```
 
-**JetPack 5 devices (Python 3.8) — additional fixes:**
+If `pycuda` is missing: `pip install pycuda`.
 
-JetPack 5 (L4T R35) ships Python 3.8; the codebase targets Python 3.10+.
-These extra packages bridge the gap — install them in the `eye_compass` venv:
+**JetPack 5 only (Python 3.8) — extra packages:**
 
 ```bash
 /home/nvidia/.virtualenvs/eye_compass/bin/pip install eval_type_backport tqdm
 ```
 
-- `eval_type_backport` — the codebase uses `str | None` union syntax (Python
-  3.10+); this package teaches pydantic to evaluate those annotations on 3.8.
-- `tqdm` — needed by the legacy `run_inference.py`; already present on 3.10
-  dev units but not in a fresh 3.8 venv.
+See `15 - jetpack5_python38_compatibility.md` for what these fix and the
+two code-level fixes already in the repo (`asyncio.to_thread` polyfill,
+`from __future__ import annotations`).
 
-`asyncio.to_thread` (added in Python 3.9) is polyfilled in `app/main.py` —
-no action needed, but be aware if you see references to it.
-
-**`.env` DATABASE_URL — special characters in the password:**
-
-If the Postgres password contains `@`, `#`, `/`, or other URL-reserved
-characters, they must be percent-encoded in `DATABASE_URL`. For example,
-password `nvidia@123` becomes:
-```
-DATABASE_URL=postgresql://postgres:nvidia%40123@localhost:5432/eye_compass
+**Camera SDK:**
+```bash
+ls /opt/MVS/lib                          # must exist
+ls -l /dev/ttyTHS* /dev/ttyUSB* 2>&1     # candidates only — which one is the
+                                         # conveyor is settled in section 12
 ```
 
 ---
 
-## 4. Create `docker-compose.yml` (Database & Frontend)
-
-If the `docker-compose.yml` file is not already present on the device, create it manually:
+## 4. Create `docker-compose.yml`
 
 ```bash
 cd /home/nvidia/eye_compass_new
 nano docker-compose.yml
 ```
 
-Paste the following configuration into the file. **Important:** Change `POSTGRES_PASSWORD` to a real password before saving, and notice that you can comment/uncomment the `frontend` sections depending on whether you are doing a development or production build:
+**Change `POSTGRES_PASSWORD` before saving.** Comment/uncomment the frontend
+section depending on dev vs prod:
 
 ```yaml
 services:
@@ -235,7 +164,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # Uncomment below for bind mount development
+  # Development — bind-mount + Vite dev server
   frontend:
     image: node:20-alpine
     working_dir: /app
@@ -245,7 +174,7 @@ services:
       - ./eye_compass_fe:/app
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
 
-  # Uncomment below for production Docker build instead
+  # Production — built bundle behind Nginx (uncomment this, comment above)
   # frontend:
   #   build:
   #     context: ./eye_compass_fe
@@ -256,73 +185,48 @@ volumes:
   postgres_data:
 ```
 
-Save and exit. The database is created automatically the first time the `db` container starts against an empty volume. You do **not** run any `CREATE DATABASE` by hand.
-
-Start the containers (this will spin up both the database and the frontend):
-
 ```bash
 sudo docker compose up -d
-sudo docker compose ps                       # Both must show Up
-```
-
-Verify the empty database exists and is reachable:
-
-```bash
-sudo docker compose exec db psql -U postgres -d eye_compass -c '\dt'
-# Expect: "Did not find any relations." — correct at this point. The backend
-# has not started yet, so there are no tables. The backend creates them in step 6.
+sudo docker compose ps   # both Up
 ```
 
 ---
 
-## 5. Configure the backend (`.env`)
+## 5. Configure `.env`
 
 ```bash
 cd /home/nvidia/eye_compass_new/eye_compass_be
 cp .env.example .env
 ```
 
-`.env.example` documents every setting inline — read it as you go. The values
-that **must** change for production are below; everything else can stay at its
-documented default on a first install.
+Key production values:
 
 ```ini
-# Real hardware, never synthetic frames. The systemd unit pins this too, so a
-# mistake here cannot put a production device into mock mode — but set it right.
 USE_MOCK_CAMERA=false
-
-# Must match the password you set in docker-compose.yml in step 4.
-DATABASE_URL=postgresql://postgres:<YOUR_PASSWORD>@localhost:5432/eye_compass
-
-# Point at production Qualix, not dev/qa.
+DATABASE_URL=postgresql://postgres:<PASSWORD>@localhost:5432/eye_compass
 QUALIX_API_URL=https://assaying.qualix.ai/
-
-# Unique to this physical device — see step 1.
 DEVICE_ID=XX
 DEVICE_CODE=...
 WAREHOUSE_NAME=...
-
-# Who syncs, and who can get in when nothing else works. Two different accounts.
 SYNC_SERVICE_USERNAME=...
 SYNC_SERVICE_PASSWORD=...
 EMERGENCY_LOGIN_USERNAME=...
 EMERGENCY_LOGIN_PASSWORD=...
-
-# S3 upload of crops/frames. Set the pool id or turn the feature off.
 S3_ENABLED=true
 AWS_IDENTITY_POOL_ID=...
-
-# The production frontend is served on port 80, not Vite's 5173.
 CORS_ORIGINS=http://localhost,http://127.0.0.1
+EYE_COMPASS_SERIAL_PORT=/dev/ttyTHS0
 ```
 
-**If this device is on Keycloak**, also set `AUTH_PROVIDER=keycloak`,
-`KEYCLOAK_CLIENT_SECRET`, and `ASSURANCE_API_URL`, and point `KEYCLOAK_URL` at
-the **same environment** as `QUALIX_API_URL`. Pointing one at prod and the
-other at dev silently changes where scan data lands. See
-`../keycloak_integration/8 - switching_a_device.md`.
+`EYE_COMPASS_SERIAL_PORT` is device-specific: `/dev/ttyTHS0` on the prod
+JetPack 5 unit, a `/dev/ttyUSB*` on units with a USB-serial adapter. Set it
+from the probe in section 12, not from another device's `.env`.
 
-Lock the file down — it holds live credentials:
+If Keycloak: also set `AUTH_PROVIDER=keycloak`, `KEYCLOAK_CLIENT_SECRET`,
+`ASSURANCE_API_URL`.
+
+If the Postgres password contains `@`, URL-encode it as `%40` in
+`DATABASE_URL`.
 
 ```bash
 chmod 600 .env
@@ -339,46 +243,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now eye-compass-backend.service
 ```
 
-The service unit pins `USE_MOCK_CAMERA=false`, the MVS SDK paths, and the
-virtualenv interpreter, and has `Restart=always` — so it comes back after a
-crash as well as a reboot.
+The backend creates all database tables on first startup automatically.
 
-**The schema is created here, automatically**, on first startup: the backend's
-lifespan runs `create_all()` plus idempotent column/constraint checks. There is
-no Alembic and no migration command to run.
-
-Verify:
-
+**Verify:**
 ```bash
-sudo systemctl status eye-compass-backend.service       # active (running)
-sudo journalctl -u eye-compass-backend.service -n 100   # clean startup, no tracebacks
-curl http://localhost:8000/                             # responds
-
-# The tables now exist:
+sudo systemctl status eye-compass-backend.service   # active (running)
+sudo journalctl -u eye-compass-backend.service -n 50
+curl http://localhost:8000/
 cd /home/nvidia/eye_compass_new
 sudo docker compose exec db psql -U postgres -d eye_compass -c '\dt'
 ```
 
-In the journal, confirm the startup lines report the auth provider and the
-camera you expect. A device that silently came up in mock mode is the single
-most common bad install.
+Check the journal for the correct auth provider and `USE_MOCK_CAMERA=false`.
 
 ---
 
-## 7. Build and serve the frontend (production mode)
+## 7. Build the production frontend
 
-This is the step that differs from the dev unit. **Do not ship the Vite dev
-server**: it recompiles on file changes, serves unminified assets, and has none
-of production's caching behaviour.
-
-`eye_compass_fe/Dockerfile` already builds the bundle and serves it behind
-Nginx, and `nginx.conf` already has the SPA fallback (so a refresh on
-`/history` does not 404) and the `/api/` + `/ws/` proxy blocks pointing at
-`localhost:8000`.
-
-**Replace the `frontend` service in `/home/nvidia/eye_compass_new/docker-compose.yml`**
-with the build-based one — the file already carries it, commented out. The
-production form:
+Replace the `frontend` service in `docker-compose.yml` with:
 
 ```yaml
   frontend:
@@ -388,229 +270,272 @@ production form:
     network_mode: host
 ```
 
-Delete (or comment out) the `node:20-alpine` dev-server service above it. Both
-cannot run at once.
-
 ```bash
 cd /home/nvidia/eye_compass_new
 sudo docker compose build frontend
 sudo docker compose up -d frontend
 ```
 
-Verify — and check specifically that the proxy reaches the backend, which is
-what `network_mode: host` makes work:
-
+**Verify:**
 ```bash
-curl -I http://localhost/                 # 200, from Nginx
-curl http://localhost/api/                # proxied through to the backend
-sudo docker compose logs -f frontend      # no startup errors
-```
-
-> `nginx.conf` proxies to `localhost:8000` and relies on sharing the host's
-> network namespace. If you ever run this container *without*
-> `network_mode: host`, that `localhost` becomes the container itself and every
-> API call 502s — replace it with the real backend host first.
-
-**Rebuilding after a frontend code change** is now an explicit step; there is
-no hot reload in production:
-
-```bash
-sudo docker compose build frontend && sudo docker compose up -d frontend
+curl -I http://localhost/             # 200 from Nginx
+curl http://localhost/api/            # proxied to backend
 ```
 
 ---
 
 ## 8. Kiosk browser
 
-Full detail and reasoning in `10 - pwa_and_deployment_rollout.md`; the
-production-specific part is the **URL**.
+Copy onto the device (if not already present):
 
-The kiosk launch script (`~/.local/bin/eye-compass-kiosk.sh`) waits for the
-frontend to respond, then launches Firefox against it. On the dev unit it
-targets `http://localhost:5173` — the Vite dev server. **On production it must
-target `http://localhost`** (port 80, Nginx). Edit both the wait-for URL and
-the launch URL in that script.
+- `~/.local/bin/eye-compass-kiosk.sh` — kiosk launcher with retry loop
+- `~/.config/autostart/eye-compass-kiosk.desktop` — GNOME autostart entry
+- `~/.local/opt/firefox-kiosk-profile/` — dedicated profile
 
-Copy onto the device, if not already present:
+The kiosk script URLs must point at `http://localhost` (port 80), not `:5173`.
 
-- `~/.local/opt/firefox/` — Mozilla's standalone Linux-aarch64 tarball.
-  Chromium and the apt `firefox` package are both snaps, and snaps cannot run
-  on this kernel at all (no AppArmor).
-- `~/.local/opt/firefox/distribution/policies.json` — disables the password
-  manager, `about:config`, devtools, and the rest. Without it an operator can
-  reach `about:logins` from the save-password prompt and get stuck on a browser
-  settings page with no title bar and no keyboard.
-- `~/.local/opt/firefox-kiosk-profile/` — the dedicated profile.
-- `~/.local/bin/eye-compass-kiosk.sh` and
-  `~/.config/autostart/eye-compass-kiosk.desktop`.
+**Check whether the standalone Firefox tarball is needed:**
+```bash
+readlink -f /usr/bin/firefox
+snap list | grep firefox
+```
+If `/usr/bin/firefox` is a real binary (not a snap), the standalone tarball at
+`~/.local/opt/firefox/` is not needed.
 
-Also enable GDM auto-login for user `nvidia` in `/etc/gdm3/custom.conf`, or
-nothing starts until someone logs in at the console.
+**Enable GDM auto-login** in `/etc/gdm3/custom.conf`:
+```ini
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=nvidia
+```
 
-Test without rebooting:
-
+**Test without rebooting:**
 ```bash
 DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority \
   /home/nvidia/.local/bin/eye-compass-kiosk.sh
-cat ~/.local/state/eye-compass-kiosk.log
 ```
 
-`--kiosk` leaves no on-screen close button. To get out: `Alt+F4`, or from a
-terminal:
-```bash
-pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
-```
-(Killing only Firefox lets the script's retry loop relaunch it three seconds later, so kill both).
+Use `/run/user/1000/gdm/Xauthority` (the live GDM session), not
+`~/.Xauthority`.
+
+To exit kiosk mode: `pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile`
 
 ---
 
 ## 9. Migrate legacy data
 
-The SQLite database was already backed up in step 1. Now migrate it into
-PostgreSQL.
+Migrate from a **copy** of the legacy SQLite file, never the live one. The
+script opens its source read-only, but working from a locked copy means a
+mistake cannot reach the file the legacy app needs for a rollback.
 
-**Preview, then run.** The script opens the SQLite file read-only, never
-deletes or overwrites anything in PostgreSQL, and runs as a single transaction
-— a failure anywhere writes nothing:
+```bash
+# 1. Copy the legacy DB and lock it read-only
+TS=$(date +%Y%m%d_%H%M%S)
+SRC=/home/nvidia/eye_compass_new/db_backups/migration_source_${TS}.db
+mkdir -p /home/nvidia/eye_compass_new/db_backups
+cp -p /home/nvidia/eye_compass/eye_compass.db "$SRC"
+chmod 444 "$SRC"
+
+# 2. Confirm the copy is byte-identical
+md5sum /home/nvidia/eye_compass/eye_compass.db "$SRC"
+```
 
 ```bash
 cd /home/nvidia/eye_compass_new/eye_compass_be
+
+# 3. Dry run — reports exactly what a real run would add, then rolls back
 /home/nvidia/.virtualenvs/eye_compass/bin/python \
-  scripts/migrate_sqlite_to_postgres.py \
-  --sqlite /home/nvidia/eye_compass/eye_compass.db --dry-run
+  scripts/migrate_sqlite_to_postgres.py --sqlite "$SRC" --dry-run
+
+# 4. Real run, once the counts look right
+/home/nvidia/.virtualenvs/eye_compass/bin/python \
+  scripts/migrate_sqlite_to_postgres.py --sqlite "$SRC"
 ```
 
-Read the table it prints. When the counts look right, re-run without
-`--dry-run`. It is safe to run twice — the second run adds nothing.
+The whole migration is one transaction — on any error nothing is written. It
+is also idempotent: a second run adds 0 rows.
 
-**The images are files, not database rows**, and the script does not touch
-them. Copy the legacy output tree across separately; the folder layout
-(`output/<commodity>/<variety>/<image_unique_id>/`) is identical:
+**Config and credential tables are copied only when the target is empty.** If
+the backend has already synced config from Qualix and an operator has already
+signed in, those rows stay as they are and only `result` is migrated. That is
+the expected outcome, not a partial failure.
+
+**Verify afterwards** — the totals must match the legacy file, and the legacy
+file itself must be unchanged:
 
 ```bash
-rsync -a /home/nvidia/eye_compass/output/ \
-         /home/nvidia/eye_compass_new/eye_compass_be/output/
+curl -s "http://localhost:8000/api/history/?limit=1&days=0" | head -c 200
+md5sum /home/nvidia/eye_compass/eye_compass.db   # same as step 2
 ```
 
-Without this, a migrated batch appears in History but its crop images are
-missing.
+**Do not copy the legacy `output/` tree** while the legacy S3 cron jobs are
+still running (`crontab -l`). Those crons upload each batch folder and then
+delete it, so copied images would be uploaded a second time and then removed
+from the new tree. Migrated batches therefore show in History with no crop
+images; the API reports `on_device: false` for them, which is correct.
 
 ---
 
 ## 10. Final verification
 
-Work through all of it before handing the device over.
-
 **Services:**
-
 ```bash
-sudo systemctl status eye-compass-backend.service   # active (running)
-sudo docker compose ps                              # db + frontend both Up
-curl -I http://localhost/                           # 200
-curl http://localhost:8000/                         # responds
+sudo systemctl status eye-compass-backend.service
+sudo docker compose ps
+curl -I http://localhost/
+curl http://localhost:8000/
 ```
 
-**Reboot test — do not skip this one.** It is the only check that proves the
-device survives a power cut unattended:
+**Reboot test — do not skip.** After `sudo reboot`, with nobody touching
+anything: containers up, backend active, kiosk showing login on the display.
 
-```bash
-sudo reboot
-```
+**End-to-end on the touchscreen:**
+1. Log in → New Batch → scan a real sample → detect → classify → Submit
+2. Batch appears in History with crop images
+3. Sync status reaches delivered; confirm in Qualix
 
-After it comes back, with nobody touching anything: both containers up, the
-backend service active, and the kiosk browser showing the login screen on the
-physical display.
-
-**Functional end-to-end**, on the device's own touchscreen:
-
-1. Log in as a real operator.
-2. New Batch → Start → put a real sample through → a detection stops the belt →
-   classify the object → Resume → Submit → Confirm.
-3. The batch appears in History with its crop images.
-4. Its sync status reaches delivered — confirm the record arrived in Qualix.
-
-**Offline behaviour**, which is the whole point of this device:
-
-5. Disconnect the network. Log out, log back in as the same operator — the
-   cached-password path must accept it and show the offline notice.
-6. Run another batch offline. It must complete and save. Reconnect, and confirm
-   the retry worker delivers it without anyone intervening.
-
-**Power-cut recovery:**
-
-7. Start a batch, pull power mid-scan, boot back up. The Home screen must offer
-   to continue that batch, and continuing it must keep the objects already
-   classified.
+**Offline test:**
+4. Disconnect network → log out → log back in (cached password)
+5. Run a batch offline → reconnect → retry worker delivers it
 
 ---
 
 ## 11. Day-to-day operations
 
 ```bash
-# Start everything (containers come back on their own after a reboot)
-cd /home/nvidia/eye_compass_new
-sudo docker compose up -d
+# Start everything
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml up -d
 sudo systemctl start eye-compass-backend.service
 
 # Stop
 sudo systemctl stop eye-compass-backend.service
-sudo docker compose stop          # 'down' also removes the containers
+sudo docker compose stop
 
-# After a backend code change — uvicorn runs without --reload, so an edited
-# file does nothing until this runs
+# Restart backend after code change
 sudo systemctl restart eye-compass-backend.service
 
-# After a frontend code change — production serves a built bundle
+# Rebuild frontend after code change
 sudo docker compose build frontend && sudo docker compose up -d frontend
 
 # Logs
 sudo journalctl -u eye-compass-backend.service -f
 sudo docker compose logs -f frontend
-sudo docker compose logs -f db
 cat ~/.local/state/eye-compass-kiosk.log
-
-# The backend also writes a daily file that survives reboots, which the
-# journal here does not (no /var/log/journal — journald runs on tmpfs)
 ls /home/nvidia/eye_compass_new/eye_compass_be/logs/
 
-# Database
+# Database shell
 sudo docker compose exec db psql -U postgres -d eye_compass
-```
 
-**Back the database up on a schedule.** The named `postgres_data` volume
-survives container recreation and reboots, but nothing protects it from disk
-failure:
-
-```bash
+# Database backup
 sudo docker compose exec -T db pg_dump -U postgres eye_compass \
   | gzip > /home/nvidia/eye_compass_new/db_backups/eye_compass_$(date +%Y%m%d).sql.gz
 ```
 
 ---
 
-## 12. If it goes wrong
+## 12. Troubleshooting
 
-| Symptom | Cause to check first |
+| Symptom | Check |
 |---|---|
-| Backend won't start, DB connection refused | `DATABASE_URL` password does not match `POSTGRES_PASSWORD`; or the `db` container is not up |
-| Backend starts but no camera | `USE_MOCK_CAMERA`, `/opt/MVS/lib` present, camera reachable on its GigE address, nothing else holding it (the SDK grants exclusive access to one process only) |
-| Frontend loads, every API call 502s | `frontend` container is not on `network_mode: host`, so `nginx.conf`'s `localhost:8000` points at the container |
-| Deep links 404 on refresh | Serving the built bundle without `nginx.conf`'s `try_files` fallback |
-| Batch creation refuses to run | `DEVICE_ID` is unset |
-| Scans complete but never sync | `SYNC_SERVICE_USERNAME` / `_PASSWORD` blank or wrong — the backend logs this explicitly |
-| `docker compose up` fails with "Unable to enable DIRECT ACCESS FILTERING" | A service lost its `network_mode: host`; this kernel has no `iptable_raw.ko` |
-| Kiosk shows a blank page or connection error | The script still targets `:5173` (the dev server) instead of port 80 |
+| Backend won't start, DB connection refused | `DATABASE_URL` password ≠ `POSTGRES_PASSWORD`; or `db` container not up |
+| Backend starts but no camera | `USE_MOCK_CAMERA` value; `/opt/MVS/lib` present; camera on GigE; no other process holding it |
+| Every API call 502s | `frontend` container missing `network_mode: host` |
+| Deep links 404 on refresh | Nginx `try_files` fallback missing |
+| Batch creation refuses | `DEVICE_ID` unset |
+| Start fails, `502`, "belt did not respond" | Wrong serial port — see **Belt does not start** below |
+| Scans never sync | `SYNC_SERVICE_USERNAME`/`_PASSWORD` blank or wrong |
+| `docker compose up` fails, "DIRECT ACCESS FILTERING" | A service lost `network_mode: host` |
+| Kiosk blank page | Script still targets `:5173` instead of port 80 |
+| Kiosk Firefox dies, `Fatal IO error 11` | Legacy app also running on `:0` — stop it first |
+| Kiosk desktop but no browser | Kiosk script died; check `~/.local/state/eye-compass-kiosk.log` |
 
-**Rolling back to the legacy app** is possible at any point — the legacy folder
-at `/home/nvidia/eye_compass` was never touched, and nothing in this procedure
-modifies it:
+### Belt does not start
+
+**Symptom.** Pressing Start on the scan screen shows *"The belt did not
+respond to the start command"*, and the backend log shows this, three times,
+followed by a fail-safe stop:
+
+```
+Attempt 1: sending 'machine_start' to /dev/ttyTHS1
+Unexpected acknowledgment '' (wanted 'machine_started')
+No acknowledgment ... after 3 retries — sending fail-safe all_stop
+```
+
+An **empty** acknowledgment (`''`) with the port opening cleanly means the
+backend is writing to a serial port nothing is listening on. The usual cause
+is `EYE_COMPASS_SERIAL_PORT` naming the wrong port. `/dev/ttyTHS0` and
+`/dev/ttyTHS1` are both real Tegra UARTs that open without error whether or
+not the controller is wired to them, so nothing fails loudly. Check this
+before suspecting the hardware.
+
+**Fix.**
+
+1. Stop the backend, because two processes can open the same port and steal
+   each other's bytes, which makes the probe unreliable:
+
+   ```bash
+   echo nvidia | sudo -S systemctl stop eye-compass-backend.service
+   ```
+
+2. Probe every candidate. `all_stop` is safe — it only stops the belt. The
+   port that answers `all_stoped` is the conveyor:
+
+   ```bash
+   for p in /dev/ttyTHS0 /dev/ttyTHS1 /dev/ttyUSB0 /dev/ttyACM0; do
+     [ -e "$p" ] || continue
+     printf '%s -> ' "$p"
+     /home/nvidia/.virtualenvs/eye_compass/bin/python -c 'import sys,serial; s=serial.Serial(sys.argv[1],9600,timeout=1); s.write(b"all_stop\n"); print(repr(s.readline().decode(errors="replace").strip()))' "$p"
+   done
+   ```
+
+   Expect one line to print `'all_stoped'` and the rest `''`.
+
+3. Put the answering port in `.env`, then start the backend:
+
+   ```bash
+   cd /home/nvidia/eye_compass_new/eye_compass_be
+   sed -i 's|^EYE_COMPASS_SERIAL_PORT=.*|EYE_COMPASS_SERIAL_PORT=/dev/ttyTHS0|' .env   # use the port you found
+   echo nvidia | sudo -S systemctl start eye-compass-backend.service
+   ```
+
+4. Confirm in the log — the startup `all_stop` must now be acknowledged:
+
+   ```bash
+   journalctl -u eye-compass-backend.service --since "1 min ago" --no-pager | grep conveyor_service
+   # want: Acknowledgment received: all_stoped
+   ```
+
+**If no port answers.** The software is not the problem. Check the controller
+board has power and the serial cable is seated, then power-cycle the board
+and run the probe again. On a unit with a USB-serial adapter, also check
+`lsusb` lists it and `ls /dev/ttyUSB*` shows a device.
+
+**Known values.** Prod JetPack 5 unit: `/dev/ttyTHS0` (legacy hardcodes this
+at `main.py:2426`). Baud is 9600 on every unit seen so far.
+
+---
+
+## 13. Rollback to legacy
+
+The legacy folder was never touched. To revert:
 
 ```bash
+# Stop the new stack + kiosk
 sudo systemctl stop eye-compass-backend.service
 sudo systemctl disable eye-compass-backend.service
-sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml stop
+sudo docker compose -f /home/nvidia/eye_compass_new/docker-compose.yml down
+pkill -f eye-compass-kiosk.sh && pkill -f firefox-kiosk-profile
+mv ~/.config/autostart/eye-compass-kiosk.desktop ~/.config/autostart/eye-compass-kiosk.desktop.disabled
+```
 
+Then start legacy (systemd or manual). If manual, run `cd` **separately**
+from the launch command:
+
+```bash
 cd /home/nvidia/eye_compass
+```
+
+```bash
 DISPLAY=:0 \
 XAUTHORITY=/home/nvidia/.Xauthority \
 PYTHONPATH=/usr/lib/python3.8/dist-packages \
@@ -619,6 +544,5 @@ MVCAM_COMMON_RUNENV=/opt/MVS/lib \
     >> /tmp/legacy_stdout.log 2>&1 &
 ```
 
-The legacy SQLite file was never written to — the migration script opens it
-read-only, and the backup from step 1 is at
-`/home/nvidia/eye_compass_new/db_backups/` as well.
+To return to the new stack later: rename the kiosk autostart entry back,
+re-enable the backend service, bring containers up.

@@ -9,6 +9,8 @@ When USE_MOCK_CAMERA is NOT set (the default on the real Jetson device),
 the real SDK is imported. If that import fails, the server crashes loudly.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 import numpy as np

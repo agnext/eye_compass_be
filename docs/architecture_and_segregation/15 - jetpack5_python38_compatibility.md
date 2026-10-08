@@ -3,7 +3,7 @@
 Production devices run **JetPack 5** (L4T R35.2.1) with **Python 3.8.10**.
 The dev unit runs **JetPack 6** with **Python 3.10.12**.
 
-The codebase is developed and tested on Python 3.10, but all five gaps listed
+The codebase is developed and tested on Python 3.10, but all six gaps listed
 below were addressed so that **the same branch runs on both platforms**
 without a separate JetPack-5 fork. Every fix is either a no-op on 3.10 or
 lives outside the repo (pip packages, device-level config).
@@ -26,6 +26,10 @@ pip install eval_type_backport
 
 Pydantic detects this package automatically and uses it to evaluate the union
 syntax at runtime on older Pythons.
+
+> **This covers pydantic model fields only.** A `X | None` annotation on a
+> plain function or module-level variable is evaluated eagerly by Python at
+> import time, and `eval_type_backport` never sees it. Those need fix #6.
 
 ---
 
@@ -120,6 +124,69 @@ database password contains special characters.
 
 ---
 
+## 6. `X | None` outside a pydantic model
+
+**Symptom:** `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`
+at **import time**, crash-looping the service before it ever serves a request:
+
+```
+File "app/services/camera_service.py", line 40, in <module>
+    def grab_frame(self) -> np.ndarray | None:
+TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+```
+
+This looks like fix #1 but is a different problem, and `eval_type_backport`
+does **not** solve it. That package only teaches *pydantic* to resolve unions
+in model fields. A function return annotation, a function parameter, or a
+module-level variable annotation is evaluated by Python itself the moment the
+module is imported — pydantic is never involved.
+
+**Fix — `from __future__ import annotations`, after the module docstring:**
+
+```python
+"""Module docstring stays first."""
+
+from __future__ import annotations   # <- PEP 563: annotations become lazy strings
+
+import logging
+...
+```
+
+PEP 563 stores every annotation as a string instead of evaluating it, so the
+`|` is never executed at import. `eval_type_backport` then resolves those
+strings at runtime in the places FastAPI and pydantic genuinely need the real
+type — the two fixes are complements, not alternatives.
+
+Applied to the six modules that annotate this way outside a pydantic model:
+
+| File | Occurrences |
+|---|---|
+| `app/api/camera.py` | 3 module-level variables |
+| `app/api/history.py` | 1 route parameter |
+| `app/api/scan.py` | 1 module-level variable |
+| `app/services/camera_service.py` | 3 method return types |
+| `app/services/conveyor_service.py` | 1 instance attribute |
+| `app/services/resource_monitor.py` | 1 function return type |
+
+Two further hits are **false positives** — `app/services/keycloak_service.py`
+and `app/services/Tracker/bytetrack/tracker/matching.py` mention `|` only
+inside docstrings, which Python never evaluates. Leave them alone.
+
+**Placement matters.** The declaration must come *after* the module docstring.
+Put it on line 1 and the docstring stops being the docstring (`__doc__`
+becomes `None`). A future statement may be preceded only by the docstring,
+comments, and blank lines — anything else is a `SyntaxError`.
+
+To find every affected file in the repo:
+
+```bash
+grep -rnE "(->|:) *[A-Za-z_][A-Za-z0-9_.]*(\[[^]]*\])? *\|" app/
+```
+
+Then discard any hit that falls inside a docstring.
+
+---
+
 ## Why not upgrade Python on JetPack 5?
 
 JetPack 5 ships Python 3.8 as the system Python. NVIDIA's CUDA, TensorRT,
@@ -140,6 +207,7 @@ Python.
 | `.pth` file | device filesystem | N/A — dev doesn't use it |
 | `tqdm` | pip package | Already present on dev |
 | `%40` encoding | device `.env` | N/A — per-device password |
+| `from __future__ import annotations` | 6 modules (repo) | Valid and supported since 3.7 |
 
 No `if sys.version` branches, no feature flags, no separate branch. The repo
 is identical on both platforms.
@@ -169,4 +237,5 @@ echo '/home/nvidia/.virtualenvs/m38/lib/python3.8/site-packages' \
 # URL-encode any @ as %40, # as %23, etc.
 ```
 
-Fix #2 (the polyfill) is already in the repo — nothing to do on the device.
+Fixes #2 and #6 are code-level and already in the repo — nothing to do on
+the device.

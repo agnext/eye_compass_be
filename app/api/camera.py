@@ -13,6 +13,8 @@ Route paths on `router` are relative because app/main.py mounts it under
 so its public URL stays ws://host/ws/camera/stream.
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import concurrent.futures

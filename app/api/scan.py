@@ -28,6 +28,8 @@ fragility, reproduced here rather than fixed, since an exact match was
 requested over the earlier one-step version.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

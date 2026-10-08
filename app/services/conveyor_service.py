@@ -6,9 +6,12 @@ A faithful port of legacy `send_control_command` (main.py:2279-2378) plus the
 deliberate deviation from legacy: the serial port is opened ONCE and held
 open, instead of being reopened on every single write/retry.
 
-Why: this device's USB-serial adapter is a CH340 (idVendor=1a86, idProduct=
-7523). Like most USB-serial chips, it pulses the DTR line when the port is
-opened, which resets the conveyor controller board. Legacy (and this file,
+Why: on units that reach the controller through a USB-serial adapter (the
+dev unit's is a CH340, idVendor=1a86, idProduct=7523), the chip pulses the
+DTR line when the port is opened, which resets the conveyor controller
+board. Units wired to the Tegra's onboard UART (/dev/ttyTHS*, e.g. the prod
+JetPack 5 unit) have no such chip, so this does not apply there - but
+holding the port open is harmless for them. Legacy (and this file,
 originally) reopened `serial.Serial(...)` on every attempt — verified live
 on-device: both legacy and this backend, with identical reopen-per-attempt
 logic, failed to get any acknowledgment from the belt, while CuteCom (which
@@ -29,6 +32,8 @@ Everything else here matters for physical safety, so none of it is optional:
 Access is serialised behind a lock: unlike the legacy Qt main thread, several
 HTTP requests can arrive at once and must not touch the port simultaneously.
 """
+
+from __future__ import annotations
 
 import logging
 import threading
