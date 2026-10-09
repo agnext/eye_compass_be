@@ -139,10 +139,9 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
     its thresholds differ from older copies on other units.
 
     Legacy inspects only detections[0] — the first detection in the frame — and
-    suppresses the whole frame based on it. That is preserved deliberately:
-    changing it to a per-detection filter would alter counts relative to the
-    legacy machine, which is what this migration is supposed to keep constant.
-    Commented-out legacy rules are left out, as they were inactive.
+    suppresses the whole frame based on it. Kept identical to legacy so counts
+    match the machine this deployment replaces. Commented-out legacy rules are
+    left out, as they were inactive.
     """
     if not detections:
         return [], True
@@ -150,48 +149,108 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
     c = normalize_commodity(commodity)
     v = normalize_commodity(variety)
 
+    # Legacy inspects detections[0] and drops/keeps the whole frame on it
+    # (GrabImage.py:534-590 use results[0]). Kept identical to legacy.
     first = detections[0]
     conf = first[4]
     cls = first[5]
+
+    # No per-frame logging here: suppression runs on every inferred frame,
+    # so logging each drop/keep floods the log. The decision this makes is
+    # visible downstream only when a box actually survives — scan_session
+    # logs that frame as an "FM candidate". A dropped frame is a non-event
+    # and is deliberately silent.
+    def _dropped(reason):
+        return [], False
 
     def drop():
         return [], False
 
     if c == "rice" and v == "tibar" and cls in (2, 4, 5) and conf < 0.20:
-        return drop()
+        return _dropped("rice/tibar cls{2,4,5}<0.20")
     if c == "rice" and v == "dawat" and (
         (cls == 5 and conf < 0.50) or (cls == 0 and conf < 0.10)
     ):
-        return drop()
+        return _dropped("rice/dawat cls5<0.50 or cls0<0.10")
     if c == "rice" and v == "gr1-ri01-rw1" and (
         (cls == 5 and conf < 0.42) or (cls == 3 and conf < 0.36)
     ):
-        return drop()
+        return _dropped("rice/gr1-ri01-rw1 cls5<0.42 or cls3<0.36")
     if c == "chitra_rajma" and (
         (cls == 0 and conf < 0.80) or (cls == 5 and conf < 0.80) or (cls == 2 and conf < 0.65)
     ):
-        return drop()
+        return _dropped("chitra_rajma cls{0,5}<0.80 or cls2<0.65")
     if c == "kabuli_chana" and cls == 1 and conf < 0.60:
-        return drop()
+        return _dropped("kabuli_chana cls1<0.60")
     if c == "toor_dal" and (
         (cls == 4 and conf < 0.48) or (cls == 2 and conf < 0.25) or (cls == 5 and conf < 0.35)
     ):
-        return drop()
+        return _dropped("toor_dal cls4<0.48 or cls2<0.25 or cls5<0.35")
     if c == "chana_dal" and (
         (cls == 2 and conf < 0.40) or (cls == 4 and conf < 0.40) or (cls == 5 and conf < 0.30)
     ):
-        return drop()
+        return _dropped("chana_dal cls{2,4}<0.40 or cls5<0.30")
     if c == "masoor_red_whole" and (
         (cls == 5 and conf < 0.80) or (cls == 3 and conf < 0.60)
         or (cls == 1 and conf < 0.20) or (cls == 0 and conf < 0.30)
     ):
-        return drop()
-    if c == "black_chana" and cls == 3 and conf < 0.44:
-        return drop()
+        return _dropped("masoor_red_whole various")
+    if c == "black_chana" and cls == 6 and conf < 0.95:
+        return _dropped("black_chana cls6<0.95")
     if c == "dalia" and ((cls == 3 and conf < 0.80) or (cls == 4 and conf < 0.40)):
-        return drop()
+        return _dropped("dalia cls3<0.80 or cls4<0.40")
 
     return detections, True
+
+
+# Class code -> legacy label (GrabImage.py:524-530). Used only for logging.
+_CLASS_LABELS = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
+
+# Suppression thresholds as a lookup, ONLY for the human-readable FM trace in
+# explain_suppression below. apply_suppression_rules above remains the single
+# source of truth for the actual decision; if a threshold changes there, change
+# it here too. Keyed (commodity, variety) with variety None meaning "any".
+_RULE_TABLE = {
+    ("rice", "tibar"): {2: 0.20, 4: 0.20, 5: 0.20},
+    ("rice", "dawat"): {5: 0.50, 0: 0.10},
+    ("rice", "gr1-ri01-rw1"): {5: 0.42, 3: 0.36},
+    ("chitra_rajma", None): {0: 0.80, 5: 0.80, 2: 0.65},
+    ("kabuli_chana", None): {1: 0.60},
+    ("toor_dal", None): {4: 0.48, 2: 0.25, 5: 0.35},
+    ("chana_dal", None): {2: 0.40, 4: 0.40, 5: 0.30},
+    ("masoor_red_whole", None): {5: 0.80, 3: 0.60, 1: 0.20, 0: 0.30},
+    ("black_chana", None): {3: 0.44},
+    ("dalia", None): {3: 0.80, 4: 0.40},
+}
+
+
+def explain_suppression(detections: List, commodity: str, variety: str) -> str:
+    """Human-readable account of why apply_suppression_rules kept this frame.
+
+    Read-only — it makes no decision, it only describes the one the real
+    function made. Called only on frames that actually become an FM, so its
+    cost and verbosity never touch the hot path. Mirrors legacy's inspection
+    of detections[0].
+    """
+    if not detections:
+        return "no detections to judge"
+    c = normalize_commodity(commodity)
+    v = normalize_commodity(variety)
+    first = detections[0]
+    conf = float(first[4])
+    cls = int(first[5])
+    label = _CLASS_LABELS.get(cls, "?")
+    rule = _RULE_TABLE.get((c, v)) or _RULE_TABLE.get((c, None))
+    if rule is None:
+        return ("box[0]=cls%d(%s) conf%.3f; '%s' has no suppression rules "
+                "→ kept" % (cls, label, conf, c))
+    if cls not in rule:
+        kinds = ", ".join("cls%d" % k for k in sorted(rule))
+        return ("box[0]=cls%d(%s) conf%.3f; '%s' only suppresses %s → "
+                "no rule for cls%d, kept" % (cls, label, conf, c, kinds, cls))
+    thr = rule[cls]
+    return ("box[0]=cls%d(%s) conf%.3f; '%s' rule cls%d<%.2f; %.3f>=%.2f "
+            "→ above threshold, kept" % (cls, label, conf, c, cls, thr, conf, thr))
 
 
 def enlarge_bbox(bbox, pad: int = 10, img_w: int = None, img_h: int = None):
@@ -356,11 +415,27 @@ class TensorRTInferenceService(BaseInferenceService):
                 )
             return [], frame.copy()
         try:
-            detections, annotated = self._model.predict(
-                frame,
-                conf_threshold=self._conf_threshold,
-                iou_threshold=iou_threshold,
-            )
+            # Legacy's run_inference.py:144 does print(conf_thres, iou_thres)
+            # on every predict() call. At ~17 inferred frames/sec that is a
+            # flood of identical lines to journald, which blocks the writer
+            # long enough to stall the WebSocket stream. We cannot edit the
+            # legacy file (rollback must stay byte-identical), so suppress its
+            # stdout only around this one call.
+            import sys, os
+            _devnull = getattr(self, "_devnull", None)
+            if _devnull is None:
+                _devnull = open(os.devnull, "w")
+                self._devnull = _devnull
+            _saved_stdout = sys.stdout
+            sys.stdout = _devnull
+            try:
+                detections, annotated = self._model.predict(
+                    frame,
+                    conf_threshold=self._conf_threshold,
+                    iou_threshold=iou_threshold,
+                )
+            finally:
+                sys.stdout = _saved_stdout
             return detections, annotated
         except Exception as exc:
             logger.error("Inference error: %s", exc)

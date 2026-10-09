@@ -32,7 +32,8 @@ load_dotenv(_backend_root / ".env", override=False)
 # --------------------------------------------------------------------------
 
 _ini = configparser.RawConfigParser()
-_ini_path = os.getenv("CONFIG_INI_PATH", "/home/nvidia/eye_compass/config.INI")
+_legacy_dir = str(_backend_root / "legacy")
+_ini_path = os.getenv("CONFIG_INI_PATH", str(_backend_root / "legacy" / "config.INI"))
 try:
     if os.path.exists(_ini_path):
         _ini.read(_ini_path)
@@ -89,22 +90,22 @@ class Settings:
 
     # ---------------- Paths ----------------
     CONFIG_INI_PATH: str = _ini_path
-    EYE_COMPASS_SRC: str = _env("EYE_COMPASS_SRC", default="/home/nvidia/eye_compass")
-    MODEL_DIR: str = _env("MODEL_DIR", default="/home/nvidia/eye_compass/models")
+    EYE_COMPASS_SRC: str = _env("EYE_COMPASS_SRC", default=_legacy_dir)
+    MODEL_DIR: str = _env("MODEL_DIR", default=str(_backend_root.parent / "models"))
     MVS_SDK_PATH: str = _env(
         "MVS_SDK_PATH", default="/home/nvidia/MVS/Samples/aarch64/Python/MvImport"
     )
     # Camera calibration file the legacy app loads via MV_CC_FeatureLoad
     # (GrabImage.py:679). Without it the camera runs on factory white balance.
     CAMERA_FEATURE_FILE: str = _env(
-        "CAMERA_FEATURE_FILE", default="/home/nvidia/eye_compass/FeatureFile_new.ini"
+        "CAMERA_FEATURE_FILE", default=str(_backend_root / "legacy" / "FeatureFile_new.ini")
     )
     # Where scan crops / frames are written, and what the S3 worker uploads.
     OUTPUT_DIR: str = _env(
         "OUTPUT_DIR", section="_PATH_", key="parent", default=str(_backend_root / "output")
     )
     XAI_MODEL_PATH: str = _env(
-        "XAI_MODEL_PATH", default="/home/nvidia/eye_compass/xai_models/v6_best.pt"
+        "XAI_MODEL_PATH", default=str(_backend_root.parent / "xai_models" / "v6_best.pt")
     )
     # Save one r_frame_N.jpg every Nth frame that had NO detection in it —
     # legacy's `if frame_count % 2 == 0` on the no-FM branch of emit_results

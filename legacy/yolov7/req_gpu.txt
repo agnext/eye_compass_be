@@ -1,0 +1,13 @@
+#for gpu
+# python train.py --weights runs/train/Toor_v_2.1.02/weights/last.pt --epochs 100 --batch-size 16 --cache-images 
+
+
+-i https://download.pytorch.org/whl/cu113
+
+
+torch==1.11.0+cu113 
+torchvision==0.12.0+cu113
+
+
+
+

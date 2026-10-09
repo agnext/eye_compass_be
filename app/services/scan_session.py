@@ -47,7 +47,7 @@ import numpy as np
 
 from app.core.config import settings
 from app.services.conveyor_service import conveyor_service
-from app.services.inference_service import apply_suppression_rules, enlarge_bbox
+from app.services.inference_service import apply_suppression_rules, enlarge_bbox, explain_suppression, resolve_model
 from app.services.sort import ObjectTracker
 
 logger = logging.getLogger(__name__)
@@ -1184,17 +1184,24 @@ class ScanSession:
             # with its raw/suppressed split made explicit: legacy logged the
             # surviving boxes only, so a frame dropped by a suppression rule
             # looked identical to a frame the model saw nothing in.
-            if raw_detections:
+            # Only log on frames where a detection actually survives the
+            # suppression rules — i.e. a real FM candidate the stop logic
+            # may act on. The earlier version logged every raw detection,
+            # including ones the model emits on every empty-belt frame,
+            # which filled the log with noise and buried the real stops.
+            # If a frame had raw detections but all were filtered out, that
+            # is a false-positive save: log it once as such, not per-frame.
+            if detections:
                 logger.info(
-                    "Frame %s — model found %s: %s",
-                    self.frame_count, len(raw_detections),
-                    _fmt_boxes(raw_detections),
+                    "Frame %s — FM candidate (%s box(es)): %s",
+                    self.frame_count, len(detections), _fmt_boxes(detections),
                 )
                 if len(detections) != len(raw_detections):
                     logger.info(
-                        "Frame %s — after filters: %s remaining: %s",
-                        self.frame_count, len(detections),
-                        _fmt_boxes(detections),
+                        "Frame %s — suppression removed %s of %s model box(es)",
+                        self.frame_count,
+                        len(raw_detections) - len(detections),
+                        len(raw_detections),
                     )
 
             # No belt-motion check here, deliberately. It is tempting (and an
@@ -1347,6 +1354,38 @@ class ScanSession:
                     (time.perf_counter() - _t_frame_start) * 1000.0,
                     csc["fm_count"],
                 )
+                # Full FM trace — only here, where an FM has actually been
+                # confirmed and the belt is being stopped. Explains the whole
+                # path from the model's raw output through suppression to the
+                # counted object(s), so a stop can be audited after the fact
+                # without per-frame logging. FM frames only, by construction.
+                try:
+                    _model_key, _conf_thr = resolve_model(self.commodity, self.variety)
+                except Exception:
+                    _model_key, _conf_thr = ("?", 0.0)
+                logger.info(
+                    "======== FM CONFIRMED ======== %s/%s | model=%s conf_thr=%.2f | "
+                    "frame=%s",
+                    self.commodity, self.variety, _model_key, _conf_thr,
+                    self.frame_count,
+                )
+                logger.info(
+                    "  model raw output (%s box(es)): %s",
+                    len(raw_detections), _fmt_boxes(raw_detections),
+                )
+                _survivors = [raw for _tid, _bx, raw in candidates]
+                _removed = len(raw_detections) - len(_survivors)
+                logger.info(
+                    "  suppression: %s | removed %s box(es), %s survived",
+                    explain_suppression(raw_detections, self.commodity, self.variety),
+                    max(_removed, 0), len(_survivors),
+                )
+                for _n, (_tid, _bx, _raw) in enumerate(candidates, 1):
+                    logger.info(
+                        "  counted FM %s/%s: box=%s track_id=%s → counts because it "
+                        "survived suppression and was tracked as a new object",
+                        _n, len(candidates), _fmt_boxes([_raw]), _tid,
+                    )
                 conveyor_service.lock_machine_start(reason="FM_detected")
                 conveyor_service.send("FM_detected")
                 self.review_phase = "settling"

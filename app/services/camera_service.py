@@ -200,10 +200,23 @@ class RealCameraService(BaseCameraService):
         """Convert a raw Bayer frame to a numpy image.
 
         Exact port of convert_frame_to_image (GrabImage.py:42-68), including the
-        pixel-format guard. Note there is deliberately NO cv2.flip here: both
-        flip calls are commented out in the legacy source, and applying them
-        rotates the image 180deg, which reverses the belt's direction of travel
-        in image space and breaks ObjectTracker's x/y assumptions.
+        pixel-format guard and BOTH cv2.flip calls.
+
+        The flips matter and were missing here. An earlier comment in this spot
+        claimed legacy had them commented out — it misread lines 47-50, which
+        are alternative cvtColor variants; the flips on GrabImage.py:51-52 are
+        live. Together flip(0) + flip(1) is a 180deg rotation, and leaving it
+        out broke two things at once:
+
+          * the model is fed every grain upside down relative to the images it
+            was tuned on, which degrades detection and flags ordinary grain as
+            foreign matter;
+          * belt travel is inverted in image space (objects run up the frame
+            instead of down), which breaks ObjectTracker's forward-motion gate
+            (sort.py's forward gate cy >= obj['y'] - 5) and its bottom-edge
+            exit rule, so a
+            moving object is minted a new track id almost every frame and the
+            same object is counted more than once.
         """
         import cv2
         from ctypes import cast, POINTER, c_ubyte
@@ -229,7 +242,11 @@ class RealCameraService(BaseCameraService):
             raise ValueError(f"Buffer size {raw.size} != expected {expected}")
 
         raw = raw.reshape((height, width))
-        return cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB).copy()
+        image = cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB)
+        # GrabImage.py:51-52 — both live in legacy. Keep the order.
+        image = cv2.flip(image, 0)
+        image = cv2.flip(image, 1)
+        return image.copy()
 
     # ---- interface ----
     def initialize(self) -> bool:

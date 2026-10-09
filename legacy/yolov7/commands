@@ -1,0 +1,28 @@
+# new traing script Attention  ##python train.py --name Tibar_attention_v1.0 --batch-size 16 --epochs 3 --workers 4 --cache-images --device 0
+# full yolo v7 model #########################
+
+#python train.py --weights yolov7.pt --cfg cfg/training/yolov7.yaml --hyp data/hyp.scratch.custom.yaml --epochs 200 --img-size 800 --batch-size 16 --device 0 --workers 16 --autoanchor --name yolov7_full_v1 --cache-images --device 0
+
+# latest # python train.py --weights yolov7.pt --cfg cfg/training/yolov7.yaml --hyp data/hyp.scratch.custom.yaml --epochs 250 --img 832 --batch 16 --device 0 --workers 2 --name Toor_FV4 --cache-images
+
+
+
+===== SUMMARY ===== broken
+Total images: 96
+Class 12: 1 images
+Class 0: 92 images
+Class 15: 2 images
+Class 11: 1 images
+
+26374060
+
+===== SUMMARY ===== shre
+Total images: 81
+Class 15: 74 images
+Class 4: 1 images
+Class 10: 3 images
+Class 2: 1 images
+Class 7: 1 images
+Class 0: 1 images
+
+
