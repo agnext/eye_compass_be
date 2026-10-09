@@ -143,7 +143,10 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
 def apply_suppression_rules(detections: List, commodity: str, variety: str) -> Tuple[List, bool]:
     """Commodity-specific false-positive suppression.
 
-    Port of process_results (GrabImage.py:445-536). Returns (detections, fm_flag).
+    Port of process_results. Returns (detections, fm_flag). The rules mirror the
+    active (uncommented) branches of the production unit's GrabImage.py — that
+    file is the source of truth for the machine this deployment replaces, and
+    its thresholds differ from older copies on other units.
 
     Legacy inspects only detections[0] — the first detection in the frame — and
     suppresses the whole frame based on it. That is preserved deliberately:
@@ -166,31 +169,36 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
 
     if c == "rice" and v == "tibar" and cls in (2, 4, 5) and conf < 0.20:
         return drop()
-    if c == "toor_dal" and cls == 4 and conf < 0.25:
+    if c == "rice" and v == "dawat" and (
+        (cls == 5 and conf < 0.50) or (cls == 0 and conf < 0.10)
+    ):
+        return drop()
+    if c == "rice" and v == "gr1-ri01-rw1" and (
+        (cls == 5 and conf < 0.42) or (cls == 3 and conf < 0.36)
+    ):
+        return drop()
+    if c == "chitra_rajma" and (
+        (cls == 0 and conf < 0.80) or (cls == 5 and conf < 0.80) or (cls == 2 and conf < 0.65)
+    ):
+        return drop()
+    if c == "kabuli_chana" and cls == 1 and conf < 0.60:
+        return drop()
+    if c == "toor_dal" and (
+        (cls == 4 and conf < 0.48) or (cls == 2 and conf < 0.25) or (cls == 5 and conf < 0.35)
+    ):
         return drop()
     if c == "chana_dal" and (
-        (cls == 2 and conf < 0.45) or (cls == 3 and conf < 0.17) or (cls == 4 and conf < 0.50)
+        (cls == 2 and conf < 0.40) or (cls == 4 and conf < 0.40) or (cls == 5 and conf < 0.30)
     ):
         return drop()
-    if c == "black_chana" and cls == 3 and conf < 0.30:
+    if c == "masoor_red_whole" and (
+        (cls == 5 and conf < 0.80) or (cls == 3 and conf < 0.60)
+        or (cls == 1 and conf < 0.20) or (cls == 0 and conf < 0.30)
+    ):
+        return drop()
+    if c == "black_chana" and cls == 3 and conf < 0.44:
         return drop()
     if c == "dalia" and ((cls == 3 and conf < 0.80) or (cls == 4 and conf < 0.40)):
-        return drop()
-    if c == "white_peas" and cls == 4 and conf < 0.25:
-        return drop()
-    if c == "lobia" and cls == 3 and conf < 0.20:
-        return drop()
-    if c == "rice" and v == "brown_rice" and cls == 3 and conf < 0.20:
-        return drop()
-    if c == "rice" and v == "dawat" and cls in (1, 3, 4) and conf < 0.25:
-        return drop()
-    if c == "moong_whole" and (
-        (cls == 4 and conf < 0.50) or (cls in (0, 1, 2, 5) and conf < 0.30)
-    ):
-        return drop()
-    if c == "sonamasoori_rice" and ((cls == 3 and conf < 0.51) or (cls == 5 and conf < 0.30)):
-        return drop()
-    if c == "masoor_red_whole" and cls in (3, 5) and conf < 0.20:
         return drop()
 
     return detections, True

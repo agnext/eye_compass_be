@@ -97,8 +97,9 @@ Tying together `5 - infrastructure_and_deployment.md`'s hybrid split:
    kiosk profile (`~/.local/opt/firefox-kiosk-profile/user.js`) that
    suppresses first-run/crash-restore/update prompts, via:
    ```
-   firefox --profile ~/.local/opt/firefox-kiosk-profile --kiosk --no-remote <url>
+   GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0 firefox --profile ~/.local/opt/firefox-kiosk-profile --kiosk --no-remote <url>
    ```
+   *(Note: The `GDK_BACKEND=x11` and `MOZ_ENABLE_WAYLAND=0` flags are strictly required if the device will be accessed via remote desktop software like DWS or VNC. Without them, Firefox runs as a native Wayland app and silently ignores all remote-injected keystrokes, completely breaking keyboard input.)*
    Chromium's `--app=<url>` trick (no tabs, no address bar) doesn't apply
    here since Chromium isn't an option on this device at all; Firefox's
    plain `--kiosk <url>` already hides all browser chrome.
@@ -176,6 +177,24 @@ Tying together `5 - infrastructure_and_deployment.md`'s hybrid split:
      off to a different application. The one login credential that had
      already been saved to the profile's `logins.json` before this was
      found was deleted as part of this change.
+     **Important for Kiosk Input/Focus:** The `user.js` must also explicitly lock down the address bar and homepage to prevent remote-desktop/kiosk conflicts. Append the following lines to the profile's `user.js`:
+     ```javascript
+     // Disable search suggestions and autocomplete from triggering
+     user_pref("browser.urlbar.suggest.searches", false);
+     user_pref("browser.urlbar.suggest.history", false);
+     user_pref("browser.urlbar.suggest.bookmark", false);
+     user_pref("browser.urlbar.suggest.topsites", false);
+     user_pref("browser.urlbar.maxRichResults", 0);
+     user_pref("browser.urlbar.autoFill", false);
+     user_pref("browser.urlbar.autocomplete.enabled", false);
+     user_pref("keyword.enabled", false); 
+     user_pref("accessibility.typeaheadfind", false);
+     
+     // Force homepage to prevent crash-recovery from opening the New Tab page
+     user_pref("browser.startup.page", 1);
+     user_pref("browser.startup.homepage", "http://localhost");
+     user_pref("browser.newtabpage.enabled", false);
+     ```
    - **What this does *not* lock down, deliberately:** the GNOME window
      manager underneath Firefox — Alt+Tab, the Super/Activities overview,
      opening a terminal — is completely untouched by any of this. `--kiosk`
