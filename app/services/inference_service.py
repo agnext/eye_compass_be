@@ -41,30 +41,25 @@ CLASS_NAMES = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
 # ---------------------------------------------------------------------------
 
 MODEL_REGISTRY = {
-    "stem_rice": "steam_rice_v1_5_0.optimized",
+    "stem_rice": "punjab_kesari_v1_0_02.optimized",
     "sella_rice": "sella_rice_v_1_0.optimized",
-    "toor": "Toor_dal_v1_9_0.optimized",
+    "toor": "Toor_v6.optimized",
     "masoor_mlka": "masoor_malka_v1_0.optimized",
     "moong_whole": "model_moong_whole_v1_0.optimized",
-    "urad_dal": "urad_dhuli_v1.optimized",
+    "urad_dal": "urad_chilka_v1_3.optimized",
     "kabuli_chana": "Kabuli_chana_v1_2.optimized",
     "rice": "Tibar_v7_new.optimized",
     "masoor_dal": "Masoor_v1.4.0.optimized",
-    "lobia": "lobia_v5.optimized",
-    "chitra_rajma": "Chitra_rajma_v4.optimized",
-    "Dawat_rice": "Dawat_sona_chandi_v3.optimized",
+    "lobia": "Lobia_v1.2_0.optimized",
+    "chitra_rajma": "Rajm_new_4.optimized",
+    "Dawat_rice": "Dawatv2_best.optimized",
     "Black_chana": "Black_chana_v4.optimized",
     "Rosted_chana": "Rosted_chana_v2.optimized",
-    "chanadal": "Toor_v6.optimized",
-    # 15 June 2026
-    "white_peas": "White_peav1.optimized",
-    "moth_dal": "Moth_dal_v2.optimized",
-    "sabudana": "sabudana_v2.optimized",
-    "brown_rice": "brown_rice_v3.optimized",
-    "sona_masoori_rice": "smrice_v2.optimized",
-    "green_moong_dal": "green_moong_v4.optimized",
-    # 23 July 2026
-    "masoor_red_whole": "masoor_red_whole_v1.4.0.optimized",
+    "chanadal": "chana_daal_v1_1_0.optimized",
+    "white_peas": "White_pea_v1.optimized",
+    "moth_dal": "Mote_dal.optimized",
+    "sabudana": "sabudana_v1.optimized",
+    "brown_rice": "BrownRice_v1.optimized",
 }
 
 
@@ -86,39 +81,34 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
 
     if c == "rice":
         if v == "dawat":
-            return "Dawat_rice", 0.10
+            return "Dawat_rice", 0.20
         if v == "tibar":
-            return "rice", 0.10
+            return "rice", 0.30
         if v in ("gr1-ri01-st2", "gr1-ri01-rw1"):
-            return "stem_rice", 0.20
-        if v == "gr1-ri01-sl3":
-            return "brown_rice", 0.10
-        if v == "brown_rice":
+            return "stem_rice", 0.30
+        if v in ("gr1-ri01-sl3", "brown_rice"):
             return "brown_rice", 0.10
         # Legacy falls through the rice branch to the bottom default.
         return "stem_rice", 0.40
 
     table = {
-        "chana_dal": ("chanadal", 0.10),
-        "toor_dal": ("chanadal", 0.10),
+        "chana_dal": ("chanadal", 0.20),
+        "toor_dal": ("toor", 0.10),
         "moong_dal": ("chanadal", 0.10),
-        "urad_white": ("urad_dal", 0.10),
+        "urad_white": ("chanadal", 0.10),
         "masoor_malka": ("masoor_mlka", 0.20),
         "kabuli_chana": ("kabuli_chana", 0.30),
-        "moong_whole": ("green_moong_dal", 0.10),
+        "moong_whole": ("moong_whole", 0.20),
         "urad_whole_black": ("urad_dal", 0.30),
         "toor": ("toor", 0.10),
-        "masoor_red_whole": ("masoor_red_whole", 0.10),
+        "masoor_red_whole": ("masoor_dal", 0.10),
         "lobia": ("lobia", 0.10),
         "chitra_rajma": ("chitra_rajma", 0.30),
-        "black_chana": ("Black_chana", 0.10),
+        "black_chana": ("Black_chana", 0.32),
         "dalia": ("Rosted_chana", 0.40),
-        # 15 June 2026 additions
         "white_peas": ("white_peas", 0.10),
         "moth_dal": ("moth_dal", 0.10),
         "sabudana": ("sabudana", 0.10),
-        "green_moong_dal": ("green_moong_dal", 0.10),
-        "sonamasoori_rice": ("sona_masoori_rice", 0.25),
     }
 
     if c in table:
