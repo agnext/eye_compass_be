@@ -427,6 +427,27 @@ def stop_belt():
     return {"success": True, **scan_session.status()}
 
 
+@router.post("/recover")
+def recover_scan():
+    """Operator pressed the Recover button on the live scan screen.
+
+    Clears a wedged live view — a stuck capture pause and/or an interlock left
+    locked with nothing to review (e.g. a manual Stop that raced an FM
+    detection's settle cycle) — and returns the live feed, continuing the SAME
+    batch. Nothing about the batch is reset; see scan_session.force_recover().
+
+    DELIBERATELY DOES NOT MOVE THE BELT. An earlier version sent machine_start
+    here, so "unfreeze my screen" also started a conveyor — a physical hazard
+    when the operator had just pressed Stop, was clearing material, or had a
+    hand near the belt. Starting the belt must stay an explicit Start press.
+    """
+    if not scan_session.active:
+        raise HTTPException(status_code=409, detail="No active scan to recover")
+    status = scan_session.force_recover()
+    _checkpoint()
+    return {"success": True, "conveyor_started": False, **status}
+
+
 @router.post("/cancel")
 def cancel_scan():
     """Discard the run without submitting. Port of cancel_result (main.py:2033-2052).

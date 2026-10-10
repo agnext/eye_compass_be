@@ -2001,6 +2001,54 @@ class ScanSession:
         self.resume_capture()
         return {"resumed": True, **self.status()}
 
+    def force_recover(self) -> Dict:
+        """Operator-initiated 'unstick' — the one-button equivalent of the
+        Stop-then-Start workaround, without resetting the batch.
+
+        The live stream can wedge with capture_paused stuck True: a detection
+        review that never got resumed (a dropped websocket mid-review, a
+        promote that left pending set with nothing the client could act on),
+        or a settle/sample cycle that never completed. The stream loop then
+        sits in its paused branch resending one frozen frame, the socket stays
+        healthy so the browser never reconnects, and the feed looks frozen.
+
+        This abandons whatever half-finished review is on screen (the operator
+        is explicitly giving up on it) and returns the live view for the SAME
+        batch: no counters, folders, tracker totals, or prior FM count are
+        touched. Counting resumes from where it was.
+
+        The BELT IS LEFT STOPPED — this only unwedges software state. Starting
+        the conveyor stays an explicit Start press, never a side effect of
+        asking for the screen to be unfrozen.
+
+        Purely additive: nothing else calls this, and it reuses the same
+        primitives (resume_capture, unlock_machine_start) the normal
+        Start/resume paths already use.
+        """
+        with self._lock:
+            # Drop any in-flight review / queue / trigger state so a stale
+            # frozen frame cannot immediately re-pause the stream.
+            self.pending = []
+            self.pending_frame = None
+            self.labelled_indices = set()
+            self.detection_queue = []
+            self._samples = []
+            self._trigger = None
+            self.review_phase = "idle"
+            # The belt is deliberately left stopped (see the /recover route's
+            # own note), so suspend detection until the operator presses Start
+            # — exactly as resume() does. Without this the live view would come
+            # back on a stationary belt and immediately re-detect the objects
+            # still sitting in frame, re-locking the interlock just cleared.
+            self.detection_suspended = True
+            self.accumulate_stop_times()
+        # Outside the lock, same as resume(): release the interlock and clear
+        # the pause so the live feed comes back.
+        conveyor_service.unlock_machine_start(reason="operator recovery (unstick)")
+        self.resume_capture()
+        logger.info("Scan recovered via operator unstick: sample=%s", self.sample_id)
+        return self.status()
+
     def cancel(self) -> Dict:
         """Discard the run — archive its crops, don't delete them.
 

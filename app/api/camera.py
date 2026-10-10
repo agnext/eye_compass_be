@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import json
 import logging
 import os
 import re
+import struct
 import threading
 import time
 
@@ -38,6 +40,31 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 ws_router = APIRouter()
+
+# How long the interlock may stay LOCKED with nothing to review before the
+# stream loop treats it as wedged and clears it. Comfortably longer than the
+# ~1-2s a normal detection takes to settle and put its review on screen, so
+# only a genuine deadlock ever reaches it. See the self-heal block in
+# camera_stream's paused branch.
+STUCK_LOCK_SECONDS = 8.0
+
+
+def _pack_frame(header: dict, jpeg: bytes) -> bytes:
+    """One binary websocket message carrying a frame AND the state describing it.
+
+    Layout: 4-byte big-endian header length, the header as UTF-8 JSON, then the
+    raw JPEG bytes.
+
+    The JPEG goes as raw bytes rather than base64 inside JSON so the browser
+    can decode it straight to a bitmap, paint it, and release it at once -
+    nothing per frame is left behind for the browser to cache.
+
+    Header and image stay in ONE message on purpose: the boxes in `pending` are
+    drawn over exactly this image, so the two must never be able to arrive
+    apart or be paired with the wrong neighbour.
+    """
+    head = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return struct.pack(">I", len(head)) + head + jpeg
 
 # ---------------------------------------------------------------------------
 # Services. The camera and the TensorRT context are single physical resources,
@@ -125,7 +152,18 @@ def shutdown_camera_services():
     see the note above _hw_executor. The executor is shut down afterward so
     that worker thread actually exits once the context is popped.
     """
-    global _camera, _inference, _camera_initialized
+    global _camera, _inference, _camera_initialized, _engine_stopping
+
+    # The stream engine can outlive every browser, so nothing else ends it at
+    # shutdown. Stop it first, or it would go on asking for frames from a
+    # camera that is about to be closed.
+    _engine_stopping = True
+    task = _engine_task
+    if task is not None and not task.done():
+        try:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass  # loop already closed
 
     def _do_shutdown():
         with _hardware_lock:
@@ -155,7 +193,468 @@ def camera_health() -> dict:
         "initialized": _camera_initialized,
         "model_loaded": bool(_inference and _inference.is_loaded),
         "stream_clients": _stream_clients,
+        "stream_engine_running": bool(_engine_task and not _engine_task.done()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Stream engine
+#
+# ONE loop grabs frames, runs inference and feeds the detection state machine,
+# however many browsers are watching - including none. Browsers are only
+# subscribers: each gets its own small outbox and its own sender task, and the
+# engine never waits on a browser.
+#
+# It used to be the other way round: the loop lived inside each websocket
+# handler and awaited every send, so the detector ran at the pace of the
+# slowest screen. A kiosk browser that stopped reading (out of memory, swapping)
+# stopped the grab loop with it - no detection and no saved frames while the
+# belt kept running - and a second tab meant a second loop feeding the same
+# tracker.
+# ---------------------------------------------------------------------------
+
+# How long one send to a browser may take before that browser is given up on.
+# Generous on purpose: a full-resolution review frame over a slow remote link
+# can legitimately take many seconds. It exists so a connection that has gone
+# away without closing cannot stay subscribed, and keep the engine running,
+# for ever. A browser dropped this way reconnects by itself when it recovers.
+STREAM_SEND_TIMEOUT = 60.0
+
+
+class _Subscriber:
+    """One connected browser's outbox.
+
+    Holds at most ONE frame message and ONE state message, so a browser that
+    falls behind costs a fixed amount of memory and simply skips the frames it
+    was too slow for - it can never build a backlog and never slows the engine.
+
+    The two slots keep the order the engine produced them in: a new frame
+    supersedes everything before it (an older state would describe an older
+    picture), while a state arriving after a frame is kept alongside it and is
+    sent after it. So the review frame, which is only ever produced once per
+    review screen, is not lost to the state ticks that follow it.
+    """
+
+    __slots__ = ("frame", "state", "wake", "sent_frozen_seq", "kicked")
+
+    def __init__(self):
+        self.frame = None
+        self.state = None
+        self.wake = asyncio.Event()
+        # Which frozen review frame this browser has already been sent. Per
+        # browser, so one that connects (or reconnects) in the middle of a
+        # review still gets the frame under review.
+        self.sent_frozen_seq = None
+        self.kicked = False
+
+    def put_frame(self, message: bytes):
+        self.frame = message
+        self.state = None
+        self.wake.set()
+
+    def put_state(self, payload: dict):
+        self.state = payload
+        self.wake.set()
+
+    def kick(self):
+        self.kicked = True
+        self.wake.set()
+
+
+# Touched only from the event loop thread.
+_subscribers: set = set()
+_engine_task = None
+_engine_stopping = False
+# Browsers on the Data Collection preview, which grabs from the same camera.
+_dc_clients = 0
+
+
+def _detection_armed() -> bool:
+    """True while the belt has been started under detection and not stopped.
+
+    This is the one situation in which the engine keeps running with no browser
+    connected: material is moving under the camera, so it still has to be
+    inspected (and the belt stopped on a detection) whether or not a screen is
+    there to show it. A scan becomes active on the Start press; a manual Stop
+    or a detection pauses capture; after a review the scan stays suspended
+    until Start is pressed again.
+
+    Not while the Data Collection preview is open, though: it grabs from the
+    same camera, and two loops would each get only some of the frames.
+    """
+    return (scan_session.active
+            and not scan_session.capture_paused
+            and not scan_session.detection_suspended
+            and _dc_clients == 0)
+
+
+def _ensure_engine():
+    """Start the engine if it is not running. Call from the event loop."""
+    global _engine_task
+    if _engine_stopping:
+        return
+    if _engine_task is None or _engine_task.done():
+        _engine_task = asyncio.get_running_loop().create_task(_stream_engine())
+
+
+async def _stream_engine():
+    """Grab -> infer -> detect, and hand the result to whoever is subscribed.
+
+    Runs while at least one browser is subscribed, or while detection is armed
+    (see _detection_armed). Ends by itself otherwise, exactly as the old
+    per-connection loop ended when its browser left; the next connection
+    starts it again.
+    """
+    loop = asyncio.get_running_loop()
+    logger.info("Stream engine started")
+
+    frame_interval = 1.0 / max(1, settings.STREAM_FPS)
+    decimation = max(1, settings.CAMERA_FRAME_DECIMATION)
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.STREAM_JPEG_QUALITY]
+
+    fps_counter = 0
+    fps_timer = time.time()
+    current_fps = 0.0
+    fps_log_timer = time.time()
+    raw_frame_index = 0
+    # Per-stage latency, accumulated between the periodic FPS logs so the
+    # same 10s log line also shows where the time within each inferred
+    # frame actually goes (grab vs. inference vs. the detection/crop logic).
+    stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
+    stage_count = 0
+    # The frozen review frame, encoded once and reused for every browser that
+    # still needs it. Keyed by frozen_frame_seq rather than a bool "already
+    # sent it": a queued detection is promoted while capture stays paused
+    # throughout, so the frame changes without the pause ever ending.
+    review_cache = None
+    review_cache_seq = None
+    was_paused = False
+    last_sent = 0.0
+    # When the interlock was first seen LOCKED with nothing to review. See the
+    # self-heal block in the paused branch below.
+    stuck_lock_since = None
+    # Whether the engine is currently running with no browser connected.
+    headless = False
+
+    def encode_display(img):
+        out = img
+        if settings.STREAM_MAX_WIDTH and out.shape[1] > settings.STREAM_MAX_WIDTH:
+            scale = settings.STREAM_MAX_WIDTH / out.shape[1]
+            out = cv2.resize(out, (settings.STREAM_MAX_WIDTH, int(out.shape[0] * scale)))
+        ok, buf = cv2.imencode(".jpg", out, encode_params)
+        if not ok:
+            return None
+        return buf.tobytes(), int(out.shape[1]), int(out.shape[0])
+
+    def encode_review(img):
+        """The frozen review frame — full resolution, no width cap.
+
+        Everything else goes through encode_display, which caps at
+        STREAM_MAX_WIDTH to keep the live stream affordable. This one is
+        encoded once per review screen, with the belt already stopped, and the
+        review panel cuts each object's thumbnail straight out of it on the
+        client. Capped at 1280 a ~70px object would arrive as ~47px and be
+        magnified from there; at full width it is the real thing.
+        """
+        ok, buf = cv2.imencode(
+            ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, settings.REVIEW_JPEG_QUALITY])
+        if not ok:
+            return None
+        return buf.tobytes(), int(img.shape[1]), int(img.shape[0])
+
+    # Grab and infer are separate steps, each taking the lock for its
+    # own single-owner resource (the camera handle, the TensorRT
+    # context), so a frame about to be decimated away never reaches
+    # inference at all. Both must still run on _hw_executor rather than
+    # the default pool — see the note above _hw_executor's definition.
+    def grab():
+        with _hardware_lock:
+            return _camera.grab_frame()
+
+    def infer(img):
+        with _hardware_lock:
+            return _inference.predict(img)
+
+    try:
+        while not _engine_stopping:
+            if not _subscribers:
+                if not _detection_armed():
+                    break
+                if not headless:
+                    headless = True
+                    logger.warning(
+                        "No browser is connected but the scan is running — "
+                        "detection continues without a viewer"
+                    )
+            elif headless:
+                headless = False
+                logger.info("A browser is connected again")
+
+            try:
+                # Port of cam_thread.capture_paused (GrabImage.py:95): while a
+                # detection is under review, or the belt has been stopped, legacy
+                # grabs no frames at all — so no inference runs, no track ids are
+                # minted, and the operator reviews a frame frozen at the moment of
+                # detection. Streaming live frames here instead would (a) keep
+                # producing detections off a stationary belt and (b) leave the
+                # box overlay drawn over a newer frame than it was computed on.
+                if scan_session.capture_paused:
+                    # Self-heal the one state the operator cannot get out of:
+                    # capture paused AND the interlock locked AND nothing to
+                    # review. A manual Stop landing in the same moment as an FM
+                    # detection leaves exactly this — Stop pauses capture, so the
+                    # detection's "look again once it settles" cycle never gets
+                    # the frames it needs, never emits a review, and never
+                    # unlocks. The belt stays locked forever and the UI disables
+                    # both Start and Stop.
+                    #
+                    # A real review always has pending (or a queue) behind it, and
+                    # a plain manual Stop never locks the interlock, so this
+                    # combination is unambiguous. The delay keeps the normal
+                    # ~1-2s settle window from ever tripping it.
+                    if (conveyor_service.machine_start_locked
+                            and not scan_session.pending
+                            and not scan_session.detection_queue):
+                        if stuck_lock_since is None:
+                            stuck_lock_since = time.time()
+                        elif time.time() - stuck_lock_since > STUCK_LOCK_SECONDS:
+                            logger.warning(
+                                "Interlock locked with nothing to review for %.0fs "
+                                "— clearing it (a manual Stop most likely raced an "
+                                "FM detection). The belt is left stopped; press "
+                                "Start to resume.",
+                                time.time() - stuck_lock_since,
+                            )
+                            scan_session.force_recover()
+                            stuck_lock_since = None
+                    else:
+                        stuck_lock_since = None
+
+                    payload = {"fps": 0.0, **scan_session.live_state()}
+                    was_paused = True
+                    frozen_seq = scan_session.frozen_frame_seq
+                    if review_cache_seq != frozen_seq:
+                        review_cache = None
+                        review_cache_seq = frozen_seq
+                    waiting = [s for s in _subscribers if s.sent_frozen_seq != frozen_seq]
+                    if waiting and review_cache is None:
+                        frozen = scan_session.pending_frame
+                        if frozen is not None:
+                            enc = await loop.run_in_executor(None, encode_review, frozen)
+                            if enc:
+                                review_cache = enc + (
+                                    int(frozen.shape[1]), int(frozen.shape[0]))
+                    review_message = None
+                    if waiting and review_cache is not None:
+                        review_jpeg, disp_w, disp_h, src_w, src_h = review_cache
+                        review_message = _pack_frame({
+                            **payload,
+                            "kind": "review",
+                            "frame_width": disp_w,
+                            "frame_height": disp_h,
+                            "source_width": src_w,
+                            "source_height": src_h,
+                            "detections": [],
+                        }, review_jpeg)
+                    for sub in list(_subscribers):
+                        if sub.sent_frozen_seq != frozen_seq:
+                            # Marked as sent even when there is no frame to
+                            # send (e.g. a manual STOP has no pending_frame):
+                            # the browser then gets no frame at all and simply
+                            # holds the last one it has.
+                            sub.sent_frozen_seq = frozen_seq
+                            if review_message is not None:
+                                sub.put_frame(review_message)
+                                continue
+                        sub.put_state(payload)
+                    await asyncio.sleep(0.2)
+                    continue
+
+                # Capture is live, so nothing is wedged — drop any pending
+                # stuck-lock timer (a lock held while grabbing is a normal
+                # in-flight detection, not the deadlock).
+                stuck_lock_since = None
+
+                if was_paused:
+                    # Just resumed — don't average the paused interval into FPS.
+                    was_paused = False
+                    review_cache = None
+                    review_cache_seq = None
+                    for sub in _subscribers:
+                        sub.sent_frozen_seq = None
+                    fps_counter = 0
+                    fps_timer = time.time()
+                    last_sent = 0.0
+
+                _t_grab_start = time.perf_counter()
+                frame = await loop.run_in_executor(_hw_executor, grab)
+                _t_grab_end = time.perf_counter()
+                if frame is None:
+                    await asyncio.sleep(0.02)
+                    continue
+
+                if settings.USE_MOCK_CAMERA:
+                    # The real camera's grab blocks until the sensor delivers,
+                    # which is what paces this loop on the device. The mock returns
+                    # instantly, so it needs pacing of its own or the loop spins a
+                    # core flat out now that nothing else throttles it.
+                    await asyncio.sleep(frame_interval / decimation)
+
+                raw_frame_index += 1
+                # Legacy processed every 2nd frame (GrabImage.py:117). The check
+                # sits BEFORE inference rather than after it: running predict() and
+                # then discarding the result spends a full TensorRT pass on a frame
+                # nothing ever looks at, halving the detection rate the GPU could
+                # otherwise sustain. Set CAMERA_FRAME_DECIMATION=1 to feed the
+                # tracker every frame the camera delivers.
+                if raw_frame_index % decimation != 0:
+                    continue
+
+                _t_infer_start = time.perf_counter()
+                detections, annotated = await loop.run_in_executor(_hw_executor, infer, frame)
+                _t_infer_end = time.perf_counter()
+
+                # Detection state machine — belt stop, interlock, crops, counting.
+                state = await loop.run_in_executor(
+                    None, scan_session.process_frame, frame, detections
+                )
+                _t_process_end = time.perf_counter()
+
+                stage_totals["grab"] += _t_grab_end - _t_grab_start
+                stage_totals["infer"] += _t_infer_end - _t_infer_start
+                stage_totals["process"] += _t_process_end - _t_infer_end
+                stage_count += 1
+
+                # Counts frames actually put through detection, which is the rate
+                # that matters for whether an object can cross the view unseen —
+                # it is no longer the same as the rate frames reach the browser.
+                fps_counter += 1
+                elapsed = time.time() - fps_timer
+                if elapsed >= 1.0:
+                    current_fps = fps_counter / elapsed
+                    fps_counter = 0
+                    fps_timer = time.time()
+                    # The detection rate only existed in the websocket payload,
+                    # which means it could only ever be read off a browser that
+                    # happened to be open at the time. It decides whether an object
+                    # can cross the view unseen, so it belongs in the journal
+                    # alongside everything else about a scan. Every 10s, not every
+                    # second, so it stays readable next to the detection lines.
+                    if time.time() - fps_log_timer >= 10.0:
+                        fps_log_timer = time.time()
+                        logger.info(
+                            "Detection rate: %.1f fps (decimation=%s, "
+                            "%.0f ms per inferred frame)",
+                            current_fps, decimation,
+                            1000.0 / current_fps if current_fps else 0,
+                        )
+                        if stage_count:
+                            logger.info(
+                                "Latency breakdown (avg over %d frames): "
+                                "grab=%.0f ms, infer=%.0f ms, process=%.0f ms, "
+                                "total=%.0f ms",
+                                stage_count,
+                                1000.0 * stage_totals["grab"] / stage_count,
+                                1000.0 * stage_totals["infer"] / stage_count,
+                                1000.0 * stage_totals["process"] / stage_count,
+                                1000.0 * sum(stage_totals.values()) / stage_count,
+                            )
+                        stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
+                        stage_count = 0
+
+                # Detection is done for this frame. Everything below is only
+                # about showing it, so with nobody watching there is nothing
+                # left to do.
+                if not _subscribers:
+                    continue
+
+                # Display is throttled to STREAM_FPS; DETECTION is not. This loop
+                # used to sleep out the remainder of a STREAM_FPS interval on every
+                # iteration, which pinned the tracker's input rate to the browser's
+                # refresh rate — at STREAM_FPS=20 with decimation 2 that is 10 Hz,
+                # few enough frames that a small object can cross the field of view
+                # in one or two of them, or between two of them. The operator does
+                # not need more than STREAM_FPS frames a second; the tracker needs
+                # every frame it can get.
+                now = time.time()
+                # A detection that has just stopped the belt goes out immediately
+                # instead of waiting out the display interval — that frame is the
+                # one the operator reviews, and pause_capture freezes the stream on
+                # it a moment later.
+                if not state.get("fm_detected") and now - last_sent < frame_interval:
+                    continue
+                last_sent = now
+
+                # Encoded off the event loop, as the paused branch above already
+                # does: a full-resolution JPEG encode inline stalls the next grab,
+                # which is the one thing this loop cannot afford.
+                enc = await loop.run_in_executor(
+                    None, encode_display, annotated if annotated is not None else frame
+                )
+                if enc is None:
+                    continue
+                jpeg, display_width, display_height = enc
+
+                # Packed once and handed to every outbox. Nothing here waits on
+                # a browser: a slow one just has this frame replaced by the
+                # next before it was ever sent.
+                message = _pack_frame({
+                    "kind": "live",
+                    "frame_width": display_width,
+                    "frame_height": display_height,
+                    "source_width": int(frame.shape[1]),
+                    "source_height": int(frame.shape[0]),
+                    "detections": [[float(v) for v in d] for d in (detections or [])],
+                    "fps": round(current_fps, 1),
+                    **state,
+                }, jpeg)
+                for sub in list(_subscribers):
+                    sub.put_frame(message)
+
+            except Exception:
+                # The old per-connection loop ended on any error and closed its
+                # websocket, and the browser reconnected a few seconds later.
+                # Same here: connected browsers are dropped so they reconnect.
+                # If detection is armed the loop carries on after a pause
+                # rather than leaving a moving belt uninspected.
+                if _engine_stopping:
+                    break
+                logger.exception("Stream engine error")
+                for sub in list(_subscribers):
+                    sub.kick()
+                _subscribers.clear()
+                await asyncio.sleep(1.0)
+    finally:
+        logger.info("Stream engine stopped")
+
+
+async def _pump(websocket: WebSocket, sub: _Subscriber):
+    """Send one browser whatever is in its outbox, at that browser's own pace.
+
+    This is the only place that waits on a browser. While a send is in flight
+    the engine keeps overwriting the outbox, so when the send completes the
+    next thing to go out is the newest frame, not the next one in a queue.
+    """
+    while True:
+        await sub.wake.wait()
+        sub.wake.clear()
+        if sub.kicked:
+            return
+        frame, sub.frame = sub.frame, None
+        state, sub.state = sub.state, None
+        if frame is not None:
+            await asyncio.wait_for(websocket.send_bytes(frame), STREAM_SEND_TIMEOUT)
+        if state is not None:
+            await asyncio.wait_for(websocket.send_json(state), STREAM_SEND_TIMEOUT)
+
+
+async def _wait_for_disconnect(websocket: WebSocket):
+    """Return when the browser closes the socket. The page never sends
+    anything on this stream, so anything else that arrives is ignored."""
+    while True:
+        message = await websocket.receive()
+        if message.get("type") == "websocket.disconnect":
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -164,19 +663,31 @@ def camera_health() -> dict:
 
 @ws_router.websocket("/ws/camera/stream")
 async def camera_stream(websocket: WebSocket):
-    """Stream annotated JPEG frames plus the live scan state.
+    """Stream JPEG frames plus the live scan state.
 
-    Message shape:
-        {
-          "frame": "<base64 jpeg>",
-          "detections": [[x1,y1,x2,y2,conf,cls], ...],
-          "fm_detected": bool,          # belt has just been stopped
-          "pending": [ {index, box, confidence, class_id}, ... ],
-          "awaiting_label": [int, ...],
-          "total_fo_detected": int,     # unique objects for the whole run
-          "machine_start_locked": bool,
-          "fps": float
-        }
+    This handler does no grabbing or detecting of its own: it subscribes the
+    browser to the stream engine above and forwards what the engine produces.
+
+    Two kinds of message, told apart by websocket frame type:
+
+    * BINARY - a frame and the state that describes it, packed by
+      _pack_frame(): 4-byte big-endian header length, JSON header, JPEG bytes.
+      The header is the scan-state snapshot (fm_detected, frame_fm_count,
+      total_fo_detected, frame_count, machine_start_locked, capture_paused,
+      pending, queue_depth, labelled, awaiting_label) plus:
+          kind           "live"   - annotated display frame, width-capped
+                         "review" - the frozen frame under review, full size
+          frame_width, frame_height    size of the JPEG itself
+          source_width, source_height  sensor size; `pending` boxes are in
+                                       these coordinates
+          detections     [[x1,y1,x2,y2,conf,cls], ...]
+          fps            detection rate
+      A review frame is sent once per review screen, not repeatedly.
+
+    * TEXT (JSON) - no frame: {"error": ...} before closing, {"warning": ...}
+      once at connect, and the state snapshot alone (with "fps": 0.0) about
+      five times a second while capture is paused. A paused message without a
+      frame means "keep showing the frame you have".
     """
     global _stream_clients
 
@@ -197,234 +708,47 @@ async def camera_stream(websocket: WebSocket):
                        "with the commodity and variety before starting a scan."
         })
 
+    sub = _Subscriber()
+    _subscribers.add(sub)
     with _clients_lock:
         _stream_clients += 1
+    _ensure_engine()
 
-    frame_interval = 1.0 / max(1, settings.STREAM_FPS)
-    decimation = max(1, settings.CAMERA_FRAME_DECIMATION)
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.STREAM_JPEG_QUALITY]
-
-    fps_counter = 0
-    fps_timer = time.time()
-    current_fps = 0.0
-    fps_log_timer = time.time()
-    raw_frame_index = 0
-    # Per-stage latency, accumulated between the periodic FPS logs so the
-    # same 10s log line also shows where the time within each inferred
-    # frame actually goes (grab vs. inference vs. the detection/crop logic).
-    stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
-    stage_count = 0
-    # Which frozen review frame has already gone out, and whether the previous
-    # iteration was a paused one. A bool "already sent it" is not enough: a
-    # queued detection is promoted while capture stays paused throughout, so
-    # the frame changes without the pause ever ending.
-    sent_frozen_seq = None
-    was_paused = False
-    last_sent = 0.0
-
-    def encode_display(img):
-        out = img
-        if settings.STREAM_MAX_WIDTH and out.shape[1] > settings.STREAM_MAX_WIDTH:
-            scale = settings.STREAM_MAX_WIDTH / out.shape[1]
-            out = cv2.resize(out, (settings.STREAM_MAX_WIDTH, int(out.shape[0] * scale)))
-        ok, buf = cv2.imencode(".jpg", out, encode_params)
-        if not ok:
-            return None
-        return base64.b64encode(buf).decode("utf-8"), int(out.shape[1]), int(out.shape[0])
-
-    def encode_review(img):
-        """The frozen review frame — full resolution, no width cap.
-
-        Everything else goes through encode_display, which caps at
-        STREAM_MAX_WIDTH to keep the live stream affordable. This one is
-        encoded once per review screen, with the belt already stopped, and the
-        review panel cuts each object's thumbnail straight out of it on the
-        client. Capped at 1280 a ~70px object would arrive as ~47px and be
-        magnified from there; at full width it is the real thing.
-        """
-        ok, buf = cv2.imencode(
-            ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, settings.REVIEW_JPEG_QUALITY])
-        if not ok:
-            return None
-        return (base64.b64encode(buf).decode("utf-8"),
-                int(img.shape[1]), int(img.shape[0]))
-
+    pump = asyncio.ensure_future(_pump(websocket, sub))
+    watch = asyncio.ensure_future(_wait_for_disconnect(websocket))
     try:
-        while True:
-            # Port of cam_thread.capture_paused (GrabImage.py:95): while a
-            # detection is under review, or the belt has been stopped, legacy
-            # grabs no frames at all — so no inference runs, no track ids are
-            # minted, and the operator reviews a frame frozen at the moment of
-            # detection. Streaming live frames here instead would (a) keep
-            # producing detections off a stationary belt and (b) leave the
-            # box overlay drawn over a newer frame than it was computed on.
-            if scan_session.capture_paused:
-                payload = {"fps": 0.0, **scan_session.live_state()}
-                was_paused = True
-                frozen_seq = scan_session.frozen_frame_seq
-                if sent_frozen_seq != frozen_seq:
-                    frozen = scan_session.pending_frame
-                    if frozen is not None:
-                        enc = await loop.run_in_executor(None, encode_review, frozen)
-                        if enc:
-                            b64, disp_w, disp_h = enc
-                            payload.update({
-                                "frame": b64,
-                                "frame_width": disp_w,
-                                "frame_height": disp_h,
-                                "source_width": int(frozen.shape[1]),
-                                "source_height": int(frozen.shape[0]),
-                                "detections": [],
-                            })
-                    # No pending_frame (e.g. a manual STOP): send no frame at
-                    # all, so the client simply holds the last one it has.
-                    sent_frozen_seq = frozen_seq
-                await websocket.send_json(payload)
-                await asyncio.sleep(0.2)
-                continue
-
-            if was_paused:
-                # Just resumed — don't average the paused interval into FPS.
-                was_paused = False
-                sent_frozen_seq = None
-                fps_counter = 0
-                fps_timer = time.time()
-                last_sent = 0.0
-
-            # Grab and infer are separate steps, each taking the lock for its
-            # own single-owner resource (the camera handle, the TensorRT
-            # context), so a frame about to be decimated away never reaches
-            # inference at all. Both must still run on _hw_executor rather than
-            # the default pool — see the note above _hw_executor's definition.
-            def grab():
-                with _hardware_lock:
-                    return _camera.grab_frame()
-
-            def infer(img):
-                with _hardware_lock:
-                    return _inference.predict(img)
-
-            _t_grab_start = time.perf_counter()
-            frame = await loop.run_in_executor(_hw_executor, grab)
-            _t_grab_end = time.perf_counter()
-            if frame is None:
-                await asyncio.sleep(0.02)
-                continue
-
-            if settings.USE_MOCK_CAMERA:
-                # The real camera's grab blocks until the sensor delivers,
-                # which is what paces this loop on the device. The mock returns
-                # instantly, so it needs pacing of its own or the loop spins a
-                # core flat out now that nothing else throttles it.
-                await asyncio.sleep(frame_interval / decimation)
-
-            raw_frame_index += 1
-            # Legacy processed every 2nd frame (GrabImage.py:117). The check
-            # sits BEFORE inference rather than after it: running predict() and
-            # then discarding the result spends a full TensorRT pass on a frame
-            # nothing ever looks at, halving the detection rate the GPU could
-            # otherwise sustain. Set CAMERA_FRAME_DECIMATION=1 to feed the
-            # tracker every frame the camera delivers.
-            if raw_frame_index % decimation != 0:
-                continue
-
-            _t_infer_start = time.perf_counter()
-            detections, annotated = await loop.run_in_executor(_hw_executor, infer, frame)
-            _t_infer_end = time.perf_counter()
-
-            # Detection state machine — belt stop, interlock, crops, counting.
-            state = await loop.run_in_executor(
-                None, scan_session.process_frame, frame, detections
-            )
-            _t_process_end = time.perf_counter()
-
-            stage_totals["grab"] += _t_grab_end - _t_grab_start
-            stage_totals["infer"] += _t_infer_end - _t_infer_start
-            stage_totals["process"] += _t_process_end - _t_infer_end
-            stage_count += 1
-
-            # Counts frames actually put through detection, which is the rate
-            # that matters for whether an object can cross the view unseen —
-            # it is no longer the same as the rate frames reach the browser.
-            fps_counter += 1
-            elapsed = time.time() - fps_timer
-            if elapsed >= 1.0:
-                current_fps = fps_counter / elapsed
-                fps_counter = 0
-                fps_timer = time.time()
-                # The detection rate only existed in the websocket payload,
-                # which means it could only ever be read off a browser that
-                # happened to be open at the time. It decides whether an object
-                # can cross the view unseen, so it belongs in the journal
-                # alongside everything else about a scan. Every 10s, not every
-                # second, so it stays readable next to the detection lines.
-                if time.time() - fps_log_timer >= 10.0:
-                    fps_log_timer = time.time()
-                    logger.info(
-                        "Detection rate: %.1f fps (decimation=%s, "
-                        "%.0f ms per inferred frame)",
-                        current_fps, decimation,
-                        1000.0 / current_fps if current_fps else 0,
-                    )
-                    if stage_count:
-                        logger.info(
-                            "Latency breakdown (avg over %d frames): "
-                            "grab=%.0f ms, infer=%.0f ms, process=%.0f ms, "
-                            "total=%.0f ms",
-                            stage_count,
-                            1000.0 * stage_totals["grab"] / stage_count,
-                            1000.0 * stage_totals["infer"] / stage_count,
-                            1000.0 * stage_totals["process"] / stage_count,
-                            1000.0 * sum(stage_totals.values()) / stage_count,
-                        )
-                    stage_totals = {"grab": 0.0, "infer": 0.0, "process": 0.0}
-                    stage_count = 0
-
-            # Display is throttled to STREAM_FPS; DETECTION is not. This loop
-            # used to sleep out the remainder of a STREAM_FPS interval on every
-            # iteration, which pinned the tracker's input rate to the browser's
-            # refresh rate — at STREAM_FPS=20 with decimation 2 that is 10 Hz,
-            # few enough frames that a small object can cross the field of view
-            # in one or two of them, or between two of them. The operator does
-            # not need more than STREAM_FPS frames a second; the tracker needs
-            # every frame it can get.
-            now = time.time()
-            # A detection that has just stopped the belt goes out immediately
-            # instead of waiting out the display interval — that frame is the
-            # one the operator reviews, and pause_capture freezes the stream on
-            # it a moment later.
-            if not state.get("fm_detected") and now - last_sent < frame_interval:
-                continue
-            last_sent = now
-
-            # Encoded off the event loop, as the paused branch above already
-            # does: a full-resolution JPEG encode inline stalls the next grab,
-            # which is the one thing this loop cannot afford.
-            enc = await loop.run_in_executor(
-                None, encode_display, annotated if annotated is not None else frame
-            )
-            if enc is None:
-                continue
-            b64_frame, display_width, display_height = enc
-
-            await websocket.send_json({
-                "frame": b64_frame,
-                "frame_width": display_width,
-                "frame_height": display_height,
-                "source_width": int(frame.shape[1]),
-                "source_height": int(frame.shape[0]),
-                "detections": [[float(v) for v in d] for d in (detections or [])],
-                "fps": round(current_fps, 1),
-                **state,
-            })
-
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
-    except Exception as exc:
-        logger.error("WebSocket error: %s", exc)
+        done, _ = await asyncio.wait({pump, watch}, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            exc = task.exception()
+            if exc is None:
+                if task is watch:
+                    logger.info("WebSocket client disconnected")
+            elif isinstance(exc, WebSocketDisconnect):
+                logger.info("WebSocket client disconnected")
+            elif isinstance(exc, asyncio.TimeoutError):
+                logger.warning(
+                    "Stream client took no data for %.0fs — dropping it "
+                    "(detection is unaffected; the browser reconnects by itself)",
+                    STREAM_SEND_TIMEOUT,
+                )
+            else:
+                logger.error("WebSocket error: %s", exc)
     finally:
+        _subscribers.discard(sub)
         with _clients_lock:
             _stream_clients -= 1
+        for task in (pump, watch):
+            task.cancel()
+        await asyncio.gather(pump, watch, return_exceptions=True)
+        # The server does not close a websocket just because its handler
+        # returns. Without this, a browser dropped from this side (engine
+        # error, send timeout) would sit on a silent, still-open connection
+        # instead of seeing it close and reconnecting. Bounded, because a
+        # browser that is not reading cannot be sent a close frame either.
+        try:
+            await asyncio.wait_for(websocket.close(), 2.0)
+        except Exception:
+            pass
         logger.info("WebSocket stream ended")
 
 
@@ -444,7 +768,7 @@ async def data_collection_stream(websocket: WebSocket):
     `_dc_recording`; only the disk write (the actual "data collection" part)
     stays gated on it, unchanged from before.
     """
-    global _dc_frame_count
+    global _dc_frame_count, _dc_clients
 
     await websocket.accept()
     logger.info("WebSocket client connected to /ws/data_collection/stream")
@@ -458,6 +782,9 @@ async def data_collection_stream(websocket: WebSocket):
 
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.STREAM_JPEG_QUALITY]
 
+    # Counted so the scan stream engine does not keep grabbing from the same
+    # camera with no viewer while this page is open — see _detection_armed.
+    _dc_clients += 1
     try:
         while True:
             def grab_and_maybe_save():
@@ -496,6 +823,8 @@ async def data_collection_stream(websocket: WebSocket):
         logger.info("WebSocket client disconnected from data collection stream")
     except Exception as exc:
         logger.error("Data collection WebSocket error: %s", exc)
+    finally:
+        _dc_clients -= 1
 
 
 # ---------------------------------------------------------------------------

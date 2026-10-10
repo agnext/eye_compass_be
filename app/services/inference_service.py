@@ -53,7 +53,7 @@ MODEL_REGISTRY = {
     "lobia": "Lobia_v1.2_0.optimized",
     "chitra_rajma": "Rajm_new_4.optimized",
     "Dawat_rice": "Dawatv2_best.optimized",
-    "Black_chana": "Black_chana_v4.optimized",
+    "Black_chana": "black_chana_v1.6.0.optimized",
     "Rosted_chana": "Rosted_chana_v2.optimized",
     "chanadal": "chana_daal_v1_1_0.optimized",
     "white_peas": "White_pea_v1.optimized",
