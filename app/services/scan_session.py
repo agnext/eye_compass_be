@@ -2017,9 +2017,17 @@ class ScanSession:
         batch: no counters, folders, tracker totals, or prior FM count are
         touched. Counting resumes from where it was.
 
-        The BELT IS LEFT STOPPED — this only unwedges software state. Starting
-        the conveyor stays an explicit Start press, never a side effect of
-        asking for the screen to be unfrozen.
+        THE BELT IS STOPPED HERE, actively. An earlier version only avoided
+        *starting* it and claimed the belt was "left stopped" — true only when
+        it already was. Pressed while the belt was running, recovery left it
+        running with detection suspended, and process_frame returns on
+        detection_suspended BEFORE save_raw_frame, so that stretch of belt was
+        neither inspected nor recorded while the live view looked entirely
+        normal. Measured on the device on 2026-10-10: 12 presses, 612 s of belt
+        moving with no detection at all.
+        Starting the conveyor stays an explicit Start press, never a side
+        effect of asking for the screen to be unfrozen — this stops it, which
+        that rule has always allowed.
 
         Purely additive: nothing else calls this, and it reuses the same
         primitives (resume_capture, unlock_machine_start) the normal
@@ -2035,15 +2043,29 @@ class ScanSession:
             self._samples = []
             self._trigger = None
             self.review_phase = "idle"
-            # The belt is deliberately left stopped (see the /recover route's
-            # own note), so suspend detection until the operator presses Start
-            # — exactly as resume() does. Without this the live view would come
-            # back on a stationary belt and immediately re-detect the objects
-            # still sitting in frame, re-locking the interlock just cleared.
+            # The belt is stopped just below, so suspend detection until the
+            # operator presses Start — exactly as resume() does. Without this
+            # the live view would come back on a stationary belt and
+            # immediately re-detect the objects still sitting in frame,
+            # re-locking the interlock just cleared.
             self.detection_suspended = True
             self.accumulate_stop_times()
-        # Outside the lock, same as resume(): release the interlock and clear
-        # the pause so the live feed comes back.
+        # Outside the lock, same as resume(). Stop the belt FIRST, so it is
+        # already stationary before the interlock is released — and because
+        # detection is now suspended, a belt still turning here would carry
+        # material past the camera unchecked.
+        #
+        # all_stop is never refused by the interlock (only machine_start is),
+        # so this works whether the lock was engaged or not, and is harmless
+        # when the belt is already stopped.
+        if not conveyor_service.send("all_stop"):
+            logger.error(
+                "Recovery could not confirm the belt stopped (%s). Detection "
+                "stays suspended until Start is pressed, but CHECK THAT THE "
+                "BELT IS STATIONARY — anything crossing it now is not being "
+                "inspected.",
+                conveyor_service.last_error or "no acknowledgment",
+            )
         conveyor_service.unlock_machine_start(reason="operator recovery (unstick)")
         self.resume_capture()
         logger.info("Scan recovered via operator unstick: sample=%s", self.sample_id)

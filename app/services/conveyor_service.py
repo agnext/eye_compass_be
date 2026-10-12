@@ -75,6 +75,16 @@ class ConveyorService:
     def machine_start_locked(self) -> bool:
         return self._machine_start_locked
 
+    @property
+    def last_error(self) -> str:
+        """Why the most recent command failed, or "" if it succeeded.
+
+        Already reported by status(); exposed here so a caller can say what
+        went wrong without building the whole status dict (which probes the
+        serial ports).
+        """
+        return self._last_error
+
     def lock_machine_start(self, reason: str = "FM_detected"):
         """Engage the interlock.
 
@@ -171,6 +181,39 @@ class ConveyorService:
             for attempt in range(1, max_retries + 1):
                 try:
                     ser = self._get_connection(port, baud)
+                    # Drop anything already waiting in the input buffer before
+                    # writing. The reply is read with a blind readline()
+                    # straight after the write, so a reply that arrived late —
+                    # after we had given up waiting for an earlier command —
+                    # sits in the buffer and is read as THIS command's reply.
+                    # Every later read is then one command behind, and it feeds
+                    # itself: each unconfirmed command writes 3 retries plus a
+                    # fail-safe all_stop, leaving still more unread replies.
+                    #
+                    # That is the "Unexpected acknowledgment 'camera_on'
+                    # (wanted 'machine_started')" fault, and the failed Starts
+                    # (502 Bad Gateway) it caused: 166 such warnings on
+                    # 2026-10-10, and the same thing every day since at least
+                    # Oct 06. The commands themselves were always written and
+                    # acted on — only the pairing of replies to commands was
+                    # wrong.
+                    #
+                    # Whatever is present at this instant was sent before this
+                    # command, so it can only be stale. Dropping it makes each
+                    # command read its own reply, and recovery takes one
+                    # command instead of never.
+                    try:
+                        stale = ser.in_waiting
+                    except Exception:
+                        stale = 0
+                    if stale:
+                        ser.reset_input_buffer()
+                        logger.warning(
+                            "Discarded %d stale byte(s) from %s before sending "
+                            "%r — the controller answered an earlier command "
+                            "after we stopped waiting for it.",
+                            stale, port, cmd,
+                        )
                     logger.info(
                         "Attempt %s: sending %r to %s", attempt, cmd, port
                     )

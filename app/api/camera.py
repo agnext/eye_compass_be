@@ -421,11 +421,18 @@ async def _stream_engine():
                             logger.warning(
                                 "Interlock locked with nothing to review for %.0fs "
                                 "— clearing it (a manual Stop most likely raced an "
-                                "FM detection). The belt is left stopped; press "
+                                "FM detection). The belt is stopped; press "
                                 "Start to resume.",
                                 time.time() - stuck_lock_since,
                             )
-                            scan_session.force_recover()
+                            # Off the event loop: force_recover now stops the
+                            # belt, and a conveyor command can take seconds
+                            # (up to 3 retries, or reopening the port). Called
+                            # inline it would stall every stream and every
+                            # request for that whole time.
+                            await loop.run_in_executor(
+                                None, scan_session.force_recover
+                            )
                             stuck_lock_since = None
                     else:
                         stuck_lock_since = None
