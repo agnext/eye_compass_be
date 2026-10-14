@@ -225,7 +225,14 @@ def _deliver(result_id: int, datagram: dict):
         # worker once it eventually went through.
         if post_status == "1":
             try:
-                sync_service.post_to_sheets(datagram)
+                if not sync_service.post_to_sheets(datagram):
+                    logger.error(
+                        "Result %s reached Qualix but NOT the Google Sheet. "
+                        "sync_status stays '1' (it tracks Qualix only), so "
+                        "nothing will retry this — the sheet row must be "
+                        "added by re-syncing it from History.",
+                        result_id,
+                    )
             except Exception as exc:
                 logger.error("Sheets sync failed for result %s: %s", result_id, exc)
 

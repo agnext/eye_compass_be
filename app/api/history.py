@@ -351,7 +351,11 @@ def resync_result(result_id: int, db: Session = Depends(get_db)):
         status, error_code, error_detail = sync_service.post_analysis_data(r.result)
         if status == "1":
             try:
-                sync_service.post_to_sheets(r.result)
+                if not sync_service.post_to_sheets(r.result):
+                    logger.error(
+                        "Result %s reached Qualix but NOT the Google Sheet on "
+                        "this re-sync.", result_id,
+                    )
             except Exception as exc:
                 logger.error("Sheets resync failed: %s", exc)
 

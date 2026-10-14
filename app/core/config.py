@@ -335,7 +335,13 @@ class Settings:
     # explicitly from the payload instead of inferring it from whichever
     # account authenticated the post. Fixed per physical device, same as
     # DEVICE_ID.
-    DEVICE_CODE: str = _env("DEVICE_CODE", section="CONFIG_SETTINGS", key="device_code", default="").strip().upper()
+    #
+    # Sent exactly as written, NOT upper-cased. Qualix matches this against its
+    # registered devices case-sensitively: with `cgi` in .env this used to go
+    # out as `CGI` and every post was rejected with error 12092 "Device does
+    # not exist" (15 batches, 9-13 Oct 2026); the identical payload with `cgi`
+    # was accepted (HTTP 200). Set it in .env to the spelling Qualix has.
+    DEVICE_CODE: str = _env("DEVICE_CODE", section="CONFIG_SETTINGS", key="device_code", default="").strip()
 
     WAREHOUSE_NAME: str = _env("WAREHOUSE_NAME", default="")
 

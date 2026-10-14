@@ -26,6 +26,7 @@ import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 from app.core.config import settings
+from app.services.sheet_mapper import build_row
 from app.models.schema import (
     BrandDetails,
     ClientInfo,
@@ -563,14 +564,11 @@ class SyncService:
             logger.error("Sheets init failed: %s", exc)
             return None
 
-    ANALYSIS_HEADERS = [
-        "Others", "Husk", "Frame Count", "Blower FO", "Magnetic FO",
-        "FM Stop Count", "Manual Stop Count", "FM Stop Time",
-        "Manual Stop Time", "Total Stop Time", "total_fo_detected",
-        "Metal Fragments", "Mud balls", "Thread", "Feathers", "Dried Leaves",
-        "Plastic Pieces", "Insects", "Sticks", "Stones", "Paper",
-        "Toffee wrappers", "Rubber", "Jute Fibers", "Glass pieces", "FM", "NON-FM",
-    ]
+    # How many times a write will recompute the target row and try again when
+    # another writer takes it first. This spreadsheet is shared across devices,
+    # so "the row after the last one" can stop being free between reading it
+    # and writing to it.
+    SHEET_WRITE_ATTEMPTS = 3
 
     def already_in_sheet(self, sheet, start_time: str) -> bool:
         """Duplicate guard. Port of check_start_time_exists (sheet_update.py:76-111).
@@ -584,48 +582,113 @@ class SyncService:
             logger.warning("Sheets duplicate check failed (%s) — assuming not present", exc)
             return False
 
+    def _write_row_at_end(self, sheet, row: list, sample_id: str) -> int:
+        """Write `row` to the first free row after the last used one, and prove
+        it landed. Returns the row number, or 0 if it could not be written.
+
+        NOT append_row. gspread's append asks the Sheets API to find "the
+        table" and add after it; on this spreadsheet — which holds several
+        years of rows from several devices, with gaps — that detection chose a
+        row in the middle of last September's data and OVERWROTE it, once per
+        append. Fifteen batches were lost that way before anyone noticed, and
+        an unrelated row was destroyed with each. Computing the end ourselves
+        and writing to an explicit range is what makes the destination
+        predictable.
+
+        The read-back is not belt and braces either: a write that reports
+        success but leaves nothing behind is exactly the failure this is here
+        to catch, so the row is read again and checked before it is called
+        done.
+        """
+        from gspread.utils import rowcol_to_a1
+
+        last_column = rowcol_to_a1(1, len(row)).rstrip("1")
+        for attempt in range(1, self.SHEET_WRITE_ATTEMPTS + 1):
+            target = len(sheet.get_all_values()) + 1
+            existing = sheet.get(f"A{target}:{last_column}{target}")
+            if existing and any(str(cell).strip() for line in existing for cell in line):
+                logger.warning(
+                    "Sheets: row %s was taken between reading and writing "
+                    "(attempt %s/%s) — recomputing.",
+                    target, attempt, self.SHEET_WRITE_ATTEMPTS,
+                )
+                continue
+
+            sheet.update(values=[row], range_name=f"A{target}")
+
+            written = sheet.row_values(target)
+            if written and written[0] == str(row[0]):
+                logger.info(
+                    "Sheets: %s written to row %s (%s columns).",
+                    sample_id, target, len(row),
+                )
+                return target
+            logger.warning(
+                "Sheets: wrote %s to row %s but read back %r (attempt %s/%s).",
+                sample_id, target, (written or [""])[0], attempt,
+                self.SHEET_WRITE_ATTEMPTS,
+            )
+        return 0
+
     def post_to_sheets(self, raw_data: dict) -> bool:
+        """Add one scan to the sheet, placing every value by COLUMN HEADER.
+
+        The sheet's own header row decides where each value goes, so a column
+        added or moved there needs no change here, and a value can never shift
+        the ones after it. The previous version built the row positionally
+        from a hardcoded copy of the header: any analysis name missing from
+        that copy — `Plant Matter`, on every batch this device runs — became an
+        extra unlabelled cell mid-row and pushed `device_id` along with it.
+
+        Anything with no matching column is skipped and logged by name and
+        amount. Dropping a count silently is what let that fault run for days.
+        """
         sheet = self._open_sheet()
         if not sheet:
+            # _open_sheet has already logged why. Returning False matters:
+            # callers treat it as "not in the sheet", and must not record the
+            # scan as fully delivered on the strength of Qualix alone.
             return False
 
         try:
             scan_data = raw_data.get("scan_data", {}) or {}
             analysis = raw_data.get("analysis", []) or []
+            sample_id = scan_data.get("sample_id", "?")
 
             start_time = scan_data.get("process_start_time", "")
             if start_time and self.already_in_sheet(sheet, start_time):
                 logger.info("Sheets: row for %s already present, skipping.", start_time)
                 return True
 
-            by_name = {a.get("analysisName"): a.get("totalAmount") for a in analysis}
+            header = sheet.row_values(1)
+            if not header:
+                logger.error("Sheets: header row is empty — refusing to write %s.", sample_id)
+                return False
 
-            row = [
-                scan_data.get("sample_id", ""),
-                scan_data.get("commodity_name", ""),
-                scan_data.get("variety_name", ""),
-                scan_data.get("weight", ""),
-                scan_data.get("brand", ""),
-                scan_data.get("vendor_name", ""),
-                scan_data.get("vendor_code", ""),
-                scan_data.get("manufacturing_date", ""),
-                scan_data.get("receiving_date", ""),
-                scan_data.get("site_code", ""),
-                scan_data.get("process_start_time", ""),
-                scan_data.get("process_end_time", ""),
-            ]
-            row += [by_name.get(header, 0) for header in self.ANALYSIS_HEADERS]
-            row += [
-                a.get("totalAmount", 0)
-                for a in analysis
-                if a.get("analysisName") not in self.ANALYSIS_HEADERS
-            ]
-            row.append(scan_data.get("device_id", ""))
+            row, report = build_row(header, scan_data, analysis)
 
-            sheet.append_row(row)
-            return True
+            if report["duplicate_headers"]:
+                logger.warning(
+                    "Sheets: duplicate column header(s) %s — the first of each "
+                    "was used.", report["duplicate_headers"],
+                )
+            for name, amount in report["skipped"]:
+                logger.warning(
+                    "Sheets: no column matches %r (value %s) for %s — NOT "
+                    "written. Add a column with that name to record it.",
+                    name, amount, sample_id,
+                )
+            for header_name, names in report["summed"]:
+                logger.warning(
+                    "Sheets: %s source names %s all map to column %r for %s — "
+                    "their values were added together.",
+                    len(names), names, header_name, sample_id,
+                )
+
+            return bool(self._write_row_at_end(sheet, row, sample_id))
         except Exception as exc:
-            logger.error("Sheets POST failed: %s", exc)
+            logger.error("Sheets POST failed for %s: %s",
+                         (raw_data.get("scan_data") or {}).get("sample_id", "?"), exc)
             return False
 
 

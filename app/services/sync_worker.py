@@ -76,7 +76,13 @@ def _run_one_cycle() -> dict:
 
                 if post_status == "1":
                     try:
-                        sync_service.post_to_sheets(datagram)
+                        if not sync_service.post_to_sheets(datagram):
+                            logger.error(
+                                "Result %s reached Qualix but NOT the Google "
+                                "Sheet — it is marked delivered and will not "
+                                "be retried; add the row via History's "
+                                "Re-sync.", record.id,
+                            )
                     except Exception as exc:
                         logger.error("Sheets retry failed for result %s: %s", record.id, exc)
                     summary["delivered"] += 1
