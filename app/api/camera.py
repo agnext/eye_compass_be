@@ -93,8 +93,27 @@ _camera_initialized = False
 _hardware_lock = threading.Lock()
 _stream_clients = 0
 _clients_lock = threading.Lock()
+# Monotonic time the LAST browser dropped off the stream, or None while one is
+# attached. Nothing here acts on it — it exists so the scan API can tell a run
+# somebody is watching from one whose browser has gone (reloaded, logged out,
+# closed) and is never coming back for it. See seconds_without_viewer() and
+# api/scan.py's _reclaim_orphaned_scan(). Starts set, because at import time no
+# browser has connected yet.
+_last_viewer_gone_at: float | None = time.monotonic()
 
 _hw_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-hw")
+
+
+def seconds_without_viewer() -> float:
+    """How long no browser has been subscribed to the stream, in seconds.
+
+    0.0 while at least one is attached, so a caller can treat "zero" as
+    "somebody is watching" without a second check.
+    """
+    with _clients_lock:
+        if _stream_clients > 0 or _last_viewer_gone_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - _last_viewer_gone_at)
 
 
 def _run_on_hw_thread(fn, *args, **kwargs):
@@ -712,7 +731,7 @@ async def camera_stream(websocket: WebSocket):
       five times a second while capture is paused. A paused message without a
       frame means "keep showing the frame you have".
     """
-    global _stream_clients
+    global _stream_clients, _last_viewer_gone_at
 
     await websocket.accept()
     logger.info("WebSocket client connected to /ws/camera/stream")
@@ -735,6 +754,7 @@ async def camera_stream(websocket: WebSocket):
     _subscribers.add(sub)
     with _clients_lock:
         _stream_clients += 1
+        _last_viewer_gone_at = None
     _ensure_engine()
 
     pump = asyncio.ensure_future(_pump(websocket, sub))
@@ -760,6 +780,8 @@ async def camera_stream(websocket: WebSocket):
         _subscribers.discard(sub)
         with _clients_lock:
             _stream_clients -= 1
+            if _stream_clients <= 0:
+                _last_viewer_gone_at = time.monotonic()
         for task in (pump, watch):
             task.cancel()
         await asyncio.gather(pump, watch, return_exceptions=True)

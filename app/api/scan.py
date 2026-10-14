@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api import camera
 from app.core.database import SessionLocal, get_db
 from app.core.security import current_operator_id
 from app.models.schema import BatchDetails, Result
@@ -64,6 +65,68 @@ def _checkpoint(awaiting_save: bool = False) -> None:
     never from the per-frame loop. Best-effort: see scan_progress."""
     if scan_session.folder_name:
         scan_progress.checkpoint(scan_session.progress_state(), awaiting_save=awaiting_save)
+
+
+# How long a run may sit with no browser attached before Home treats it as
+# abandoned. Comfortably longer than a page reload or a dropped socket: the
+# client retries a closed stream after 3s and gives up on a silent one after
+# 10s, so only a browser that is genuinely gone reaches this.
+ORPHANED_SCAN_GRACE_SECONDS = 60.0
+
+
+def _reclaim_orphaned_scan() -> None:
+    """Hand a run whose browser has gone back to Held Batches.
+
+    A scan_progress row is only moved off `active` at startup
+    (interrupt_all_active) or when a different batch begins (checkpoint). So a
+    page that reloads, logs out or is closed mid-batch leaves the row `active`
+    with nothing attached to it — and since Held Batches lists only held and
+    interrupted rows, the batch becomes invisible with no way back into it.
+
+    Confirmed on the device on 2026-10-14: the scan page logged itself out
+    mid-batch, and a run with 125 reviewed objects sat unreachable on Home for
+    twenty minutes. It only came back because the operator started a different
+    batch, which displaced it into `interrupted` as a side effect.
+
+    Deliberately NOT applied while detection is still armed. A belt that is
+    running is still inspecting material, and the stream engine is built to
+    keep going with no viewer (see camera.py's _detection_armed) — cutting that
+    run loose would strand material mid-inspection. Such a run becomes eligible
+    on its own the moment its next detection pauses capture, which is also the
+    first moment anybody would need to review it.
+
+    Called from the endpoints Home polls, so the recovery happens exactly when
+    the operator goes looking for the batch. Never raises.
+    """
+    if not scan_session.active:
+        return
+    # Still scanning — leave it alone; see the docstring.
+    if not (scan_session.capture_paused or scan_session.detection_suspended):
+        return
+    if camera.seconds_without_viewer() < ORPHANED_SCAN_GRACE_SECONDS:
+        return
+
+    folder = scan_session.folder_name
+    if not folder:
+        return
+
+    try:
+        # The counters first, so the batch is continued from where it actually
+        # got to rather than from the last operator action.
+        _checkpoint()
+        scan_progress.interrupt(folder)
+        with scan_session._lock:
+            if scan_session.folder_name == folder:
+                scan_session.reset()
+        conveyor_service.unlock_machine_start(reason="scan abandoned by its browser")
+        logger.warning(
+            "Batch %s had no browser for over %.0fs — released it to Held "
+            "Batches so it can be continued. Nothing is lost: its crops and "
+            "frames are on disk and its counters were just checkpointed.",
+            folder, ORPHANED_SCAN_GRACE_SECONDS,
+        )
+    except Exception as exc:
+        logger.error("Could not release abandoned batch %s: %s", folder, exc)
 
 # Holds the last /submit's computed result until /confirm persists it — the
 # in-memory equivalent of legacy's self.datagram/self.final_result sitting on
@@ -384,7 +447,14 @@ def label_detection(req: LabelRequest):
         _checkpoint()
         return result
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        # exc.args[0], not str(exc): str() of a KeyError is its repr, so the
+        # message reached the operator wrapped in literal single quotes —
+        # 'No pending detection with index 9'. The box is simply no longer on
+        # the review screen; the client closes its picker and moves on rather
+        # than showing this (see Dashboard.jsx's handleLabel), so this text is
+        # now for the log and the API, not for the screen.
+        detail = exc.args[0] if exc.args else "No pending detection with that index"
+        raise HTTPException(status_code=404, detail=detail)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -946,7 +1016,13 @@ def hold_pending():
 
 @router.get("/held")
 def list_held():
-    """Held and interrupted batches, for the Held Batches list on Home."""
+    """Held and interrupted batches, for the Held Batches list on Home.
+
+    Reclaims an abandoned run first, so a batch whose browser went away is in
+    the list the operator is looking at rather than invisible behind an
+    `active` row — see _reclaim_orphaned_scan.
+    """
+    _reclaim_orphaned_scan()
     return {"batches": scan_progress.list_open()}
 
 
