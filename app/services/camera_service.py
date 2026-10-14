@@ -280,22 +280,6 @@ class RealCameraService(BaseCameraService):
             self._release_handle()
             return False
 
-        # GigE: negotiate the optimal packet size before streaming, or frames
-        # arrive partial/dropped under load (GrabImage.py:662-665).
-        if self._is_gige:
-            packet_size = self.cam.MV_CC_GetOptimalPacketSize()
-            if packet_size > 0:
-                ret = self.cam.MV_CC_SetIntValue("GevSCPSPacketSize", packet_size)
-                if ret != 0:
-                    logger.warning("Could not set GevSCPSPacketSize: ret[0x%x]", ret)
-                else:
-                    logger.info("GevSCPSPacketSize set to %s", packet_size)
-            else:
-                logger.warning(
-                    "MV_CC_GetOptimalPacketSize returned %s; leaving packet size at default",
-                    packet_size,
-                )
-
         self.cam.MV_CC_SetEnumValue("TriggerMode", self._MV_TRIGGER_MODE_OFF)
         self.cam.MV_CC_SetEnumValue("BalanceWhiteAuto", self._MV_BALANCEWHITE_AUTO_OFF)
         self.cam.MV_CC_SetEnumValue("ExposureAuto", self._MV_EXPOSURE_AUTO_MODE_OFF)
@@ -316,6 +300,20 @@ class RealCameraService(BaseCameraService):
         # Without this the camera runs on factory defaults and the colour
         # profile the models were trained against is lost (GrabImage.py:679).
         self._load_feature_file()
+
+        if self._is_gige:
+            packet_size = self.cam.MV_CC_GetOptimalPacketSize()
+            if packet_size > 0:
+                ret = self.cam.MV_CC_SetIntValue("GevSCPSPacketSize", packet_size)
+                if ret != 0:
+                    logger.warning("Could not set GevSCPSPacketSize: ret[0x%x]", ret)
+                else:
+                    logger.info("GevSCPSPacketSize set to %s", packet_size)
+            else:
+                logger.warning(
+                    "MV_CC_GetOptimalPacketSize returned %s; leaving packet size at default",
+                    packet_size,
+                )
 
         logger.info(
             "Camera initialized (exposure=%.1f gain=%.2f gige=%s)",

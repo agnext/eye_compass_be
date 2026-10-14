@@ -310,6 +310,24 @@ def start_scan(req: ScanStartRequest, db: Session = Depends(get_db)):
         if row and row.analysis:
             analysis = [a for a in row.analysis if isinstance(a, str)]
 
+    # Belt safety: never start the conveyor with no inference model loaded.
+    # Without this the belt runs and material crosses the camera with zero
+    # detection and no frame record - the operator sees a normal live-scan
+    # screen over a sample that was never actually inspected. Checked here,
+    # before scan_session.start() and before any conveyor command, so nothing
+    # on the machine moves. The frontend also disables Start in this state,
+    # but this is the authoritative gate that holds even if that is bypassed.
+    from app.api.camera import is_model_loaded
+
+    if not is_model_loaded():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No inference model is loaded, so scanning cannot start. Load "
+                "the model for this commodity and variety, then try Start again."
+            ),
+        )
+
     batch = None
     if req.batch_id:
         batch = db.query(BatchDetails).filter(BatchDetails.id == req.batch_id).first()

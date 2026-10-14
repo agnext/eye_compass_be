@@ -188,10 +188,21 @@ def shutdown_camera_services():
         _hw_executor.shutdown(wait=True)
 
 
+def is_model_loaded() -> bool:
+    """Whether an inference model is loaded and ready to detect.
+
+    Exposed for the scan start gate (app/api/scan.py): the belt must not be
+    told to move while this is False, or material crosses the camera with no
+    inspection and no frame record. Reads the same flag camera_health() and
+    camera_status() already report, so there is a single source of truth.
+    """
+    return bool(_inference and _inference.is_loaded)
+
+
 def camera_health() -> dict:
     return {
         "initialized": _camera_initialized,
-        "model_loaded": bool(_inference and _inference.is_loaded),
+        "model_loaded": is_model_loaded(),
         "stream_clients": _stream_clients,
         "stream_engine_running": bool(_engine_task and not _engine_task.done()),
     }
@@ -437,7 +448,11 @@ async def _stream_engine():
                     else:
                         stuck_lock_since = None
 
-                    payload = {"fps": 0.0, **scan_session.live_state()}
+                    payload = {
+                        "fps": 0.0,
+                        "model_loaded": is_model_loaded(),
+                        **scan_session.live_state(),
+                    }
                     was_paused = True
                     frozen_seq = scan_session.frozen_frame_seq
                     if review_cache_seq != frozen_seq:
@@ -613,6 +628,7 @@ async def _stream_engine():
                     "source_height": int(frame.shape[0]),
                     "detections": [[float(v) for v in d] for d in (detections or [])],
                     "fps": round(current_fps, 1),
+                    "model_loaded": is_model_loaded(),
                     **state,
                 }, jpeg)
                 for sub in list(_subscribers):
