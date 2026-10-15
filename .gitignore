@@ -5,6 +5,7 @@ __pycache__/
 
 # Environments
 .env
+.env*
 /credentials/
 .venv
 env/
@@ -15,7 +16,6 @@ venv.bak/
 
 # Project specifics
 # ML weights / engines (leading slash so it never matches app/models/)
-/models/
 /ml_m/
 # Anchored to root for the same reason as /models/ above — an unanchored
 # "output/" would also match any future app/**/output/ directory.
