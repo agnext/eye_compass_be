@@ -22,9 +22,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
 import threading
 import time
+
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -133,15 +137,139 @@ def _run_on_hw_thread(fn, *args, **kwargs):
 _dc_lock = threading.Lock()
 _dc_recording = False
 _dc_folder: str | None = None
+# Frames actually written to disk this visit (what the operator gets).
 _dc_frame_count = 0
+# Every frame grabbed while recording, saved or not.
+_dc_frames_seen = 0
+# Wall-clock bounds of this visit's recording: first Start to last Stop.
+_dc_started_at: float | None = None
+_dc_stopped_at: float | None = None
+# The one /ws/data_collection/stream connection that saves frames. Others
+# (a second kiosk window, a browser) get the preview only, so files are not
+# written twice and the counts stay true. Whoever connects first while the
+# slot is free owns it; it is released when that connection closes.
+_dc_writer: object | None = None
+
+# Operator-editable settings for Data Collection, kept in their own file so
+# the frame rate of a collection can be changed on the device without
+# touching .env or restarting the service: it is re-read on every prepare,
+# i.e. every visit to the Data Collection page.
+DC_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "data_collection_settings.json"
+DC_SETTINGS_DEFAULTS = {
+    # Keep one frame in every N grabbed while recording. 1 = every frame
+    # (legacy behaviour); 3 = every third frame.
+    "save_every_n_frames": 3,
+    # "png" (lossless, as legacy) or "jpg".
+    "image_format": "png",
+    # Only used when image_format is "jpg".
+    "jpeg_quality": 95,
+    # Recording stops (and the belt with it) when the output disk has less
+    # free space than this, instead of failing writes silently.
+    "min_free_disk_gb": 2.0,
+}
+_dc_settings = dict(DC_SETTINGS_DEFAULTS)
+
+
+def _load_dc_settings() -> dict:
+    """Read data_collection_settings.json, falling back per key to the
+    defaults. A missing or broken file never blocks a collection."""
+    loaded = dict(DC_SETTINGS_DEFAULTS)
+    try:
+        with open(DC_SETTINGS_PATH) as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            loaded.update({k: raw[k] for k in DC_SETTINGS_DEFAULTS if k in raw})
+    except FileNotFoundError:
+        logger.info("No %s; using data collection defaults", DC_SETTINGS_PATH.name)
+    except Exception as exc:
+        logger.warning("Ignoring unreadable %s: %s", DC_SETTINGS_PATH.name, exc)
+    try:
+        loaded["save_every_n_frames"] = max(1, int(loaded["save_every_n_frames"]))
+    except (TypeError, ValueError):
+        loaded["save_every_n_frames"] = DC_SETTINGS_DEFAULTS["save_every_n_frames"]
+    if str(loaded["image_format"]).lower() not in ("png", "jpg"):
+        loaded["image_format"] = "png"
+    loaded["image_format"] = str(loaded["image_format"]).lower()
+    try:
+        loaded["jpeg_quality"] = min(100, max(1, int(loaded["jpeg_quality"])))
+    except (TypeError, ValueError):
+        loaded["jpeg_quality"] = DC_SETTINGS_DEFAULTS["jpeg_quality"]
+    try:
+        loaded["min_free_disk_gb"] = max(0.0, float(loaded["min_free_disk_gb"]))
+    except (TypeError, ValueError):
+        loaded["min_free_disk_gb"] = DC_SETTINGS_DEFAULTS["min_free_disk_gb"]
+    return loaded
+
+
+def _dc_free_gb(path: str) -> float:
+    return shutil.disk_usage(path).free / 1e9
+
+
+# Disk writes run here, off the camera thread, so a slow PNG encode never
+# holds up the next grab. One worker keeps files in order. Writes still in
+# flight are capped at _DC_MAX_PENDING_WRITES: past that a kept frame is
+# dropped (and counted) rather than letting memory grow without bound.
+_dc_write_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="dc-write")
+_DC_MAX_PENDING_WRITES = 16
+_dc_pending_writes = 0
+_dc_frames_dropped = 0
+# Why recording last stopped on its own (disk full, write error), for the
+# app to show; cleared on prepare and on start.
+_dc_stop_reason: str | None = None
+
+
+def _dc_write(path: str, frame, params: list) -> None:
+    global _dc_frame_count, _dc_pending_writes, _dc_frames_dropped
+    try:
+        written = cv2.imwrite(path, frame, params)
+    except Exception as exc:
+        logger.error("Data collection write failed for %s: %s", path, exc)
+        written = False
+    with _dc_lock:
+        _dc_pending_writes -= 1
+        if written:
+            _dc_frame_count += 1
+        else:
+            _dc_frames_dropped += 1
+
+
+def _iso(ts: float | None) -> str | None:
+    return datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else None
 
 
 def _dc_status() -> dict:
+    end = _dc_stopped_at if not _dc_recording else time.time()
+    duration = (end - _dc_started_at) if (_dc_started_at and end) else 0.0
     return {
         "recording": _dc_recording,
         "folder": _dc_folder,
         "frame_count": _dc_frame_count,
+        "frames_seen": _dc_frames_seen,
+        "save_every_n_frames": _dc_settings["save_every_n_frames"],
+        "frames_dropped": _dc_frames_dropped,
+        "stop_reason": _dc_stop_reason,
+        "started_at": _iso(_dc_started_at),
+        "ended_at": _iso(end) if _dc_started_at else None,
+        "duration_seconds": round(max(0.0, duration), 1),
     }
+
+
+def _dc_begin_recording() -> None:
+    """Caller holds _dc_lock."""
+    global _dc_recording, _dc_started_at, _dc_stopped_at
+    _dc_recording = True
+    if _dc_started_at is None:
+        _dc_started_at = time.time()
+    _dc_stopped_at = None
+
+
+def _dc_end_recording() -> None:
+    """Caller holds _dc_lock."""
+    global _dc_recording, _dc_stopped_at
+    if _dc_recording:
+        _dc_stopped_at = time.time()
+    _dc_recording = False
 
 
 def _ensure_services() -> bool:
@@ -813,7 +941,6 @@ async def data_collection_stream(websocket: WebSocket):
     `_dc_recording`; only the disk write (the actual "data collection" part)
     stays gated on it, unchanged from before.
     """
-    global _dc_frame_count, _dc_clients
 
     await websocket.accept()
     logger.info("WebSocket client connected to /ws/data_collection/stream")
@@ -827,42 +954,97 @@ async def data_collection_stream(websocket: WebSocket):
 
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.STREAM_JPEG_QUALITY]
 
+    global _dc_writer, _dc_frames_seen, _dc_pending_writes, _dc_frames_dropped
+    global _dc_clients
+    me = object()
+    with _dc_lock:
+        if _dc_writer is None:
+            _dc_writer = me
+    if _dc_writer is not me:
+        logger.warning("Second data collection stream: preview only, not saving")
+
+    frame_interval = 1.0 / max(1, settings.STREAM_FPS)
+    last_sent = 0.0
+    last_disk_check = 0.0
+
+    def grab():
+        with _hardware_lock:
+            return _camera.grab_frame()
+
+    def stop_recording_because(reason: str) -> None:
+        global _dc_stop_reason
+        with _dc_lock:
+            _dc_stop_reason = reason
+            _dc_end_recording()
+        logger.warning("Data collection stopped: %s", reason)
+        conveyor_service.send("all_stop")
+
     # Counted so the scan stream engine does not keep grabbing from the same
     # camera with no viewer while this page is open — see _detection_armed.
     _dc_clients += 1
     try:
         while True:
-            def grab_and_maybe_save():
-                with _hardware_lock:
-                    frame = _camera.grab_frame()
-                if frame is None or not _dc_recording or not _dc_folder:
-                    return frame
-                # Same array, same cv2.imwrite call as legacy's
-                # CollectionCameraThread.run (GrabImage.py:780-782) — no color
-                # conversion here in legacy either, so none is added here.
-                image_name = time.time()
-                filename = f"{os.path.basename(_dc_folder)}_{image_name}.png"
-                cv2.imwrite(os.path.join(_dc_folder, filename), frame)
-                return frame
-
-            frame = await loop.run_in_executor(_hw_executor, grab_and_maybe_save)
+            # Every frame the camera delivers is grabbed and counted; only the
+            # preview below is throttled to STREAM_FPS. Saving used to sit
+            # inside the preview's sleep, which capped collection at
+            # STREAM_FPS frames a second whatever the camera could do.
+            frame = await loop.run_in_executor(_hw_executor, grab)
             if frame is None:
                 await asyncio.sleep(0.02)
                 continue
+            if settings.USE_MOCK_CAMERA:
+                # The real grab blocks until the sensor delivers, which paces
+                # this loop; the mock returns at once and needs pacing.
+                await asyncio.sleep(0.01)
 
-            if _dc_recording:
-                with _dc_lock:
-                    _dc_frame_count += 1
+            if _dc_writer is me and _dc_recording and _dc_folder:
+                now = time.time()
+                if now - last_disk_check >= 2.0:
+                    last_disk_check = now
+                    free = await loop.run_in_executor(None, _dc_free_gb, _dc_folder)
+                    if free < _dc_settings["min_free_disk_gb"]:
+                        await loop.run_in_executor(
+                            None, stop_recording_because,
+                            f"Output disk almost full ({free:.1f} GB free).")
+                if _dc_recording:
+                    # Only every Nth recorded frame is written
+                    # (data_collection_settings.json); the rest are counted
+                    # so the summary can say how many went past.
+                    with _dc_lock:
+                        _dc_frames_seen += 1
+                        keep = _dc_frames_seen % _dc_settings["save_every_n_frames"] == 0
+                        folder = _dc_folder
+                        if keep and _dc_pending_writes >= _DC_MAX_PENDING_WRITES:
+                            _dc_frames_dropped += 1
+                            keep = False
+                        elif keep:
+                            _dc_pending_writes += 1
+                    if keep:
+                        # Same array, no colour conversion, as legacy's
+                        # CollectionCameraThread.run (GrabImage.py:780-782).
+                        ext = _dc_settings["image_format"]
+                        path = os.path.join(
+                            folder, f"{os.path.basename(folder)}_{time.time()}.{ext}")
+                        params = ([cv2.IMWRITE_JPEG_QUALITY, _dc_settings["jpeg_quality"]]
+                                  if ext == "jpg" else [])
+                        _dc_write_executor.submit(_dc_write, path, frame, params)
 
-            ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+            now = time.time()
+            if now - last_sent < frame_interval:
+                continue
+            last_sent = now
+            ok, buffer = await loop.run_in_executor(
+                None, cv2.imencode, ".jpg", frame, encode_params)
             if not ok:
                 continue
             await websocket.send_json({
                 "frame": base64.b64encode(buffer).decode("utf-8"),
                 "frame_count": _dc_frame_count,
+                "frames_seen": _dc_frames_seen,
+                "frames_dropped": _dc_frames_dropped,
                 "recording": _dc_recording,
+                "stop_reason": _dc_stop_reason,
             })
-            await asyncio.sleep(1.0 / max(1, settings.STREAM_FPS))
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected from data collection stream")
@@ -870,6 +1052,18 @@ async def data_collection_stream(websocket: WebSocket):
         logger.error("Data collection WebSocket error: %s", exc)
     finally:
         _dc_clients -= 1
+        # Losing the saving stream mid-recording (app closed or crashed,
+        # network gone) would otherwise leave the belt running with nothing
+        # being saved. Stop both, as the live scan does when its stream goes.
+        was_recording = False
+        with _dc_lock:
+            if _dc_writer is me:
+                _dc_writer = None
+                was_recording = _dc_recording
+                _dc_end_recording()
+        if was_recording:
+            logger.warning("Data collection stream lost while recording: stopping the belt")
+            await loop.run_in_executor(None, conveyor_service.send, "all_stop")
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1155,8 @@ def prepare_data_collection(req: DataCollectionRequest):
     every Start/capture Image press during this visit writes into it — it is
     not recreated per button press.
     """
-    global _dc_folder, _dc_frame_count
+    global _dc_folder, _dc_frame_count, _dc_frames_seen, _dc_settings
+    global _dc_started_at, _dc_stopped_at, _dc_frames_dropped, _dc_stop_reason
 
     # The three values ARE the folder path. A blank one produces a path with an
     # empty segment — <OUTPUT_DIR>/Data_Collection///<epoch>_ — so the session's
@@ -1016,6 +1211,13 @@ def prepare_data_collection(req: DataCollectionRequest):
     with _dc_lock:
         _dc_folder = folder
         _dc_frame_count = 0
+        _dc_frames_seen = 0
+        _dc_started_at = None
+        _dc_stopped_at = None
+        _dc_frames_dropped = 0
+        _dc_stop_reason = None
+        _dc_settings = _load_dc_settings()
+    logger.info("Data collection prepared: %s (settings %s)", folder, _dc_settings)
     return {"success": True, **_dc_status()}
 
 
@@ -1030,23 +1232,52 @@ def start_data_collection():
     raw capture tool, and refusing to record because the belt didn't answer
     would be stricter than the code it is meant to reproduce.
     """
-    global _dc_recording
     if _dc_folder is None:
         raise HTTPException(status_code=409, detail="Call prepare before starting.")
+    if _dc_writer is None:
+        # Frames are only saved inside the stream loop, so with no stream
+        # open the belt would run and nothing would be recorded.
+        raise HTTPException(
+            status_code=409,
+            detail="Camera preview is not connected; nothing would be saved.",
+        )
+    if scan_session.active:
+        raise HTTPException(
+            status_code=409,
+            detail="A batch inspection is in progress; finish it first.",
+        )
+    min_free = _dc_settings["min_free_disk_gb"]
+    free = _dc_free_gb(_dc_folder)
+    if free < min_free:
+        raise HTTPException(
+            status_code=507,
+            detail=f"Only {free:.1f} GB free on the output disk "
+                   f"(needs {min_free:g} GB). Free up space first.",
+        )
     if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera not available")
-    conveyor_service.send("machine_start")
+    # Deliberately stricter than legacy, which ignored this result: showing
+    # "Recording" over a belt that never moved collects the same few grains
+    # over and over.
+    if not conveyor_service.send("machine_start"):
+        conveyor_service.send("all_stop")
+        raise HTTPException(
+            status_code=502,
+            detail="Belt did not start: "
+                   f"{conveyor_service.status().get('last_error') or 'no acknowledgment'}",
+        )
+    global _dc_stop_reason
     with _dc_lock:
-        _dc_recording = True
+        _dc_stop_reason = None
+        _dc_begin_recording()
     return {"success": True, **_dc_status()}
 
 
 @router.post("/data_collection/stop")
 def stop_data_collection():
     """Port of stop_dc (main.py:1926-1931): stop saving frames, then the belt."""
-    global _dc_recording
     with _dc_lock:
-        _dc_recording = False
+        _dc_end_recording()
     conveyor_service.send("all_stop")
     return {"success": True, **_dc_status()}
 
@@ -1058,16 +1289,15 @@ def capture_image_data_collection():
     Only the camera thread is touched here, same as legacy — the conveyor is
     not started or stopped by this action.
     """
-    global _dc_recording
     if _dc_folder is None:
         raise HTTPException(status_code=409, detail="Call prepare before capturing.")
     if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera not available")
     with _dc_lock:
-        _dc_recording = True
+        _dc_begin_recording()
     time.sleep(2.0)
     with _dc_lock:
-        _dc_recording = False
+        _dc_end_recording()
     return {"success": True, **_dc_status()}
 
 
@@ -1084,9 +1314,24 @@ def finish_data_collection():
     That is a leak in the original, not something worth reproducing here: this
     unconditionally stops both, then the caller navigates away same as legacy.
     """
-    global _dc_recording, _dc_folder
+    global _dc_folder
     with _dc_lock:
-        _dc_recording = False
+        _dc_end_recording()
+    # Let frames already handed to the writer land, so the summary's
+    # "captured" matches the files in the folder.
+    deadline = time.time() + 10.0
+    while _dc_pending_writes > 0 and time.time() < deadline:
+        time.sleep(0.05)
+    with _dc_lock:
+        summary = _dc_status()
         _dc_folder = None
     conveyor_service.send("all_stop")
-    return {"success": True}
+    logger.info(
+        "Data collection finished: %s frames seen, %s saved (every %s), %.1fs, %s",
+        summary["frames_seen"], summary["frame_count"],
+        summary["save_every_n_frames"], summary["duration_seconds"],
+        summary["folder"],
+    )
+    # The summary is what the client's completion popup shows: start/end
+    # time, duration, frames that went past, and frames kept.
+    return {"success": True, **summary}

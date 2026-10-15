@@ -1,0 +1,6 @@
+{
+  "save_every_n_frames": 3,
+  "image_format": "png",
+  "jpeg_quality": 95,
+  "min_free_disk_gb": 2.0
+}
