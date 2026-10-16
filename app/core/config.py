@@ -221,7 +221,16 @@ class Settings:
     # the frames that make up the review screen are taken. Nothing is shown and
     # nothing is counted during this window — it exists so the objects are
     # stationary when they are finally looked at.
-    DETECTION_SETTLE_SECONDS: float = _as_float(os.getenv("DETECTION_SETTLE_SECONDS"), 2.0)
+    DETECTION_SETTLE_SECONDS: float = _as_float(os.getenv("DETECTION_SETTLE_SECONDS"), 5.0)
+
+    # How long to wait, after an FM is confirmed, before the stop command is
+    # actually sent to the conveyor. It lets the object travel a little further
+    # down the belt so it comes to rest in view instead of short of it. The
+    # wait is held on a timer thread, never in the capture loop: the camera
+    # keeps grabbing and the model keeps inferring while the belt is still
+    # running, which is the only way the object can be seen where it ends up.
+    STOP_COMMAND_DELAY_SECONDS: float = _as_float(
+        os.getenv("STOP_COMMAND_DELAY_SECONDS"), 1.0)
 
     # How long to let the belt get moving on the FIRST Start of a batch before
     # detection begins. The belt is physically at rest when Start is pressed, so

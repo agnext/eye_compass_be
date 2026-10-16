@@ -557,17 +557,102 @@ separated by nearest-match, which hands each detection to the closest track
 rather than the first one in range. `scripts/test_reid.py` covers both halves:
 identity surviving a gap, and an id never reaching a different object.
 
-**Still open: objects lost during the stop.** At this belt's measured
-1244 px/s an object crosses the 1200 px view in 964 ms, about as long as the
-1.0 s settle, so the stationary frames often contain nothing at all — in one
-run, 13 of 18 review screens. Two things can still be lost there: an object the
-model stops finding partway through the stop (only a bottom-of-frame exit is
-held), and the rest of the stopping sighting when the stationary frames find
-some but not all of it. An attempt to close both by holding every sighting
-during the stop was reverted, because it was built on top of the id churn
-described above and faithfully reproduced it — one object became several
-"missed" ones and was shown repeatedly. It is worth revisiting now that the
-identity problem is fixed. See §10.
+**Objects lost during the stop — closed 16 Oct, see §4.1.** At this belt's
+measured 1244 px/s an object crosses the 1200 px view in 964 ms, about as long
+as the settle, so the stationary frames often contain nothing at all — in one
+run, 13 of 18 review screens. An earlier attempt to hold every sighting during
+the stop was reverted, because it was built on top of the id churn described
+above and faithfully reproduced it. §4.1 revisits it now that the identity
+problem is fixed, and had to for an unrelated reason: a second change held the
+stop command back as well, which stretched this window far enough that it
+could no longer be ignored.
+
+### 4.1 Delaying the stop, and the gap it opened in §4's escape handling
+
+Operators wanted an object to come to rest further from where it was first
+sighted — resting in the middle of the frame is easier to reach than resting
+at the near edge. `STOP_COMMAND_DELAY_SECONDS` (default `1.0`) holds the stop
+command back by that long after the sighting; the belt runs on, the camera
+keeps grabbing and the model keeps inferring, so the object is found several
+more times at later positions before the conveyor is told to brake. The wait
+runs on a timer thread, never in the capture loop — blocking there would
+freeze the camera and the model for the whole delay, exactly while the belt is
+still moving and the object still needs to be seen.
+
+**`DETECTION_SETTLE_SECONDS` cannot do this job**, which is why
+`STOP_COMMAND_DELAY_SECONDS` exists as a separate setting rather than just
+raising the settle time. By the time the settle window starts, the stop
+command has already been sent — raising it only makes the operator wait
+longer before the (already decided) resting position is reviewed.
+
+This reopened exactly the gap §4 flagged as still open, and made it worse. At
+the measured belt speed an object moves roughly one tracker exit-margin
+(`TRACK_EDGE_MARGIN_PX`, 50 px) every frame, so under the old 2 s round trip it
+would usually be *caught* crossing that band and handled by `_note_escapes`.
+Run the belt on for a further second first and an object typically clears the
+whole 50 px band between one inferred frame and the next — it is never seen
+inside it, so the exit rule never fires. The tracker instead drops it for
+having gone unseen (`"unseen(0.3xs)"`), which `_note_escapes` ignored
+entirely: only `exit-zone` evictions were held.
+
+Reproduced 16 Oct, 13:27: three objects placed with a few seconds between them.
+The first stopped the belt. By the time it had braked, the belt had run far
+enough that the other two had already left the frame — neither through the
+exit band — and were dropped silently. Only the object that triggered the stop
+reached the operator, and it reached them **twice**: once as the correctly
+frozen trigger frame (the stationary re-look found nothing, so §4's
+nothing-found fallback showed the sighting that caused the stop), and once
+more as the same frame handed out a second time because nothing recognised
+that it was the same object.
+
+Three changes to `scan_session.py` close it:
+
+- **`_note_escapes` now also holds an "unseen" eviction**, not only
+  `exit-zone`. Both mean the same thing here — the object is gone and will not
+  be in the stationary frames — the old restriction to `exit-zone` just
+  happened to be sufficient at the old, shorter delay.
+- **A running tally of the newest sighting of every not-yet-shown track**
+  (`_last_sighting`), taken every frame while `settling` or `sampling`. An
+  object evicted as unseen is, by definition, not in the frame it was evicted
+  on — `_note_escapes` can no longer cut its box from "the frame being
+  processed right now" the way it does for an `exit-zone` eviction, so it
+  needs the last frame the object actually appeared in, kept on hand.
+  `_flush_unresolved_sightings` runs once, right before the escape queue is
+  built, and converts any sighting from before the stationary samples began
+  into an escape the same way `_note_escapes` does — it exists for the
+  3–8 frame gap between "last seen" and "formally evicted" that `_note_escapes`
+  alone cannot close, since eviction only happens after
+  `TRACK_STALE_AFTER_SECONDS` (0.3 s) of being unseen.
+- **The nothing-found fallback no longer fires for objects already queued as
+  escapes.** `_promote_from_samples` now checks, before falling back to the
+  trigger frame, whether every track id that stopped the belt has already been
+  queued by the two mechanisms above. If so the trigger frame is dropped
+  rather than shown — it would be the same object a second time, from an
+  earlier and worse-placed sighting than the escape already holds.
+
+One more bug, caught by the regression test rather than production: with
+`STOP_COMMAND_DELAY_SECONDS=0` the stop command is still sent synchronously
+(`conveyor_service.send` blocks for the serial round-trip), but the settle
+deadline used to be set from *before* that call rather than after. A slow
+conveyor acknowledgment could then eat into the settle window, and a frame of
+the still-decelerating belt could be taken as a stationary sample. The deadline
+is now always set after the send completes, delayed or not.
+
+`scripts/test_stop_delay_escapes.py` is the regression: three objects in
+separate lanes, replaying the 13:27 timing, in two shapes — all three leaving
+the frame before the stop lands, and one still parked in view when it does.
+Every object is shown exactly once in both.
+
+**This script and `test_settle.py` open the real conveyor serial port
+(`/dev/ttyTHS0`) unless run with `USE_MOCK_CAMERA=true`.** Without it they send
+genuine `FM_detected`/stop commands to whatever is connected — harmless if the
+belt is already stopped and nothing is running, but both now refuse to start
+without the flag rather than leave that to the person running them:
+
+```
+USE_MOCK_CAMERA=true /home/nvidia/.virtualenvs/eye_compass/bin/python scripts/test_stop_delay_escapes.py
+USE_MOCK_CAMERA=true /home/nvidia/.virtualenvs/eye_compass/bin/python scripts/test_settle.py
+```
 
 `detection_queue` survives as a safety net and should now always read 0 — a
 sighting is resolved into one screen before capture pauses, so nothing reaches
@@ -805,7 +890,8 @@ out there.
 | `TRACK_X_TOLERANCE_RATIO` | `0.25` | The same tolerance as a fraction of the object's own width |
 | `DETECTION_MERGE_IOU` | `0.6` | Overlap above which two boxes in one frame are treated as one object |
 | `DETECTION_QUEUE_MAX` | `20` | Most detections that may wait behind the one on screen |
-| `DETECTION_SETTLE_SECONDS` | `1.0` | How long to let the belt stop before looking |
+| `STOP_COMMAND_DELAY_SECONDS` | `1.0` | How long to hold the stop command back after a sighting, so the object travels further before braking |
+| `DETECTION_SETTLE_SECONDS` | `1.0`* | How long to let the belt stop before looking, measured from when the stop command actually goes out |
 | `DETECTION_SAMPLE_FRAMES` | `3` | Stationary frames combined into one review screen; 1 disables |
 | `DETECTION_START_GRACE_SECONDS` | `2.0` | How long to let the belt get moving on a batch's first Start before detecting; 0 disables |
 | `REVIEW_JPEG_QUALITY` | `88` | Quality of the frozen review frame, which is sent at full sensor width rather than `STREAM_MAX_WIDTH` |
@@ -815,12 +901,34 @@ corresponds to legacy's *other* queue, the `LifoQueue(maxsize=32)` between the
 camera thread and the inference thread (`GrabImage.py:85`); this port grabs and
 infers in one loop and has no equivalent.
 
-### 8.1 The two switches behind "stop, settle, then look"
+*`DETECTION_SETTLE_SECONDS`'s default has since been raised on the device, to
+`5.0` — current `eye_compass_be/.env` and `app/core/config.py` are the source
+of truth for what is actually running; the `1.0` used in this section's prose
+is the value in effect when §4/§8.1 were written and does not affect how the
+setting behaves, only how long the default wait is.
+
+### 8.1 The switches behind "stop, settle, then look"
 
 Section 4's behaviour is the one worth being able to back out of a device
 without a code change, because it is the only change here that alters what the
-operator experiences rather than just what is correct. Both settings live in
+operator experiences rather than just what is correct. These settings live in
 `eye_compass_be/.env` and take effect on a service restart.
+
+**`STOP_COMMAND_DELAY_SECONDS`** (default `1.0`) — how long to hold the stop
+command back after a sighting, so the belt carries the object further before
+braking. See §4.1 for why this exists, what it opened up in the escape
+handling, and the fix.
+
+- Raise it if objects are still coming to rest too close to the near edge.
+- Lower it, or set it to `0`, if objects now overshoot — coming to rest past
+  the middle of the frame, or leaving the view before the belt stops at all.
+  `0` sends the stop immediately, the original behaviour.
+- This runs **before** `DETECTION_SETTLE_SECONDS`, not instead of it — the two
+  add together. The settle window exists so the review photo is not blurred by
+  a still-moving belt; this one exists so the belt has moved further by the
+  time it starts braking. Raising `DETECTION_SETTLE_SECONDS` cannot do this
+  setting's job (see §4.1) — it only delays the review screen the operator
+  waits for, not where the object stops.
 
 **`DETECTION_SETTLE_SECONDS`** (default `1.0`) — how long to wait, after the
 belt has been told to stop, before taking the frames the review screen is built
@@ -852,6 +960,7 @@ sitting together reached the operator as 5, then 1, then 4.
 To return a device to the pre-existing behaviour entirely:
 
 ```
+STOP_COMMAND_DELAY_SECONDS=0
 DETECTION_SETTLE_SECONDS=0
 DETECTION_SAMPLE_FRAMES=1
 ```
@@ -1026,7 +1135,8 @@ Runnable with the service virtualenv from the backend root:
 | `test_queue.py` | The four states of the review screen: first detection shown, second queued behind it, Submit promoting while staying frozen and interlocked, Submit on an empty queue restoring the live view |
 | `test_merge.py` | Both live class-confusion pairs merged, genuinely adjacent objects kept separate |
 | `test_identity.py` | An already-reviewed object not shown again when a different object arrives; a left-edge object reported once and not again |
-| `test_settle.py` | Nothing shown until the belt has stopped; three stationary frames finding different subsets combined into one screen carrying all five objects; fallback when the stationary frames find nothing; an object leaving the view mid-stop held and shown afterwards; raw frames written off the loop |
+| `test_settle.py` | Nothing shown until the belt has stopped; three stationary frames finding different subsets combined into one screen carrying all five objects; fallback when the stationary frames find nothing; an object leaving the view mid-stop held and shown afterwards; raw frames written off the loop. Requires `USE_MOCK_CAMERA=true` — opens the real conveyor port otherwise |
+| `test_stop_delay_escapes.py` | §4.1's regression: three objects, replaying the 16 Oct 13:27 timing with `STOP_COMMAND_DELAY_SECONDS` in effect — every object shown exactly once, both when all three leave the frame before the stop lands and when one is still parked in view when it does. Also requires `USE_MOCK_CAMERA=true` |
 | `test_start_grace.py` | An object under the camera at the first Start is not detected, does not stop the belt and is not counted while the belt is at rest; the same object is detected once the belt moves and reaches the count exactly once; a mid-batch resume still detects immediately; `DETECTION_START_GRACE_SECONDS=0` restores the previous behaviour |
 
 Several assert against coordinates taken verbatim from production logs, so a
@@ -1043,10 +1153,14 @@ regression reproduces the original failure rather than an approximation of it.
   so — but it is a genuine "skips FM" path. Changing it to a per-detection
   filter would shift counts relative to the legacy machine, so it needs an
   explicit decision.
-- **The first detection of a burst has no settling delay.** The port never had
-  legacy's 0.41–0.56 s travel compensation. If objects come to rest short of
-  where operators reach for them, this is the cause. It is a physical
-  calibration question, not a code one.
+- **Closed 16 Oct:** the first detection of a burst used to have no settling
+  delay — the port never had legacy's 0.41–0.56 s travel compensation, and
+  objects came to rest short of where operators reach for them.
+  `STOP_COMMAND_DELAY_SECONDS` (§4.1) adds it back as a configurable wait
+  before the stop command is sent. Still a physical calibration question, not
+  a code one — the setting decides how long to wait, not how far that actually
+  moves the object on a given belt, so it needs tuning per device the same way
+  the belt-speed constant in §12 does.
 - **`CAMERA_FRAME_DECIMATION` is still 2.** Now that decimation happens before
   inference it is free to set to 1, roughly doubling the detection rate. With
   ~16 looks per object already, it is not currently needed.
@@ -1230,13 +1344,34 @@ objects is waiting, the most recently identified one is shown first, then the
 one before it, and so on back. The object just identified is the one the
 operator is looking at on the belt.
 
-**And one thing that can still be lost.** This belt is fast — an object crosses
-the whole picture in under a second, about as long as the belt takes to stop —
-so the stopped-belt photos often contain nothing at all, and an object the AI
-stops spotting partway through the stop is not caught. Showing everything ever
-seen during the stop was tried and made things worse at the time, because it
-was built on top of the identity problem above. Worth trying again now that
-part is fixed.
+**Making objects stop further from where they were first spotted.** Operators
+wanted an object to come to rest nearer the middle of the picture, where it is
+easier to reach, rather than right where it was first seen. The belt is now
+told to keep running for a short extra wait (`STOP_COMMAND_DELAY_SECONDS`, 1
+second by default) before the stop command goes out at all — the camera and AI
+keep working the whole time, so the object is still being watched as it travels
+further down. Turning up `DETECTION_SETTLE_SECONDS` instead does not do this:
+by the time that wait starts, the stop has already been sent and the resting
+place is already decided — it only makes the operator wait longer to see it.
+
+**This belt is fast** — an object crosses the whole picture in under a second,
+about as long as the belt takes to stop — so the stopped-belt photos often
+contain nothing at all, and running the belt on for that extra second made it
+worse: an object usually used to cross the point where the machine would catch
+it leaving (a narrow strip right at the bottom) in a single jump, so it was
+never seen there and nothing caught it at all. Three objects placed a few
+seconds apart on 16 Oct showed this exactly: only the one that triggered the
+stop reached the operator, and it was shown twice over — once correctly, once
+as a mistaken second copy of the same object.
+
+The fix is that the machine now keeps a running note of where every
+not-yet-reviewed object was last actually seen, however it left — whether it
+visibly crossed the exit strip or simply was not found again. Anything that
+vanishes is queued for review from that last sighting, the same as before. And
+the mistaken second copy is gone too: the machine now checks whether an object
+has already been queued this way before showing the "nothing found, falling
+back to the original sighting" screen, so the same object cannot reach the
+operator by both routes at once.
 
 **A second thing that was making it worse.** Every detection was saving a
 full-size photo to disk, which took 52 milliseconds — more than twice as long as
@@ -1251,21 +1386,29 @@ than just making the counts right, so it can be backed out from
 `eye_compass_be/.env` without touching any code. Restart the service afterwards.
 
 ```
+STOP_COMMAND_DELAY_SECONDS=0
 DETECTION_SETTLE_SECONDS=0
 DETECTION_SAMPLE_FRAMES=1
 ```
 
+- **`STOP_COMMAND_DELAY_SECONDS`** (normally `1.0`) is how long the belt keeps
+  running after an object is spotted, before it is told to stop at all. Raise
+  it if objects are stopping too close to the near edge. Lower it, or set it
+  to `0`, if objects now run past the middle of the picture, or leave it
+  entirely before the belt stops. `0` sends the stop immediately — the
+  original behaviour.
 - **`DETECTION_SETTLE_SECONDS`** (normally `1.0`) is how long to wait for the
-  belt to stop before taking the photos. Raise it if the boxes do not sit
-  properly on the objects in the frozen image — that means the belt was still
-  moving. Lower it to make the screen appear sooner. `0` means take the photo
-  straight away.
+  belt to stop before taking the photos — this is a separate wait, counted
+  from after the stop command above has gone out, not instead of it. Raise it
+  if the boxes do not sit properly on the objects in the frozen image — that
+  means the belt was still moving. Lower it to make the screen appear sooner.
+  `0` means take the photo straight away.
 - **`DETECTION_SAMPLE_FRAMES`** (normally `3`) is how many photos of the
   stopped belt to combine. Raise it if objects are still turning up on separate
   screens; each extra one adds about 50 milliseconds. `1` means use a single
   photo, which is the old behaviour.
 
-Setting both as shown above returns the machine to how it worked before.
+Setting all three as shown above returns the machine to how it worked before.
 Everything else in this document keeps working — the counting fixes, the
 duplicate merging, the tracking. The only thing that comes back is one group of
 objects being spread over several screens.

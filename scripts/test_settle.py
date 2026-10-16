@@ -1,18 +1,23 @@
 """Stop, settle, look — one review screen per group of objects.
 
-    /home/nvidia/.virtualenvs/eye_compass/bin/python scripts/test_settle.py
+    USE_MOCK_CAMERA=true /home/nvidia/.virtualenvs/eye_compass/bin/python scripts/test_settle.py
 
 Reproduces the 28 Sep case where five objects sitting together on the belt
 reached the operator as 5 boxes, then 1, then 4 across three screens: the model
 does not find the same set in every frame, and the first frame was being frozen
 immediately.
 """
-import sys, tempfile, time
+import os, sys, tempfile, time
 sys.path.insert(0, '.')
+# Without the mock this opens the real /dev/ttyTHS0 and sends FM_detected to
+# the production belt — it did, 16 Oct, while the backend held the same port.
+if os.getenv("USE_MOCK_CAMERA", "").lower() != "true":
+    sys.exit("refusing to run: set USE_MOCK_CAMERA=true (real conveyor otherwise)")
 import numpy as np
 from app.core.config import settings
 settings.OUTPUT_DIR = tempfile.mkdtemp()
 settings.DETECTION_SETTLE_SECONDS = 0.0      # no real waiting in a test
+settings.STOP_COMMAND_DELAY_SECONDS = 0.0    # nor before the stop goes out
 # The belt-start grace would otherwise suppress detection for the first
 # seconds of every run started here; these tests feed frames immediately.
 settings.DETECTION_START_GRACE_SECONDS = 0.0

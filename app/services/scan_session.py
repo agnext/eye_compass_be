@@ -72,6 +72,37 @@ def _fmt_boxes(boxes: List) -> str:
     return "[" + ", ".join(out) + "]"
 
 
+def _down_belt_position(boxes: List, frame_h: int) -> str:
+    """Where a set of boxes sits along the belt, for the stop-distance logs.
+
+    Reported as each box's vertical centre, in pixels and as a percentage of
+    frame height, because that is the axis the belt travels along: _set_pending
+    already orders by it on the grounds that a larger y means "further down the
+    belt". The camera looks straight down at the middle, so an object resting
+    near 50% is sitting directly under the lens — which is the thing these logs
+    exist to measure.
+    """
+    if not boxes or not frame_h:
+        return "none"
+    parts = []
+    for b in boxes:
+        if len(b) < 4:
+            continue
+        centre = (float(b[1]) + float(b[3])) / 2.0
+        parts.append("{:.0f}px ({:.1f}%)".format(
+            centre, 100.0 * centre / float(frame_h)))
+    return ", ".join(parts) if parts else "none"
+
+
+def _mean_centre_y(boxes: List) -> Optional[float]:
+    """Mean vertical centre of a box set, or None when there is nothing to
+    measure. Used only to report how far a stop carried the objects."""
+    centres = [
+        (float(b[1]) + float(b[3])) / 2.0 for b in boxes if len(b) >= 4
+    ]
+    return sum(centres) / len(centres) if centres else None
+
+
 # _COLOR_ORDER_NOTE — why the three save sites below write their frame/crop
 # as-is, dropping the cv2.COLOR_BGR2RGB conversion legacy applies at each of
 # its own (main.py:1361 submit_fm_type, main.py:2464 save_raw_image).
@@ -373,6 +404,16 @@ class ScanSession:
         # freeze-the-first-frame behaviour caught. Each is kept with the frame
         # it was last seen in, and shown after the main screen.
         self._escaped: Dict = {}
+        # The most recent frame and box each not-yet-shown track was actually
+        # detected in, during settling/sampling. _note_escapes needs it because
+        # most objects do not leave through the exit zone: with the belt
+        # running on through STOP_COMMAND_DELAY_SECONDS an object moves ~120px
+        # per inferred frame, so it usually jumps clean past the 50px exit band
+        # and is evicted as "unseen" instead — by which time the frame in hand
+        # no longer contains it. Keyed by track id: {"frame", "box"}.
+        self._last_sighting: Dict = {}
+        # frame_count of the first stationary sample of the current stop.
+        self._sampling_from = 0
 
         # Bumped every time a different frame is put on the review screen. The
         # stream loop sends the frozen frame once and then holds it, so with a
@@ -1289,6 +1330,7 @@ class ScanSession:
             # Nothing is shown or counted until the belt has stopped and a few
             # stationary frames have been combined. See review_phase in reset().
             if self.review_phase in ("settling", "sampling"):
+                self._record_sightings(frame, detections, assignment)
                 self._note_escapes(frame, h, w)
 
             if self.review_phase == "settling":
@@ -1297,6 +1339,8 @@ class ScanSession:
                     return self._snapshot(fm_detected=False)
                 self.review_phase = "sampling"
                 self._samples = []
+                # First stationary frame — see _flush_unresolved_sightings.
+                self._sampling_from = self.frame_count
                 # Falls through — the frame that ends the wait is the first
                 # stationary one, and there is no reason to discard it.
 
@@ -1387,14 +1431,80 @@ class ScanSession:
                         _n, len(candidates), _fmt_boxes([_raw]), _tid,
                     )
                 conveyor_service.lock_machine_start(reason="FM_detected")
-                conveyor_service.send("FM_detected")
+                # The stop command is deliberately held back by
+                # STOP_COMMAND_DELAY_SECONDS so the object travels a little
+                # further before the belt brakes. The wait runs on a timer
+                # thread rather than here, because this is the capture loop:
+                # sleeping in it would freeze the camera and the model for the
+                # whole delay, exactly while the belt is still moving and the
+                # object still needs to be seen. The start lock above is taken
+                # immediately all the same, so the operator cannot restart in
+                # the gap before the stop lands.
+                _stop_delay = max(settings.STOP_COMMAND_DELAY_SECONDS, 0.0)
+                _t_stop_sent = time.monotonic() + _stop_delay
+                if _stop_delay:
+                    threading.Timer(
+                        _stop_delay,
+                        conveyor_service.send,
+                        args=("FM_detected",),
+                    ).start()
+                else:
+                    conveyor_service.send("FM_detected")
+                    # send() blocks for the serial round-trip (it waits for the
+                    # ack). The settle window must start once that is done, as
+                    # it did before the delay existed — measured from before
+                    # it, a slow ack ate the whole window and a frame from a
+                    # still-moving belt was taken as a stationary sample.
+                    _t_stop_sent = time.monotonic()
                 self.review_phase = "settling"
+                # Settling can only begin once the belt has been told to stop,
+                # so the delay is part of the deadline, not something the
+                # settle window absorbs.
                 self._settle_deadline = (
-                    time.monotonic() + settings.DETECTION_SETTLE_SECONDS)
+                    _t_stop_sent + settings.DETECTION_SETTLE_SECONDS)
                 logger.info(
-                    "Foreign matter sighted (%s object(s)) — belt stopping, "
-                    "looking again in %.1fs once it has settled",
-                    len(candidates), settings.DETECTION_SETTLE_SECONDS,
+                    "Foreign matter sighted (%s object(s)) — stop goes out in "
+                    "%.1fs (belt keeps running, detection keeps running), "
+                    "looking again %.1fs after that once it has settled",
+                    len(candidates), _stop_delay,
+                    settings.DETECTION_SETTLE_SECONDS,
+                )
+                # Stop-distance trace, part 1 of 2 — see STOP_GEOMETRY settled
+                # in _promote_from_samples for the other half. Together they
+                # say where each object was when the belt was told to stop and
+                # where it actually came to rest, which is the only way to tell
+                # a braking-distance problem from a trigger-point one.
+                #
+                # Recorded here because the ordering is the whole point: the
+                # settle deadline is measured from the moment FM_detected goes
+                # out, so DETECTION_SETTLE_SECONDS cannot move the resting
+                # place — it only delays the look that follows. The one knob
+                # that does move it is STOP_COMMAND_DELAY_SECONDS, the wait
+                # before the stop is sent at all.
+                self._trigger["frame_h"] = h
+                self._trigger["stop_sent_at"] = _t_stop_sent
+                # Which tracks stopped the belt, so _promote_from_samples can
+                # tell when every one of them has already been queued as an
+                # escape and the fallback would only show them a second time.
+                self._trigger["track_ids"] = [
+                    tid for tid, _bx, _raw in candidates]
+                # Seed their sightings from the trigger frame itself. An
+                # object only ever seen on this one frame is otherwise unknown
+                # to _note_escapes when it is evicted as unseen.
+                for tid, _bx, _raw in candidates:
+                    if tid is not None:
+                        self._last_sighting[tid] = {
+                            "frame": self._trigger["frame"], "box": list(_raw),
+                            "frame_no": self.frame_count}
+                logger.info(
+                    "STOP_GEOMETRY trigger: frame=%s down-belt %s | stop sent "
+                    "in %.1fs, %.1fs settle starts after that (only the stop "
+                    "delay moves where it halts, the settle does not)",
+                    self.frame_count,
+                    _down_belt_position(
+                        [raw for _tid, _bx, raw in candidates], h),
+                    _stop_delay,
+                    settings.DETECTION_SETTLE_SECONDS,
                 )
                 self.existing_track_ids.update(track_ids)
                 return self._snapshot(fm_detected=False)
@@ -1465,6 +1575,25 @@ class ScanSession:
                 return True
         return False
 
+    def _record_sightings(self, frame: np.ndarray, detections: List,
+                          assignment: List):
+        """Keep the latest frame and box for every not-yet-shown track.
+
+        One copy of the frame is shared by every track seen on it, and each
+        track only ever holds its newest one, so this stays a handful of
+        frames however long the stop delay runs.
+        """
+        snapshot = None
+        for i, det in enumerate(detections):
+            tid = assignment[i] if i < len(assignment) else None
+            if tid is None or tid in self.counted_track_ids or len(det) < 4:
+                continue
+            if snapshot is None:
+                snapshot = frame.copy()
+            self._last_sighting[tid] = {
+                "frame": snapshot, "box": list(det),
+                "frame_no": self.frame_count}
+
     def _note_escapes(self, frame: np.ndarray, h: int, w: int):
         """Remember anything that leaves the view while the belt is stopping.
 
@@ -1477,9 +1606,21 @@ class ScanSession:
 
         Only ids that have never been shown are kept. An object already
         reviewed is expected to leave.
+
+        "unseen" evictions count too. With the belt running on through
+        STOP_COMMAND_DELAY_SECONDS an object moves ~120px per inferred frame,
+        so it usually jumps straight past the 50px exit band and is dropped
+        for going unseen instead. Ignoring those lost objects outright —
+        confirmed 16 Oct: three objects on the belt, tracks 24 and 25 were
+        both evicted "unseen(0.34s)" off the bottom and never shown. For
+        those the frame in hand no longer contains the object, so the image
+        and box come from _last_sighting, the last frame it was detected in.
+        An object that merely flickered out on a stopped belt is caught by
+        _queue_escapes' still_visible check and not shown twice.
         """
         for obj_id, reason in self.tracker.last_evicted.items():
-            if not reason.startswith("exit-zone"):
+            exited = reason.startswith("exit-zone")
+            if not (exited or reason.startswith("unseen")):
                 continue
             if obj_id in self.counted_track_ids or obj_id in self._escaped:
                 continue
@@ -1493,18 +1634,58 @@ class ScanSession:
             # Reported live, 29 Sep: one object, three screens.
             if self.tracker.last_evicted_first_frames.get(obj_id) == self.frame_count:
                 continue
-            box = self.tracker.last_evicted_boxes.get(obj_id)
+            sighting = self._last_sighting.pop(obj_id, None)
+            if exited:
+                # Its box was updated on this very frame, so the two match.
+                box = self.tracker.last_evicted_boxes.get(obj_id)
+                seen_in = frame
+            elif sighting is not None:
+                box = sighting["box"]
+                seen_in = sighting["frame"]
+            else:
+                continue
             if box is None or len(box) < 4:
                 continue
             self._escaped[obj_id] = {
-                "frame": frame.copy(),
+                "frame": seen_in.copy() if seen_in is frame else seen_in,
                 "box": enlarge_bbox(box, pad=20, img_w=w, img_h=h),
                 "raw_box": list(box),
             }
             logger.warning(
-                "Object %s left the frame while the belt was still stopping — "
-                "holding its last sighting to show after the main screen.",
-                obj_id,
+                "Object %s left the frame while the belt was still stopping "
+                "(%s) — holding its last sighting to show after the main "
+                "screen.",
+                obj_id, reason,
+            )
+
+    def _flush_unresolved_sightings(self, h: int, w: int):
+        """Treat anything seen during the stop but not on the stopped belt as
+        an escape.
+
+        _note_escapes only hears about an object once the tracker evicts it,
+        which for one that went unseen takes ~0.34s. An object that slipped
+        out of view inside that last stretch before the stationary samples
+        finish has not been evicted yet, is not on any stationary frame, and
+        would otherwise be lost with the rest of this cycle's state. Only
+        sightings from BEFORE sampling began are taken: anything seen on a
+        stationary frame is on the main screen already, and _queue_escapes'
+        still_visible check catches the rest.
+        """
+        for tid, seen in list(self._last_sighting.items()):
+            if tid in self.counted_track_ids or tid in self._escaped:
+                continue
+            if seen.get("frame_no", 0) >= self._sampling_from:
+                continue
+            box = seen["box"]
+            self._escaped[tid] = {
+                "frame": seen["frame"],
+                "box": enlarge_bbox(box, pad=20, img_w=w, img_h=h),
+                "raw_box": list(box),
+            }
+            logger.warning(
+                "Object %s was seen while the belt was stopping but is not on "
+                "the stopped belt — holding its last sighting (frame %s) to "
+                "show after the main screen.", tid, seen.get("frame_no"),
             )
 
     def _queue_escapes(self, still_visible=None):
@@ -1523,6 +1704,8 @@ class ScanSession:
         showed the operator the same object twice.
         """
         escaped, self._escaped = self._escaped, {}
+        # The settle cycle is over: nothing will be evicted against these now.
+        self._last_sighting = {}
         for obj_id, item in list(escaped.items()):
             if self._overlaps_any(item["raw_box"], still_visible or []):
                 logger.info(
@@ -1543,6 +1726,7 @@ class ScanSession:
                 "queued behind the main screen: %s",
                 len(escaped), sorted(escaped),
             )
+        return set(escaped)
 
     def _promote_from_samples(self, h: int, w: int):
         """Combine the stationary frames into one review screen.
@@ -1565,12 +1749,58 @@ class ScanSession:
         combined = self._merge_overlapping_detections(combined)
         frame = samples[-1]["frame"] if samples else None
 
+        # Stop-distance trace, part 2 of 2 — the companion to STOP_GEOMETRY
+        # trigger. `combined` is measured on stationary frames, so this is
+        # where the objects genuinely ended up; the delta against the trigger
+        # is how far the belt carried them while braking. A delta near zero
+        # with a resting place near 50% means the belt stops faster than the
+        # object can clear the lens, and no amount of settle time will change
+        # that — the trigger has to fire earlier, or the belt has to run on.
+        _trigger_h = (trigger or {}).get("frame_h") or h
+        _settled_y = _mean_centre_y(combined)
+        _trigger_y = _mean_centre_y((trigger or {}).get("raw_boxes") or [])
+        if _settled_y is not None and _trigger_y is not None and _trigger_h:
+            _moved = _settled_y - _trigger_y
+            logger.info(
+                "STOP_GEOMETRY settled: down-belt %s | travelled %+.0fpx "
+                "(%+.1f%% of frame) while braking, over %.1fs settle + %s "
+                "stationary frame(s)",
+                _down_belt_position(combined, _trigger_h),
+                _moved, 100.0 * _moved / float(_trigger_h),
+                settings.DETECTION_SETTLE_SECONDS, len(samples),
+            )
+        elif _settled_y is not None:
+            logger.info(
+                "STOP_GEOMETRY settled: down-belt %s | no trigger box to "
+                "compare against",
+                _down_belt_position(combined, _trigger_h),
+            )
+
         # Anything that left the view while the belt was stopping goes behind
         # whatever the stationary frames turn up. Queued before every exit
         # below, including the ones that find nothing, so they still show —
         # but after `combined` exists, because anything still sitting in view
         # belongs on the main screen instead of behind it.
-        self._queue_escapes(still_visible=combined)
+        self._flush_unresolved_sightings(h, w)
+        queued = self._queue_escapes(still_visible=combined)
+
+        # The objects that stopped the belt usually leave the view during
+        # STOP_COMMAND_DELAY_SECONDS and are queued just above as escapes, with
+        # their last sighting. Falling back to the trigger frame as well put
+        # the same object on screen twice — seen 16 Oct, track 23 shown as
+        # both the fallback and the escape. When every triggering track is
+        # already queued, the escape screen is the one to keep: it is a later,
+        # better-placed sighting of the same object.
+        trigger_ids = [t for t in (trigger or {}).get("track_ids") or []]
+        if (not combined and trigger is not None and trigger_ids
+                and None not in trigger_ids
+                and all(t in queued for t in trigger_ids)):
+            logger.info(
+                "Nothing found once stopped, but the object(s) that stopped "
+                "the belt %s are already queued as escapes — not showing the "
+                "trigger frame a second time.", sorted(trigger_ids),
+            )
+            trigger = None
 
         if not combined and trigger is not None:
             # Gate the fallback on how confident the original sighting was.
@@ -1663,6 +1893,7 @@ class ScanSession:
         """Nothing to review after all — hand the belt back without a screen."""
         self.review_phase = "idle"
         self._escaped = {}
+        self._last_sighting = {}
         conveyor_service.unlock_machine_start(reason="nothing to review")
 
     def _set_pending(self, boxes: List, raw_boxes: Optional[List] = None):
@@ -2042,6 +2273,8 @@ class ScanSession:
             self.detection_queue = []
             self._samples = []
             self._trigger = None
+            self._escaped = {}
+            self._last_sighting = {}
             self.review_phase = "idle"
             # The belt is stopped just below, so suspend detection until the
             # operator presses Start — exactly as resume() does. Without this
