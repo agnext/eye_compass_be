@@ -1,0 +1,412 @@
+import os
+import logging
+import configparser
+import gspread
+import requests
+import json
+from google.oauth2.service_account import Credentials
+
+parser = configparser.RawConfigParser()
+parser.read('config.INI')
+
+
+def get_cpu_id():
+    # Returns a unique machine identifier with fallback options.
+    paths = [
+        "/etc/machine-id",
+        "/var/lib/dbus/machine-id"
+    ]
+
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    machine_id = f.read().strip()
+                    logging.info(f"Machine ID found in {machine_id}")
+                    return machine_id
+            except Exception:
+                continue
+
+    return None
+
+
+logging.info("machine ID: %s", get_cpu_id())
+
+# --- Configuration ---
+# [GOOGLE_SHEETS] in config.INI is the source of truth; GOOGLE_APPLICATION_CREDENTIALS
+# (if set) overrides the configured key file path, e.g. for per-deployment secrets
+# management without touching config.INI.
+SHEETS_ENABLED = parser.getboolean('GOOGLE_SHEETS', 'enabled', fallback=True)
+SPREADSHEET_ID = parser.get('GOOGLE_SHEETS', 'spreadsheet_id',
+                             fallback="1WqnBWivIIYHcUiLKkSBSdLxzAe4u4SVqNRzEm2CizGs")
+SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') or parser.get(
+    'GOOGLE_SHEETS', 'service_account_file', fallback="sturdy-lore-271106-75bcb0be8976.json")
+API_URL = "YOUR_API_ENDPOINT_URL"  # Replace with your actual API endpoint
+API_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Authorization": "Bearer YOUR_API_TOKEN",  # Replace with your actual API token if needed
+    "User-Agent": "EyeCompass-DataUploader/1.0"
+}
+
+def initialize_google_sheets():
+    """Initialize Google Sheets connection"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+    client = gspread.authorize(creds)
+    # Bound every Google Sheets HTTP call so a slow/hung network can't block the
+    # calling worker thread forever (get_all_values / append_row had no timeout).
+    try:
+        client.set_timeout(30)  # gspread >= 5.7
+    except Exception:
+        try:
+            client.session.request = _with_timeout(client.session.request, 30)
+        except Exception:
+            pass
+    return client.open_by_key(SPREADSHEET_ID).sheet1
+
+
+def _with_timeout(request_fn, timeout):
+    """Wrap a requests Session.request to inject a default timeout."""
+    def wrapper(*args, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return request_fn(*args, **kwargs)
+    return wrapper
+
+def check_start_time_exists(start_time):
+    """
+    Check if a record with the given start_time already exists in Google Sheets
+    
+    Args:
+        start_time (str): The start_time to check for
+        
+    Returns:
+        bool: True if start_time exists, False otherwise
+    """
+    try:
+        sheet = initialize_google_sheets()
+        
+        # Get all values from the sheet
+        all_values = sheet.get_all_values()
+        
+        if not all_values:
+            return False
+        
+        # Find the header row to get the column index for start_time
+        headers = all_values[0] if all_values else []
+        try:
+            start_time_col_index = headers.index("start_time")
+        except ValueError:
+            # If "start_time" header not found, assume it's at index 8 (based on headers structure)
+            start_time_col_index = 8
+        
+        # Check all rows (skip header row)
+        for row in all_values[1:]:
+            if len(row) > start_time_col_index:
+                if row[start_time_col_index] == start_time:
+                    return True
+        
+        return False
+    except Exception as e:
+        print(f"⚠️ Error checking start_time in Google Sheets: {e}")
+        # If check fails, return False to allow sync (fail-safe)
+        return False
+
+def post_to_api(data, url, headers):
+    """Post data to the API endpoint"""
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=30)
+        response.raise_for_status()  # Raises an HTTPError for bad responses
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"❌ API Error: {e}")
+        return None
+
+def process_raw_data(raw_data):
+    """Process raw data and return structured row for Google Sheets"""
+    scan_data = raw_data["scan_data"]
+    analysis = raw_data["analysis"]
+
+    # Must match the real sheet's header row order exactly (verified against the
+    # live "Raw_Data" sheet) - vendor_name/vendor_code sit between brand and
+    # manufacturing_date; omitting them here silently shifted every later column
+    # two to the left.
+    headers = [
+        "sample_id", "Commodity", "Variety", "weight", "brand",
+        "vendor_name", "vendor_code",
+        "manufacturing_date", "receiving_date", "site_code",
+        "start_time", "end_time"
+    ]
+
+    # Create a dictionary to map analysis names to their values
+    analysis_dict = {}
+    for a in analysis:
+        analysis_dict[a["analysisName"]] = a["totalAmount"]
+
+    # Create the base row with scan data (matching your headers exactly)
+    row = [
+        scan_data["sample_id"],                    # sample_id
+        scan_data["commodity_name"],               # Commodity
+        scan_data["variety_name"],                 # Variety
+        scan_data["weight"],                       # weight
+        scan_data["brand"],                        # brand
+        scan_data.get("vendor_name", ""),           # vendor_name
+        scan_data.get("vendor_code", ""),           # vendor_code
+        scan_data["manufacturing_date"],           # manufacturing_date
+        scan_data["receiving_date"],               # receiving_date
+        scan_data["site_code"],                    # site_code
+        scan_data["process_start_time"],           # start_time
+        scan_data["process_end_time"]              # end_time
+    ]
+
+    # Add analysis results in the exact order of your headers
+    analysis_headers = [
+        "Others", "Husk", "Frame Count", "Blower FO", "Magnetic FO", 
+        "FM Stop Count", "Manual Stop Count", "FM Stop Time", 
+        "Manual Stop Time", "Total Stop Time", "total_fo_detected",
+        "Metal Fragments", "Mud balls", "Thread", "Feathers", "Dried Leaves",
+        "Plastic Pieces", "Insects", "Sticks", "Stones", "Paper", 
+        "Toffee wrappers", "Rubber", "Jute Fibers", "Glass pieces", "FM", "NON-FM"
+    ]
+
+    for analysis_name in analysis_headers:
+        row.append(analysis_dict.get(analysis_name, 0))  # Use 0 if not found
+
+    # Check for any extra analysis types not in the predefined list
+    extra_analysis = []
+    for a in analysis:
+        if a["analysisName"] not in analysis_headers:
+            extra_analysis.append(a["analysisName"])
+            row.append(a["totalAmount"])
+
+    # Print info about any extra analysis types found
+    if extra_analysis:
+        print(f"🔍 Found extra analysis types: {extra_analysis}")
+        print("📝 These have been added as new columns to the row")
+
+    # Device ID always goes last, regardless of any extra analysis columns above.
+    row.append(scan_data.get("device_id"))
+    # Epoch timestamp: internal uniqueness/tracking key alongside sample_id (column 1),
+    # which operators can and do reuse across different batches - never shown to the
+    # operator, appended last like Device_id so it doesn't shift any existing column.
+    row.append(scan_data.get("epoch_timestamp"))
+
+    # Print the complete header structure for verification
+    complete_headers = headers + analysis_headers + extra_analysis + ["Device_id", "Epoch_Timestamp"]
+    print(f"\n📊 Complete header structure ({len(complete_headers)} columns):")
+    print(" | ".join(complete_headers))
+    print(f"\n📋 Row data ({len(row)} values):")
+    print(" | ".join(map(str, row)))
+    
+    return row, complete_headers
+
+# How many times write_row_at_end recounts and tries again when another device
+# takes the target row first. Every device shares this one spreadsheet.
+SHEET_WRITE_ATTEMPTS = 3
+
+
+def write_row_at_end(sheet, row):
+    """Write `row` to the first free row after the last used one, then read it
+    back to prove it landed. Returns the row number, or 0 if it could not be
+    confirmed.
+
+    Replaces sheet.append_row(row). append_row asks Google to "find the table
+    and add after it" and lets Google choose the row; with no insertDataOption
+    sent, Google OVERWRITES whatever is there. On this shared sheet Google kept
+    choosing the same row (Raw_Data row 4017), so every new batch - from this
+    device and others - replaced the previous one and only the last survived
+    (edit history of A4017, 14-15 Oct 2026). Working out the end ourselves and
+    writing to an explicit range makes the destination predictable; the
+    read-back means a write that "succeeds" but leaves nothing behind is
+    reported instead of ignored.
+    """
+    from gspread.utils import rowcol_to_a1
+
+    last_col = rowcol_to_a1(1, len(row)).rstrip("1")      # e.g. 41 -> "AO"
+    for attempt in range(1, SHEET_WRITE_ATTEMPTS + 1):
+        target = len(sheet.get_all_values()) + 1
+        # Another device may have taken this row since we counted. Never write
+        # onto a row that already holds anything; count again instead.
+        existing = sheet.get("A%d:%s%d" % (target, last_col, target))
+        if existing and any(str(c).strip() for line in existing for c in line):
+            logging.warning("Sheets: row %s was taken by another writer "
+                            "(attempt %s/%s) - recounting",
+                            target, attempt, SHEET_WRITE_ATTEMPTS)
+            continue
+
+        sheet.update(values=[row], range_name="A%d" % target)
+
+        written = sheet.row_values(target)
+        if written and written[0] == str(row[0]):
+            logging.info("Sheets: %s written to row %s", row[0], target)
+            return target
+        logging.warning("Sheets: wrote %s to row %s but read back %r "
+                        "(attempt %s/%s)", row[0], target,
+                        (written or [""])[0], attempt, SHEET_WRITE_ATTEMPTS)
+    return 0
+
+
+def sync_data(raw_data, api_url=None, api_headers=None, update_sheets=True):
+    """
+    Main function to sync data to API and Google Sheets
+    
+    Args:
+        raw_data (dict): The raw data containing scan_data and analysis
+        api_url (str, optional): API endpoint URL. If None, uses default from config
+        api_headers (dict, optional): API headers. If None, uses default from config
+        update_sheets (bool): Whether to update Google Sheets (default: True)
+    
+    Returns:
+        dict: Results of the sync operation
+    """
+    results = {
+        "api_success": False,
+        "sheets_success": False,
+        "api_response": None,
+        "sheets_error": None,
+        "api_error": None
+    }
+    
+    # Use provided API config or defaults
+    if api_url is None:
+        api_url = API_URL
+    if api_headers is None:
+        api_headers = API_HEADERS
+    
+    # Process the raw data
+    print("🔄 Processing raw data...")
+    row, headers = process_raw_data(raw_data)
+    
+    # Post to API
+    if api_url != "YOUR_API_ENDPOINT_URL":  # Only if API URL is configured
+        print("🚀 Posting data to API...")
+        api_response = post_to_api(raw_data, api_url, api_headers)
+        
+        if api_response:
+            print(f"✅ Data posted successfully to API!")
+            print(f"📊 Response Status: {api_response.status_code}")
+            print(f"📝 Response: {api_response.text}")
+            results["api_success"] = True
+            results["api_response"] = api_response.text
+        else:
+            print("❌ Failed to post data to API")
+            results["api_error"] = "API request failed"
+    else:
+        print("⚠️ API URL not configured, skipping API sync")
+    
+    # Update Google Sheets
+    if update_sheets and SHEETS_ENABLED:
+        try:
+            print("📊 Updating Google Sheets...")
+            sheet = initialize_google_sheets()
+            # Not append_row: see write_row_at_end above.
+            if not write_row_at_end(sheet, row):
+                raise RuntimeError("the row could not be confirmed in the sheet")
+            print("✅ Data synced to Google Sheet")
+            logging.info("Data synced to Google Sheet")
+            results["sheets_success"] = True
+        except Exception as e:
+            print(f"⚠️ Google Sheet sync failed: {e}")
+            # Was print()-only before, which meant this failed silently for months
+            # (see: missing service_account_file) with nothing in the app log.
+            logging.warning("Google Sheet sync failed: %s", e)
+            results["sheets_error"] = str(e)
+    elif update_sheets and not SHEETS_ENABLED:
+        print("⚠️ Google Sheets sync disabled via config.INI [GOOGLE_SHEETS] enabled=false")
+        results["sheets_error"] = "Google Sheets sync disabled in config"
+
+    return results
+
+# # Example usage and test data
+# if __name__ == "__main__":
+#     # Sample data for testing
+#     sample_data = {
+#         "scan_data": {
+#             "sample_id": "TiberRice#5",
+#             "uuid": "0185e4e4-8718-11f0-b414-48b02df91547",
+#             "commodity_name": "RICE",
+#             "variety_name": "Tibar",
+#             "surveyor_name": "Surveyor",
+#             "image_unique_id": "TiberRice#5_20250901151041",
+#             "inspection_date": 1756719762300,
+#             "batch_no": "TiberRice#5",
+#             "weight": "26",
+#             "weight_unit": "kg",
+#             "variety_id": 240,
+#             "vendor_name": "",
+#             "vendor_code": "",
+#             "po": "01",
+#             "brand": "India Gate",
+#             "manufacturing_date": "01/09/2025",
+#             "receiving_date": "01/09/2025",
+#             "site_code": "715",
+#             "process_start_time": "01/09/2025 15:10:41",
+#             "process_end_time": "01/09/2025 15:12:41"
+#         },
+#         "analysis": [
+#             {
+#                 "analysisName": "Others",
+#                 "totalAmount": 2,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Husk",
+#                 "totalAmount": 1,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Frame Count",
+#                 "totalAmount": 208,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Blower FO",
+#                 "totalAmount": 0,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Magnetic FO",
+#                 "totalAmount": 0,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "FM Count",
+#                 "totalAmount": 7,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Manual Stop Count",
+#                 "totalAmount": 1,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "FM Stop Time",
+#                 "totalAmount": 86.0982756614685,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Manual Stop Time",
+#                 "totalAmount": 0.0002334117889404297,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "Total Stop Time",
+#                 "totalAmount": 86.09850907325745,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "total_fo_detected",
+#                 "totalAmount": 219,
+#                 "analysisType": "ICOMPASS"
+#             },
+#             {
+#                 "analysisName": "abc",
+#                 "totalAmount": 219,
+#                 "analysisType": "ICOMPASS"
+#             }
+#         ]
+#     }
+    
+#     # Run the sync
+#     results = sync_data(sample_data)
+#     print(f"\n📋 Final Results: {results}")

@@ -1,0 +1,4 @@
+# Pulled copies of production data: never committed.
+data/
+*.log
+__pycache__/
