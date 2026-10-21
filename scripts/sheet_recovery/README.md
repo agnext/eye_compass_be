@@ -19,20 +19,40 @@ behaviour.
 
 ## Putting the missing batches back
 
-Run with the backend's own virtualenv — confusingly named `eye_compass`, but it
-is the one `eye-compass-backend.service` uses, not the legacy app's (`m38`):
+Two steps: a dry run first, then the real run. Both commands work as they stand,
+from any folder. Change only the database file name to match the copy you made
+(see "Getting the database off a device" below).
+
+The python is the backend's own virtualenv — confusingly named `eye_compass`, but
+it is the one `eye-compass-backend.service` uses, not the legacy app's (`m38`).
+
+**1. Dry run — writes nothing.** Lists which batches are missing from the sheet
+and the row they would go to. Always do this first.
 
 ```
-cd eye_compass_be/scripts/sheet_recovery
-PY=/home/nvidia/.virtualenvs/eye_compass/bin/python
-
-$PY -I backfill_from_backup.py --db data/blr004.db            # dry run
-$PY -I backfill_from_backup.py --db data/blr004.db --send     # append them
+cd /home/nvidia/eye_compass_new/eye_compass_be/scripts/sheet_recovery
+/home/nvidia/.virtualenvs/eye_compass/bin/python -I backfill_from_backup.py --db data/eye_compass_blr_004.db
 ```
 
-`--db` is **your own copy** of the device's database (next section). Everything
-runs from that copy, so the device is never touched and need not be reachable.
-The dry run writes nothing: it lists what is missing and where it would go.
+**2. Actual run — appends the missing rows to the sheet.** The same command with
+`--send` on the end. It takes about a minute per four batches.
+
+```
+cd /home/nvidia/eye_compass_new/eye_compass_be/scripts/sheet_recovery
+/home/nvidia/.virtualenvs/eye_compass/bin/python -I backfill_from_backup.py --db data/eye_compass_blr_004.db --send
+```
+
+Options, added to either command:
+
+| Option | Meaning |
+|---|---|
+| `--db <file>` | Required. Your copy of the device's database. |
+| `--send` | Actually write. Without it nothing is written. |
+| `--since YYYY-MM-DD` | Only consider batches from that date on. Default is all of 2026. Example: `--since 2026-09-30` leaves out the August batches. |
+| `--limit N` | Stop after N rows. Useful for a first small real run: `--send --limit 2`. |
+
+The database is **your own copy** of the device's (next section). Everything runs
+from that copy, so the device is never touched and need not be reachable.
 
 Missing batches are **appended at the end, oldest first**. The tab is not in
 time order anyway — four devices append to it independently — and inserting
@@ -50,13 +70,16 @@ quota, so expect roughly a minute per four batches.
 
 ### Getting the database off a device
 
-Copy `/home/nvidia/eye_compass/eye_compass.db` from the device into `data/`
-here, naming it after the device (`data/blr004.db`). Any way you like — a USB
-stick, or from this Jetson:
+Copy `/home/nvidia/eye_compass/eye_compass.db` from the device into the `data/`
+folder here, as a file you can recognise (e.g. `data/eye_compass_blr_004.db`).
+Any way you like — a USB stick, or from this Jetson over the network:
 
 ```
-scp nvidia@<device>:/home/nvidia/eye_compass/eye_compass.db data/blr004.db
+scp nvidia@100.64.145.101:/home/nvidia/eye_compass/eye_compass.db /home/nvidia/eye_compass_new/eye_compass_be/scripts/sheet_recovery/data/eye_compass_blr_004.db
 ```
+
+(`100.64.145.101` is BLR-004. Check the file is not empty afterwards — a 0-byte
+file means the copy did not complete.)
 
 Copying only reads the device and does not disturb the running app. Do it while
 no batch is being saved, so the copy is not caught mid-write; between batches is
@@ -67,7 +90,8 @@ fine, as is any time the app is stopped.
 ### Checking before a run
 
 ```
-$PY -I test_backfill.py --db data/blr004.db
+cd /home/nvidia/eye_compass_new/eye_compass_be/scripts/sheet_recovery
+/home/nvidia/.virtualenvs/eye_compass/bin/python -I test_backfill.py --db data/eye_compass_blr_004.db
 ```
 
 Replays the whole backfill against a stand-in sheet, so it touches nothing. It

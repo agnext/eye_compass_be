@@ -76,7 +76,7 @@ import hashlib
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from app.core.config import settings
@@ -94,6 +94,10 @@ SESSION_DEPTH = 3
 # spend hours failing one file at a time. It is tried again at the next check.
 MAX_CONSECUTIVE_FAILURES = 5
 
+# Cognito credentials last about an hour. Renew this long before the stated
+# expiry, so no file is sent with credentials that run out mid-request.
+CREDENTIAL_RENEW_MARGIN = timedelta(minutes=5)
+
 
 class Deferred(Exception):
     """A scan or data collection started mid-run. Stop cleanly and retry later."""
@@ -103,6 +107,7 @@ class S3UploaderTask:
     def __init__(self):
         self.is_running = False
         self._client = None
+        self._expires_at: Optional[datetime] = None
 
     # ------------------------------------------------------------------
     # Credentials
@@ -136,12 +141,36 @@ class S3UploaderTask:
                 region_name=settings.S3_REGION,
                 config=cfg,
             )
-            logger.info("S3 credentials initialised for bucket %s", settings.S3_BUCKET)
+            self._expires_at = creds.get("Expiration")
+            logger.info(
+                "S3 credentials initialised for bucket %s (valid until %s)",
+                settings.S3_BUCKET, self._expires_at,
+            )
             return True
         except Exception as exc:
             logger.error("S3 init failed: %s", exc)
             self._client = None
+            self._expires_at = None
             return False
+
+    def _ensure_credentials(self) -> bool:
+        """Credentials good for at least CREDENTIAL_RENEW_MARGIN more, renewing if not.
+
+        They were fetched once at startup and never again, so an hour later
+        every request failed — each run stopped after the same five files and
+        nothing was uploaded or freed until the backend was restarted (20-21
+        Oct). Checked before every run and every file, since a run can outlast
+        them too.
+        """
+        if self._client is not None:
+            if self._expires_at is None:
+                # Cognito gave no expiry (or the client was supplied directly):
+                # _process_file still renews when S3 rejects it.
+                return True
+            if datetime.now(timezone.utc) < self._expires_at - CREDENTIAL_RENEW_MARGIN:
+                return True
+            logger.info("S3 credentials expire at %s — renewing", self._expires_at)
+        return self._init_s3()
 
     def _key_prefix(self) -> str:
         """Prefix from the Qualix client info if we have it, else config."""
@@ -438,7 +467,7 @@ class S3UploaderTask:
             summary["complete"] = True
             logger.info("S3 upload: nothing to upload (%s)", skipped)
             return summary
-        if self._client is None and not self._init_s3():
+        if not self._ensure_credentials():
             return summary
 
         prefix = self._key_prefix()
@@ -453,6 +482,9 @@ class S3UploaderTask:
                         raise Deferred(reason)
                     summary["files"] += 1
                     key = prefix + sub + "/" + os.path.relpath(path, root).replace(os.sep, "/")
+                    # A failed renewal is not handled here: the file then fails
+                    # like any other and counts towards the consecutive limit.
+                    self._ensure_credentials()
                     outcome = self._process_file(path, key, summary)
                     if outcome == "failed":
                         consecutive += 1
@@ -490,10 +522,12 @@ class S3UploaderTask:
         )
         return summary
 
-    def _process_file(self, path: str, key: str, summary: Dict) -> str:
+    def _process_file(self, path: str, key: str, summary: Dict, retry: bool = True) -> str:
         """Upload one file if needed, verify it, delete it if verified.
 
         Returns "ok", "kept" (uploaded or present, but not deleted) or "failed".
+        If S3 rejects the credentials, they are renewed and the file is tried
+        once more before it counts as failed.
         """
         try:
             before = os.stat(path)
@@ -535,11 +569,15 @@ class S3UploaderTask:
             summary["bytes_freed"] += now.st_size
             return "ok"
         except Exception as exc:
+            if retry and _credentials_rejected(exc):
+                logger.warning(
+                    "S3 rejected the credentials for %s (%s) — renewing and "
+                    "trying again", path, exc,
+                )
+                if self._init_s3():
+                    return self._process_file(path, key, summary, retry=False)
             summary["failed"] += 1
             logger.error("S3 upload failed for %s: %s", path, exc)
-            # Cognito credentials last about an hour; a long run outlives them.
-            if "ExpiredToken" in str(exc) or "InvalidAccessKeyId" in str(exc):
-                self._init_s3()
             return "failed"
 
     def _head(self, key: str) -> Optional[Dict]:
@@ -569,6 +607,28 @@ class S3UploaderTask:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+def _credentials_rejected(exc: Exception) -> bool:
+    """S3 refused who we are, rather than what we asked for.
+
+    Judged by status code, not message text. A HEAD request has no response
+    body, so expired credentials there come back as a bare "400 Bad Request"
+    with no ExpiredToken anywhere in it — which is how the old text match
+    missed every expiry. A 400 or 403 for any other reason costs one needless
+    renewal, and the file then fails as before.
+    """
+    from botocore.exceptions import ClientError
+
+    if not isinstance(exc, ClientError):
+        return False                  # network trouble: renewing will not help
+    code = str(exc.response.get("Error", {}).get("Code", ""))
+    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return (
+        code in ("ExpiredToken", "InvalidAccessKeyId", "InvalidToken",
+                 "TokenRefreshRequired", "400", "403")
+        or status in (400, 403)
+    )
+
 
 def _matches(head: Optional[Dict], digest: str, size: int) -> bool:
     """S3's stored copy has exactly this SHA-256 and size.

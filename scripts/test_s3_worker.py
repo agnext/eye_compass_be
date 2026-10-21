@@ -15,7 +15,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -352,5 +352,119 @@ check("db down: does not run, nothing deleted",
       task.tick() is None and len(remaining(root)) == len(files))
 S3UploaderTask._load_state = staticmethod(real_load)
 check("db back: runs", task.tick() is not None and remaining(root) == [])
+
+# 15. Expired credentials. On the device (20-21 Oct) they were fetched once at
+#     startup and never renewed: an hour later every request failed, each run
+#     stopped after the same five files, and nothing was uploaded or freed
+#     until the backend was restarted. S3 answers an expired token on HEAD
+#     with a bare 400 and no body, so "ExpiredToken" never appears in the error.
+BARE_400 = {"Error": {"Code": "400", "Message": "Bad Request"},
+            "ResponseMetadata": {"HTTPStatusCode": 400}}
+
+
+class ExpiringS3(FakeS3):
+    """FakeS3 whose credentials stop working after `good_for` requests."""
+
+    def __init__(self, objects, good_for):
+        super().__init__()
+        self.objects = objects        # one bucket, shared across renewals
+        self.left = good_for
+
+    def _spend(self, op):
+        if self.left <= 0:
+            raise ClientError(BARE_400, op)
+        self.left -= 1
+
+    def head_object(self, Bucket, Key, ChecksumMode=None):
+        self._spend("HeadObject")
+        return super().head_object(Bucket, Key, ChecksumMode)
+
+    def put_object(self, **kw):
+        self._spend("PutObject")
+        return super().put_object(**kw)
+
+
+def with_renewal(task, good_for=10 ** 6, expires_in=timedelta(hours=1)):
+    """Stand in for Cognito: each renewal hands out a fresh client."""
+    bucket = task._client.objects
+    calls = {"n": 0}
+
+    def init():
+        calls["n"] += 1
+        task._client = ExpiringS3(bucket, good_for)
+        task._expires_at = datetime.now(timezone.utc) + expires_in
+        return True
+    task._init_s3 = init
+    return calls
+
+
+# 15a. The device's exact state: credentials long expired, S3 answering 400.
+root, files, task = fresh()
+task._client = ExpiringS3({}, good_for=0)
+task._expires_at = datetime.now(timezone.utc) - timedelta(days=2)
+calls = with_renewal(task)
+s = task.run_once()
+check("expired: renewed before the run started", calls["n"] == 1, calls)
+check("expired: everything uploaded and freed",
+      s["complete"] and s["failed"] == 0 and remaining(root) == [], s)
+
+# 15b. Expiring within the margin counts as expired.
+root, files, task = fresh()
+task._expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+calls = with_renewal(task)
+task.run_once()
+check("about to expire: renewed", calls["n"] == 1, calls)
+
+# 15c. Still well within its hour: left alone.
+root, files, task = fresh()
+task._expires_at = datetime.now(timezone.utc) + timedelta(minutes=50)
+calls = with_renewal(task)
+s = task.run_once()
+check("valid: not renewed", calls["n"] == 0 and s["complete"], (calls, s))
+
+# 15d. Expiry the clock did not predict (no stated expiry, or rejected early):
+#      the bare 400 itself triggers renewal, and the file is retried, not lost.
+root, files, task = fresh()
+task._client = ExpiringS3({}, good_for=3)     # dies three requests into the run
+task._expires_at = None
+calls = with_renewal(task)
+s = task.run_once()
+check("rejected mid-run: renewed once", calls["n"] == 1, calls)
+check("rejected mid-run: retried, so nothing counted as failed",
+      s["complete"] and s["failed"] == 0 and remaining(root) == [], s)
+
+# 15e. Renewal that does not help (e.g. the bucket refuses this identity):
+#      still stops after five failures, nothing deleted, no endless renewing.
+root, files, task = fresh()
+task._client = ExpiringS3({}, good_for=0)
+task._expires_at = None
+calls = with_renewal(task, good_for=0)
+s = task.run_once()
+check("refused for good: stops after the limit",
+      s["failed"] == s3_worker.MAX_CONSECUTIVE_FAILURES, s)
+check("refused for good: one renewal per file, no more",
+      calls["n"] == s3_worker.MAX_CONSECUTIVE_FAILURES, calls)
+check("refused for good: nothing deleted", len(remaining(root)) == len(files))
+
+# 15f. Network down is not a credentials problem: no renewal attempted.
+root, files, task = fresh()
+task._client.fail_puts = True
+calls = with_renewal(task)
+task._client.fail_puts = True
+task._expires_at = datetime.now(timezone.utc) + timedelta(minutes=50)
+real_client = task._client
+task.run_once()
+check("offline: no renewal for a connection error",
+      calls["n"] == 0 and task._client is real_client, calls)
+
+# 15g. 404 still means "not on S3 yet", never a credentials problem.
+check("404 is not a rejection",
+      not s3_worker._credentials_rejected(
+          ClientError({"Error": {"Code": "404"},
+                       "ResponseMetadata": {"HTTPStatusCode": 404}}, "HeadObject")))
+check("bare 400 is a rejection",
+      s3_worker._credentials_rejected(ClientError(BARE_400, "HeadObject")))
+check("connection error is not a rejection",
+      not s3_worker._credentials_rejected(ConnectionError("Could not connect")))
 
 print(f"\nAll {passed} checks passed.")
