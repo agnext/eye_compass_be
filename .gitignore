@@ -36,3 +36,6 @@ test_frames/
 test_frames_fm/
 
 legacy/sturdy-lore-271106-75bcb0be8976.json
+
+# Lock shared by the S3 uploader and the SSD archiver (app/services/folder_copies.py)
+.device_files.lock

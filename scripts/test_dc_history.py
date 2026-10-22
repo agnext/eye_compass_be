@@ -268,6 +268,7 @@ for dirpath, dirs, files in os.walk(settings.OUTPUT_DIR):
     for n in dirs + files:
         os.utime(os.path.join(dirpath, n), (old_t, old_t))
 settings.S3_DELETE_AFTER_UPLOAD = True
+settings.SSD_ARCHIVE_ENABLED = False      # cloud only: S3 removes what it uploaded
 settings.S3_RETENTION_DAYS = 0
 settings.S3_MIN_AGE_MINUTES = 30
 camera._dc_folder = None
@@ -277,23 +278,28 @@ w._key_prefix = lambda: "p/"
 summary = w.run_once()
 assert summary["failed"] == 0, summary
 d = client.get(f"/api/data_collection/sessions/{sid}").json()
-assert d["storage"] == "uploaded_cleaned" and d["images_on_device"] == 0, d["storage"]
-assert d["cloud_uploaded_at"] and d["cloud_files_verified"] == 4
+assert d["storage"] == "in_cloud" and d["images_on_device"] == 0, d["storage"]
+assert d["in_cloud"] and d["cloud_uploaded_at"] and d["cloud_files_verified"] == 4, d
+assert d["removed_by"] == "s3", d["removed_by"]
 assert client.get(f"/api/data_collection/sessions/{sid}/images").json()["total"] == 0
-print("10. S3 upload + delete -> record marked uploaded, badge 'uploaded & cleaned'")
+print("10. S3 upload + delete (cloud only) -> recorded uploaded and removed, 'in_cloud'")
 
-# 11. Gone without a confirmed upload reads as missing; partial as partial ----
+# 11. Gone without a confirmed upload reads as missing; partial is a tag ------
+from app.services import folder_copies  # noqa: E402
+
 db = SessionLocal()
 r = DataCollectionSession(rel_path="rice/x/1792000002_M", sample_id="M", commodity="rice",
                           variety="x", status="completed", frames_saved=5)
 db.add(r)
 db.commit()
-assert dc_history.storage_state(r, None) == "missing_from_device"
-r.cloud_files_verified = 2
-assert dc_history.storage_state(r, "device") == "partially_uploaded"
 db.close()
+assert folder_copies.storage_state(None, None) == "missing_from_device"
+folder_copies.record_cloud("Data_Collection", "rice/x/1792000002_M", 2, False)
+c = folder_copies.get("Data_Collection", "rice/x/1792000002_M")
+assert folder_copies.storage_state(c, None) == "missing_from_device"
+assert folder_copies.copy_info(c)["cloud_partial"] is True
 print("11. frames gone with no confirmed upload -> 'missing_from_device'; part uploaded -> "
-      "'partially_uploaded'")
+      "'cloud_partial' tag")
 
 # 12. Archive SSD: a run moved there is still shown, read from the SSD ---------
 from pathlib import Path  # noqa: E402
@@ -308,7 +314,7 @@ ssd.mkdir(parents=True)
 cfg = ArchiveConfig(data_root=Path(settings.OUTPUT_DIR), device_retention_days=30,
                     min_file_age_seconds=60, ssd_reserve_bytes=0,
                     marker_name=".eyecompass_archive", mount_roots=(mounts,),
-                    require_separate_disk=False)
+                    require_separate_disk=False, ssd_retention_days=0)
 ArchiveConfig.from_settings = classmethod(lambda cls: cfg)
 ssd_worker._busy = lambda: None
 ssd_worker._protected_dirs = lambda: set()
@@ -336,7 +342,7 @@ assert summary["result"] == "ok" and summary["deleted_samples"] >= 1, summary
 assert not os.path.exists(moved), "old run not moved off the device"
 k = fresh(f"/api/data_collection/sessions/{kid}")
 assert k["storage"] == "on_ssd" and k["on_ssd"] and k["ssd_connected"], k
-assert k["ssd"]["ssd"] == "ARCHIVE" and k["ssd"]["removed_at"], k["ssd"]
+assert k["ssd"]["ssd"] == "ARCHIVE" and k["removed_by"] == "ssd_archive", k
 imgs = client.get(f"/api/data_collection/sessions/{kid}/images").json()
 assert imgs["source"] == "ssd" and imgs["total"] == 1, imgs
 assert client.get(imgs["images"][0]["thumb_url"]).headers["content-type"] == "image/jpeg"

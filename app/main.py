@@ -60,12 +60,6 @@ def _add_missing_columns():
             # they have already seen sitting in Held Batches.
             "interrupt_notified": "BOOLEAN NOT NULL DEFAULT TRUE",
         },
-        "data_collection_sessions": {
-            "ssd_archived_at": "TIMESTAMP NULL",
-            "ssd_removed_at": "TIMESTAMP NULL",
-            "ssd_name": "VARCHAR(150) NULL",
-            "ssd_path": "VARCHAR(500) NULL",
-        },
         "result": {
             "sync_error": "TEXT DEFAULT ''",
             # No DEFAULT: existing rows must stay NULL. A default of '' would
@@ -209,13 +203,6 @@ async def lifespan(app: FastAPI):
 
     scan_progress.interrupt_all_active()
 
-    # Same for Data Collection: close runs cut off by the stop, import session
-    # folders from before the history table, remove empty ones. Before the S3
-    # worker starts, so nothing else is touching Data_Collection/.
-    from app.services import dc_history
-
-    dc_history.reconcile_on_startup()
-
     # 2. Safety: the machine must never come up with the belt running.
     #    Legacy did this at main.py:505.
     if not settings.USE_MOCK_CAMERA:
@@ -226,6 +213,14 @@ async def lifespan(app: FastAPI):
             logger.info("Startup all_stop sent to conveyor.")
         except Exception as exc:
             logger.warning("Startup all_stop failed: %s", exc)
+
+    # Data Collection, like the batches above: close runs cut off by the stop,
+    # import session folders from before the history table, remove empty ones.
+    # After the belt's safety stop, since it walks every folder, and before the
+    # S3 worker starts, so nothing else is touching Data_Collection/.
+    from app.services import dc_history
+
+    dc_history.reconcile_on_startup()
 
     # 2b. Legacy's run_inference.py registers a SIGTERM handler at import time
     #     (run_inference.py:103), which only works from the main thread of the
@@ -282,8 +277,11 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(s3_task.start(), name="s3-upload"))
         logger.info("S3 background uploader started.")
 
+    # Also runs, for the low-disk safety net alone, with the SSD archive off
+    # but S3 deletion on. With both off nothing is ever removed from the device.
     ssd_task = None
-    if settings.SSD_ARCHIVE_ENABLED:
+    if settings.SSD_ARCHIVE_ENABLED or (
+            settings.S3_DELETE_AFTER_UPLOAD and settings.DEVICE_LOW_DISK_FREE_PERCENT > 0):
         from app.services.ssd_archive.worker import SsdArchiveTask
 
         ssd_task = SsdArchiveTask()

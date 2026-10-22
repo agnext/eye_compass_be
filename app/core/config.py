@@ -537,19 +537,47 @@ class Settings:
     S3_ENABLED: bool = _as_bool(os.getenv("S3_ENABLED"), True)
 
     # ---------------- Archive SSD ----------------
-    # Copies Data_Collection/ and output_frame/ to this device's archive SSD
-    # (a drive marked with `python -m app.services.ssd_archive init <mount>`)
-    # once a day, and frees the device of what has been verified there. Does
-    # nothing while no marked drive is connected. See app/services/ssd_archive.
-    SSD_ARCHIVE_ENABLED: bool = _as_bool(_env("SSD_ARCHIVE_ENABLED", default="true"), True)
+    # Copies Data_Collection/, output_frame/ and (see below) output/ to this
+    # device's archive SSD (a drive marked with
+    # `python -m app.services.ssd_archive init <mount>`) once a day, frees the
+    # device of what has been verified there, and deletes from the SSD what is
+    # older than SSD_ARCHIVE_SSD_RETENTION_DAYS. Does nothing while no marked
+    # drive is connected. See docs/ssd_archive.md.
+    #
+    # Who removes data from the device:
+    #   SSD only       SSD_ARCHIVE_ENABLED=true,  S3_DELETE_AFTER_UPLOAD=false
+    #   SSD and cloud  the same, plus SSD_ARCHIVE_REQUIRE_CLOUD=true
+    #   cloud only     SSD_ARCHIVE_ENABLED=false, S3_DELETE_AFTER_UPLOAD=true
+    # With both on, the S3 uploader removes only folders already on the SSD.
+    # Off by default, so a device without an archive SSD keeps working as
+    # before (with it on, the S3 uploader stops removing what the SSD lacks).
+    SSD_ARCHIVE_ENABLED: bool = _as_bool(_env("SSD_ARCHIVE_ENABLED", default="false"), False)
+    # Also copy output/ (the batch crops History shows). History then shows a
+    # batch's crops from the SSD once they have left the device.
+    SSD_ARCHIVE_INCLUDE_CROPS: bool = _as_bool(
+        _env("SSD_ARCHIVE_INCLUDE_CROPS", default="true"), True)
+    # Remove a sample from the device only once it is also confirmed in S3,
+    # not just on the SSD. Off by default: devices are often offline, and a
+    # sample would then wait on the device for as long as the internet is down.
+    SSD_ARCHIVE_REQUIRE_CLOUD: bool = _as_bool(
+        _env("SSD_ARCHIVE_REQUIRE_CLOUD", default="false"), False)
     # How often the worker checks for the drive and whether today's run is
     # done. The work itself happens once a day.
     SSD_ARCHIVE_CHECK_INTERVAL_SECONDS: int = _as_int(
         _env("SSD_ARCHIVE_CHECK_INTERVAL_SECONDS", default="3600"), 3600)
-    # A sample older than this is removed from the DEVICE once every file of
-    # it is re-verified on the SSD. The SSD itself is never cleaned.
+    # Days a sample stays on the DEVICE after it is taken. Once that has passed
+    # and every file is re-verified on the SSD, it is removed from the device.
+    # 0 = as soon as it is verified there (and not in use).
     SSD_ARCHIVE_DEVICE_RETENTION_DAYS: int = _as_int(
-        _env("SSD_ARCHIVE_DEVICE_RETENTION_DAYS", default="30"), 30)
+        _env("SSD_ARCHIVE_DEVICE_RETENTION_DAYS", default="0"), 0)
+    # Days a sample is kept on the SSD, counted from its date (the SSD's date
+    # folder). Older ones are deleted from the SSD. 0 = never delete from it.
+    SSD_ARCHIVE_SSD_RETENTION_DAYS: int = _as_int(
+        _env("SSD_ARCHIVE_SSD_RETENTION_DAYS", default="30"), 30)
+    # Delete from the SSD only what is confirmed in S3. Off: deleted after
+    # SSD_ARCHIVE_SSD_RETENTION_DAYS whether or not it was ever uploaded.
+    SSD_ARCHIVE_SSD_DELETE_REQUIRE_CLOUD: bool = _as_bool(
+        _env("SSD_ARCHIVE_SSD_DELETE_REQUIRE_CLOUD", default="false"), False)
     # Files changed more recently than this may still be being written.
     SSD_ARCHIVE_MIN_FILE_AGE_SECONDS: int = _as_int(
         _env("SSD_ARCHIVE_MIN_FILE_AGE_SECONDS", default="300"), 300)
@@ -558,6 +586,14 @@ class Settings:
     SSD_ARCHIVE_MARKER: str = _env("SSD_ARCHIVE_MARKER", default=".eyecompass_archive")
     # Where removable drives are mounted, colon separated.
     SSD_ARCHIVE_MOUNT_ROOTS: str = _env("SSD_ARCHIVE_MOUNT_ROOTS", default="/media:/run/media:/mnt")
+    # Safety net for when the normal clean-up cannot run (SSD unplugged for
+    # weeks, S3 deletion off): while the device's free space is below this
+    # percentage, the oldest samples that have a confirmed copy on the SSD or
+    # in S3 are removed early, regardless of SSD_ARCHIVE_DEVICE_RETENTION_DAYS,
+    # until it is 5 points above it. Never a sample with no copy anywhere, nor
+    # one in use. 0 turns it off. Runs as part of the SSD archive worker.
+    DEVICE_LOW_DISK_FREE_PERCENT: float = _as_float(
+        _env("DEVICE_LOW_DISK_FREE_PERCENT", default="10"), 10.0)
 
     # ---------------- Google Sheets ----------------
     SHEETS_ENABLED: bool = _as_bool(

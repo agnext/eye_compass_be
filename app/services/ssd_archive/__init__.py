@@ -1,16 +1,17 @@
-"""Archive SSD: a copy of the device's raw capture folders on an external drive.
+"""Archive SSD: a copy of the device's session folders on an external drive.
 
-Copies Data_Collection/ and output_frame/ to this device's archive SSD once a
-day, organised by date, and frees device space by removing samples older than
-SSD_ARCHIVE_DEVICE_RETENTION_DAYS, but only after every file of the sample
-has been re-verified byte for byte against its SSD copy. The SSD itself is
-never cleaned. Runs inside the backend (worker.SsdArchiveTask) and records
-each Data Collection run's SSD copy on its history row, so Data Collection
-History can show the run from the SSD once it has left the device.
+Copies Data_Collection/, output_frame/ and (SSD_ARCHIVE_INCLUDE_CROPS)
+output/ to this device's archive SSD once a day, organised by date, and frees
+device space by removing each sample (once SSD_ARCHIVE_DEVICE_RETENTION_DAYS
+have passed, 0 = at once, and not in use), but only after every file of it
+has been re-verified byte for byte against its SSD copy. Samples older than
+SSD_ARCHIVE_SSD_RETENTION_DAYS are deleted from the SSD. Runs inside the backend
+(worker.SsdArchiveTask), records every copy in folder_copies, and also runs
+the low-disk safety net. See docs/ssd_archive.md.
 
 On the SSD:
 
-    <SSD>/<YYYY-MM-DD>/<Data_Collection|output_frame>/<commodity>/<variety>/<sample>/
+    <SSD>/<YYYY-MM-DD>/<Data_Collection|output_frame|output>/<commodity>/<variety>/<sample>/
 
 Setting up a drive (once, with the backend's Python):
 

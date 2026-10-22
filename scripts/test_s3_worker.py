@@ -120,6 +120,14 @@ def fresh(age_minutes=120):
     settings.S3_UPLOAD_EVERY_DAYS = 3
     files = make_tree(root, age_minutes)
     set_state()
+    # Each case starts with no record of earlier cases' uploads: they reuse
+    # the same folder names, and a folder recorded as uploaded is skipped.
+    from app.models.schema import FolderCopy
+
+    db = SessionLocal()
+    db.query(FolderCopy).delete()
+    db.commit()
+    db.close()
     task = S3UploaderTask()
     task._client = FakeS3()
     task._key_prefix = lambda: "pre/"

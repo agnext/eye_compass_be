@@ -1,6 +1,6 @@
 """Where samples live on the device and how their date is read.
 
-Expected layout, per source folder:
+Expected layout, per source folder (Data_Collection, output_frame, output):
 
     <data_root>/<source>/<commodity>/<variety>/<sample_id>/...files
 
@@ -56,6 +56,8 @@ class Source:
 SOURCES = (
     Source("Data_Collection", time_from_epoch_prefix),
     Source("output_frame", time_from_datetime_suffix),
+    # The batch crops and result.json History reads: <sample>_<YYYYMMDDHHMMSS>
+    Source("output", time_from_datetime_suffix),
 )
 
 

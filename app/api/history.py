@@ -233,24 +233,49 @@ def get_result_images(
     def slug(v):
         return (v or "").strip().lower().replace(" ", "_")
 
-    folder = os.path.join(
-        settings.OUTPUT_DIR, "output", slug(r.commodity), slug(r.variety), folder_name
-    )
+    rel = f"{slug(r.commodity)}/{slug(r.variety)}/{folder_name}"
+    folder = os.path.join(settings.OUTPUT_DIR, "output", rel)
     # Guard against anything escaping the output tree.
     root = os.path.realpath(os.path.join(settings.OUTPUT_DIR, "output"))
     folder = os.path.realpath(folder)
-    if not folder.startswith(root):
+    if not folder.startswith(root + os.sep):
         return {"status": "success", "total": 0, "images": []}
-    if not os.path.isdir(folder):
-        # A saved result whose batch folder is gone: the S3 worker uploads
-        # batches and then removes them from the device (s3_worker.py). Said
-        # explicitly so the record view can tell the operator where the images
-        # went, rather than implying the scan never captured any.
-        return {"status": "success", "total": 0, "images": [], "on_device": False}
 
-    names = sorted(
-        f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    )
+    def crops(d):
+        try:
+            return sorted(f for f in os.listdir(d) if f.lower().endswith((".png", ".jpg", ".jpeg")))
+        except OSError:
+            return []
+
+    # The batch folder leaves the device once it is copied to the archive SSD
+    # (ssd_archive) or uploaded to S3 (s3_worker). From the SSD it is still
+    # shown, while that drive is connected; otherwise `storage` tells the
+    # record view where the images went, rather than implying the scan never
+    # captured any.
+    from app.services import folder_copies
+
+    where = "device" if os.path.isdir(folder) else None
+    names = crops(folder) if where else []
+    if where is None:
+        copy = folder_copies.get("output", rel)
+        ssd = folder_copies.ssd_folder(copy)
+        if ssd:
+            folder, where, names = ssd, "ssd", crops(ssd)
+        storage = folder_copies.storage_state(copy, where)
+        if copy is None and settings.S3_ENABLED:
+            # No record: removed before folder_copies existed, when the S3
+            # uploader was the only thing that removed batch folders.
+            storage = "in_cloud"
+        location = {
+            "on_device": False,
+            "source": where,
+            "storage": storage,
+            "ssd_connected": folder_copies.ssd_connected(),
+        }
+        if where is None:
+            return {"status": "success", "total": 0, "images": [], **location}
+    else:
+        location = {"on_device": True, "source": "device", "storage": "on_device"}
     if item:
         needle = item.strip().lower()
         needle_slug = needle.replace(" ", "_")
@@ -300,6 +325,7 @@ def get_result_images(
         "limit": limit,
         "offset": offset,
         "images": images,
+        **location,
     }
 
 

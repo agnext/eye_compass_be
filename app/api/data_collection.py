@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.schema import DataCollectionSession
-from app.services import dc_history
+from app.services import dc_history, folder_copies
 from app.services.inference_service import normalize_commodity
 
 logger = logging.getLogger(__name__)
@@ -52,9 +52,17 @@ def _live_status(row: DataCollectionSession) -> Optional[dict]:
     return None
 
 
-def _summary(row: DataCollectionSession) -> dict:
-    _, where, names = dc_history.image_folder(row)
+TREE = dc_history.SUBDIR
+
+
+def _copy(row: DataCollectionSession):
+    return folder_copies.get(TREE, row.rel_path)
+
+
+def _summary(row: DataCollectionSession, copy) -> dict:
+    _, where, names = dc_history.image_folder(row, copy)
     live = _live_status(row)
+    info = folder_copies.copy_info(copy)
     return {
         "id": row.id,
         "sample_id": row.sample_id,
@@ -69,9 +77,11 @@ def _summary(row: DataCollectionSession) -> dict:
         "frames_seen": live["frames_seen"] if live else row.frames_seen,
         "frames_dropped": live["frames_dropped"] if live else row.frames_dropped,
         "images_on_device": len(names) if where == "device" else 0,
-        "storage": dc_history.storage_state(row, where),
-        # Copied to the archive SSD, whether or not it is still on the device.
-        "on_ssd": bool(row.ssd_archived_at),
+        "storage": folder_copies.storage_state(copy, where, row.status == "recording"),
+        # Copies, whether or not the run is still on the device
+        "on_ssd": info["on_ssd"],
+        "in_cloud": info["in_cloud"],
+        "cloud_partial": info["cloud_partial"],
     }
 
 
@@ -112,13 +122,14 @@ def list_sessions(
         query.order_by(DataCollectionSession.started_at.desc(), DataCollectionSession.id.desc())
         .offset(offset).limit(limit).all()
     )
+    copies = folder_copies.get_many(TREE, [r.rel_path for r in rows])
     return {
         "status": "success",
         "total": total,
         "limit": limit,
         "offset": offset,
-        "data": [_summary(r) for r in rows],
-        "ssd_connected": dc_history.ssd_connected(),
+        "data": [_summary(r, copies.get(r.rel_path)) for r in rows],
+        "ssd_connected": folder_copies.ssd_connected(),
     }
 
 
@@ -130,7 +141,8 @@ def session_filters(db: Session = Depends(get_db)):
     for c, v, rel in db.query(DataCollectionSession.commodity,
                               DataCollectionSession.variety,
                               DataCollectionSession.rel_path).all():
-        c_seg, v_seg = rel.split("/")[:2]
+        # A misplaced folder can sit one or two levels too high
+        c_seg, v_seg = (rel.split("/") + ["", ""])[:2]
         commodities.setdefault(c_seg, c or c_seg)
         varieties.setdefault(c_seg, {}).setdefault(v_seg, v or v_seg)
     return {
@@ -145,17 +157,15 @@ def session_filters(db: Session = Depends(get_db)):
 @router.get("/sessions/{session_id}")
 def get_session(session_id: int, db: Session = Depends(get_db)):
     row = _get_row(db, session_id)
+    copy = _copy(row)
     return {
         "status": "success",
-        **_summary(row),
+        **folder_copies.copy_info(copy),
+        **_summary(row, copy),
         "stop_reason": row.stop_reason,
         "capture_settings": row.capture_settings or {},
-        "cloud_files_verified": row.cloud_files_verified or 0,
-        "cloud_uploaded_at": (
-            row.cloud_uploaded_at.isoformat(timespec="seconds") if row.cloud_uploaded_at else None),
         "folder": f"{dc_history.SUBDIR}/{row.rel_path}",
-        "ssd": dc_history.ssd_info(row),
-        "ssd_connected": dc_history.ssd_connected(),
+        "ssd_connected": folder_copies.ssd_connected(),
     }
 
 
@@ -167,7 +177,7 @@ def list_session_images(
     offset: int = Query(0, ge=0),
 ):
     row = _get_row(db, session_id)
-    _, where, names = dc_history.image_folder(row)
+    _, where, names = dc_history.image_folder(row, _copy(row))
     base = f"/api/data_collection/sessions/{session_id}/images"
     return {
         "status": "success",
@@ -185,7 +195,7 @@ def list_session_images(
 def _image_path(db: Session, session_id: int, name: str) -> str:
     """Only a file that is actually in the run's folder, by exact name."""
     row = _get_row(db, session_id)
-    folder, _, names = dc_history.image_folder(row)
+    folder, _, names = dc_history.image_folder(row, _copy(row))
     if not _NAME_RE.match(name) or name not in names:
         raise HTTPException(status_code=404, detail="Image not found")
     return os.path.join(folder, name)

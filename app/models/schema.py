@@ -189,6 +189,46 @@ class S3UploadState(Base):
     last_result = Column(JSONType, nullable=True)
 
 
+class FolderCopy(Base):
+    """Where one session folder has been copied: the archive SSD and S3.
+
+    One row per folder of output/, output_frame/ or Data_Collection/
+    (<tree>/<commodity>/<variety>/<folder>), written by the SSD archiver and
+    the S3 uploader. Each of them reads the other's record before removing a
+    folder from the device, and History reads it to find a batch or run that
+    has left the device.
+
+    Each "at" time is when every file of the folder was last confirmed in that
+    place. A folder changed after that (newest file newer than the time) does
+    not count as copied until it is confirmed again.
+    """
+
+    __tablename__ = "folder_copies"
+    __table_args__ = (UniqueConstraint("tree", "rel_path", name="uq_folder_copies_tree_rel"),)
+
+    id = Column(Integer, primary_key=True)
+    tree = Column(String(32), nullable=False)        # output | output_frame | Data_Collection
+    rel_path = Column(String(400), nullable=False)   # <commodity>/<variety>/<folder>
+
+    # Archive SSD: the drive's folder name and the folder relative to its root
+    ssd_name = Column(String(150), nullable=True)
+    ssd_path = Column(String(500), nullable=True)
+    ssd_copied_at = Column(DateTime, nullable=True)
+    # Deleted from the SSD after SSD_ARCHIVE_SSD_RETENTION_DAYS
+    ssd_removed_at = Column(DateTime, nullable=True)
+
+    # S3: files confirmed identical in the last pass, and when every file was
+    cloud_files_verified = Column(Integer, default=0)
+    cloud_uploaded_at = Column(DateTime, nullable=True)
+
+    # Removed from the device, and by what: ssd_archive | s3 | low_disk
+    removed_at = Column(DateTime, nullable=True)
+    removed_by = Column(String(20), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class SsdArchiveState(Base):
     """When the SSD archiver last ran. One row, id=1.
 
@@ -439,8 +479,7 @@ class DataCollectionSession(Base):
 
     Whether the frames are still on the device is NOT stored here: it is read
     from the folder whenever a row is shown, because files can leave the device
-    without this table being told (manual cleanup, an archiver). The cloud
-    columns record only what the S3 worker has confirmed.
+    without this table being told (manual cleanup).
     """
 
     __tablename__ = "data_collection_sessions"
@@ -470,21 +509,8 @@ class DataCollectionSession(Base):
     # run. data_collection_settings.json can change between runs.
     capture_settings = Column(JSONType, default=dict)
 
-    # Set by the S3 worker. cloud_uploaded_at only once every file of the run
-    # has been confirmed identical on S3; cloud_files_verified counts them.
-    cloud_files_verified = Column(Integer, default=0)
-    cloud_uploaded_at = Column(DateTime, nullable=True)
-
-    # Set by the SSD archiver (app/services/ssd_archive). ssd_archived_at: first
-    # time every file of the run was on the archive SSD. It is committed before
-    # the archiver may remove anything from the device, so a run that has left
-    # the device for the SSD is always known to be there. ssd_removed_at: when
-    # it was then removed from this device. ssd_name/ssd_path: which drive, and
-    # the run's folder relative to the drive's root.
-    ssd_archived_at = Column(DateTime, nullable=True)
-    ssd_removed_at = Column(DateTime, nullable=True)
-    ssd_name = Column(String(150), nullable=True)
-    ssd_path = Column(String(500), nullable=True)
+    # Where its frames have been copied (archive SSD, S3) is in folder_copies,
+    # under tree "Data_Collection" and this rel_path.
 
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)

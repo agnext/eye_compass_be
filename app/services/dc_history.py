@@ -137,6 +137,8 @@ def record_update(folder: str, status: Dict) -> None:
     from app.core.database import SessionLocal
     from app.models.schema import DataCollectionSession
 
+    if not folder:
+        return
     rel = rel_path_of(folder)
     db = SessionLocal()
     try:
@@ -296,7 +298,7 @@ def reconcile_on_startup() -> None:
                 m = _FOLDER_RE.match(leaf)
                 started = _ts(int(m.group(1))) if m else None
                 ended = _ts(_newest_image_mtime(folder, names))
-                db.add(DataCollectionSession(
+                row = DataCollectionSession(
                     rel_path=rel,
                     sample_id=m.group(2) if m else leaf,
                     commodity=commodities.get(c_seg, c_seg),
@@ -309,9 +311,17 @@ def reconcile_on_startup() -> None:
                     frames_saved=len(names), frames_seen=None, frames_dropped=0,
                     capture_settings={
                         "image_format": os.path.splitext(names[0])[1].lstrip(".").lower()},
-                ))
-                imported += 1
-            db.commit()
+                )
+                # One at a time, so a folder that cannot be stored (a name
+                # too long for the column) does not undo every other import.
+                try:
+                    db.add(row)
+                    db.commit()
+                    imported += 1
+                except Exception as exc:
+                    db.rollback()
+                    logger.error("Could not import data collection folder %s: %s", rel, exc)
+        _carry_over_cloud_columns(db)
         logger.info(
             "Data collection history: %s interrupted run(s) closed, %s empty "
             "run(s) removed, %s folder(s) imported", closed, removed, imported)
@@ -320,6 +330,40 @@ def reconcile_on_startup() -> None:
         logger.error("Data collection history reconcile failed: %s", exc)
     finally:
         db.close()
+
+
+def _carry_over_cloud_columns(db) -> None:
+    """Runs uploaded before folder_copies existed kept their S3 result on this
+    table (cloud_files_verified, cloud_uploaded_at). Copy it across once, so
+    they still show as in the cloud. Nothing to do on a database that never
+    had those columns."""
+    from sqlalchemy import inspect, text
+
+    from app.models.schema import FolderCopy
+
+    try:
+        columns = {c["name"] for c in inspect(db.get_bind()).get_columns("data_collection_sessions")}
+        if not {"cloud_files_verified", "cloud_uploaded_at"} <= columns:
+            return
+        known = {r for (r,) in db.query(FolderCopy.rel_path).filter_by(tree=SUBDIR).all()}
+        rows = db.execute(text(
+            "SELECT rel_path, cloud_files_verified, cloud_uploaded_at FROM data_collection_sessions "
+            "WHERE cloud_uploaded_at IS NOT NULL OR cloud_files_verified > 0")).fetchall()
+        added = 0
+        for rel, verified, uploaded in rows:
+            if rel in known:
+                continue
+            if isinstance(uploaded, str):   # SQLite returns the raw text
+                uploaded = datetime.fromisoformat(uploaded)
+            db.add(FolderCopy(tree=SUBDIR, rel_path=rel, cloud_files_verified=verified or 0,
+                              cloud_uploaded_at=uploaded))
+            added += 1
+        db.commit()
+        if added:
+            logger.info("Data collection history: S3 status of %s run(s) carried over", added)
+    except Exception as exc:
+        db.rollback()
+        logger.error("Could not carry over earlier S3 status of data collection runs: %s", exc)
 
 
 def _session_folders(base: str) -> List[str]:
@@ -337,175 +381,60 @@ def _session_folders(base: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# S3 worker
+# The SSD archiver
 # ---------------------------------------------------------------------------
 
-def record_cloud_result(rel_path: str, files_verified: int, all_verified: bool) -> None:
-    """After the S3 worker has been through one Data_Collection folder.
-
-    files_verified counts files confirmed identical on S3 in this pass.
-    all_verified means every file in the folder was. Only that marks the run
-    uploaded; a partial pass is picked up again next run.
-    """
+def ensure_row(rel_path: str) -> bool:
+    """A row for a collection folder the archiver is about to move off the
+    device. Startup imports every folder, so this is only for one that
+    appeared since: once moved, the folder would not be found to import.
+    True if the row exists or was created."""
     from app.core.database import SessionLocal
     from app.models.schema import DataCollectionSession
 
     db = SessionLocal()
     try:
-        row = db.query(DataCollectionSession).filter_by(rel_path=rel_path).first()
-        if row is None:
-            return
-        row.cloud_files_verified = max(row.cloud_files_verified or 0, files_verified)
-        if all_verified and row.cloud_uploaded_at is None:
-            row.cloud_uploaded_at = datetime.now()
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.error("Could not record S3 result for data collection %s: %s", rel_path, exc)
-    finally:
-        db.close()
-
-
-# ---------------------------------------------------------------------------
-# The SSD archiver (app/services/ssd_archive)
-# ---------------------------------------------------------------------------
-
-def record_ssd_copy(rel_path: str, ssd_name: str, ssd_path: str,
-                    at: Optional[datetime] = None) -> bool:
-    """Every file of the run is on the archive SSD, at ssd_path under its root.
-
-    True only once that is committed: the archiver removes nothing from the
-    device until it is, so the history always knows where a run went. Repeat
-    calls keep the first ssd_archived_at. A folder with no row yet (from
-    before the history table, reached before startup imported it) gets one.
-    """
-    from app.core.database import SessionLocal
-    from app.models.schema import DataCollectionSession
-
-    when = at or datetime.now()
-    db = SessionLocal()
-    try:
-        row = db.query(DataCollectionSession).filter_by(rel_path=rel_path).first()
-        if row is None:
-            c_seg, v_seg, leaf = (rel_path.split("/", 2) + ["", "", ""])[:3]
-            m = _FOLDER_RE.match(leaf)
-            row = DataCollectionSession(
-                rel_path=rel_path, sample_id=m.group(2) if m else leaf,
-                commodity=c_seg, variety=v_seg, status="completed", source="imported",
-                started_at=_ts(int(m.group(1))) if m else when,
-                frames_saved=len(list_images(folder_of(rel_path))))
-            db.add(row)
-        row.ssd_name = ssd_name
-        row.ssd_path = ssd_path
-        if row.ssd_archived_at is None:
-            row.ssd_archived_at = when
+        if db.query(DataCollectionSession.id).filter_by(rel_path=rel_path).first():
+            return True
+        c_seg, v_seg, leaf = (rel_path.split("/", 2) + ["", "", ""])[:3]
+        m = _FOLDER_RE.match(leaf)
+        names = list_images(folder_of(rel_path))
+        db.add(DataCollectionSession(
+            rel_path=rel_path, sample_id=m.group(2) if m else leaf,
+            commodity=c_seg, variety=v_seg, status="completed", source="imported",
+            started_at=_ts(int(m.group(1))) if m else datetime.now(),
+            frames_saved=len(names), frames_seen=None, frames_dropped=0,
+            capture_settings={})
+        )
         db.commit()
         return True
     except Exception as exc:
         db.rollback()
-        logger.error("Could not record %s as archived to the SSD: %s", rel_path, exc)
+        logger.error("Could not create a data collection record for %s: %s", rel_path, exc)
         return False
     finally:
         db.close()
-
-
-def record_ssd_removed(rel_path: str, at: Optional[datetime] = None) -> None:
-    """The run was removed from the device after its SSD copy was verified."""
-    from app.core.database import SessionLocal
-    from app.models.schema import DataCollectionSession
-
-    db = SessionLocal()
-    try:
-        row = db.query(DataCollectionSession).filter_by(rel_path=rel_path).first()
-        if row is not None and row.ssd_removed_at is None:
-            row.ssd_removed_at = at or datetime.now()
-            db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.error("Could not record %s as removed from the device: %s", rel_path, exc)
-    finally:
-        db.close()
-
-
-def ssd_folder(row) -> Optional[str]:
-    """The run's folder on the archive SSD, if that drive is connected now and
-    the folder is on it."""
-    if not (row.ssd_archived_at and row.ssd_path):
-        return None
-    from app.services.ssd_archive.config import ArchiveConfig
-    from app.services.ssd_archive.target import connected_target
-
-    target = connected_target(ArchiveConfig.from_settings())
-    if target is None:
-        return None
-    base = os.path.realpath(str(target))
-    folder = os.path.realpath(os.path.join(base, row.ssd_path))
-    if not folder.startswith(base + os.sep) or not os.path.isdir(folder):
-        return None
-    return folder
-
-
-def ssd_connected() -> bool:
-    from app.services.ssd_archive.config import ArchiveConfig
-    from app.services.ssd_archive.target import connected_target
-
-    return connected_target(ArchiveConfig.from_settings()) is not None
-
-
-def ssd_info(row) -> Optional[Dict]:
-    """What the archiver recorded for this run, or None if it never copied it."""
-    if not row.ssd_archived_at:
-        return None
-    return {
-        "ssd": row.ssd_name,
-        "ssd_path": row.ssd_path,
-        "archived_at": row.ssd_archived_at.isoformat(timespec="seconds"),
-        "removed_at": row.ssd_removed_at.isoformat(timespec="seconds") if row.ssd_removed_at else None,
-    }
 
 
 # ---------------------------------------------------------------------------
 # Reading
 # ---------------------------------------------------------------------------
 
-def image_folder(row):
+def image_folder(row, copy):
     """(folder, where, names) for the run's frames: the device while it has
     any, else the archive SSD if the run was copied there and the drive is
-    connected. where is "device", "ssd" or None (nowhere to read them)."""
+    connected (copy is its FolderCopy row). where is "device", "ssd" or None."""
+    from app.services import folder_copies
+
     folder = folder_of(row.rel_path)
     names = list_images(folder)
     if names:
         return folder, "device", names
-    ssd = ssd_folder(row)
+    ssd = folder_copies.ssd_folder(copy)
     names = list_images(ssd)
     if names:
         return ssd, "ssd", names
     return None, None, []
-
-
-def storage_state(row, where: Optional[str]) -> str:
-    """on_device | on_device_uploaded | partially_uploaded | on_ssd
-    | missing_from_ssd | uploaded_cleaned | missing_from_device.
-
-    where is image_folder()'s answer. on_ssd: gone from the device, readable
-    on the archive SSD. missing_from_ssd: copied to the SSD, gone from the
-    device, and not found on the SSD now (the drive is unplugged, or the
-    folder is not on it). missing_from_device: gone from the device, and
-    neither the archiver nor the S3 worker accounts for it."""
-    if where == "device":
-        if row.cloud_uploaded_at:
-            return "on_device_uploaded"
-        if row.cloud_files_verified:
-            return "partially_uploaded"
-        return "on_device"
-    if row.status == "recording":
-        return "on_device"
-    if row.ssd_archived_at:
-        return "on_ssd" if where == "ssd" else "missing_from_ssd"
-    if row.cloud_uploaded_at or (
-            row.frames_saved and (row.cloud_files_verified or 0) >= row.frames_saved):
-        return "uploaded_cleaned"
-    return "missing_from_device"
 
 
 def window_bounds(date_from: Optional[str], date_to: Optional[str]):

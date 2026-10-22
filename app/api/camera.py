@@ -1330,6 +1330,10 @@ def start_data_collection():
         )
     if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera not available")
+    # Folder and record before the belt moves: if they cannot be created, the
+    # request fails with the belt still stopped. A run left empty because the
+    # belt then fails to start is removed when it is closed.
+    _dc_open_run()
     # Deliberately stricter than legacy, which ignored this result: showing
     # "Recording" over a belt that never moved collects the same few grains
     # over and over.
@@ -1341,7 +1345,6 @@ def start_data_collection():
                    f"{conveyor_service.status().get('last_error') or 'no acknowledgment'}",
         )
     global _dc_stop_reason
-    _dc_open_run()
     with _dc_lock:
         _dc_stop_reason = None
         _dc_begin_recording()
@@ -1372,13 +1375,16 @@ def capture_image_data_collection():
     if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera not available")
     _dc_open_run()
+    folder = _dc_folder
     with _dc_lock:
         _dc_begin_recording()
     time.sleep(2.0)
     with _dc_lock:
         _dc_end_recording()
     status = _dc_status()
-    dc_history.record_update(_dc_folder, status)
+    # Finish may have closed the run during the sleep; it recorded it then.
+    if folder and _dc_folder == folder:
+        dc_history.record_update(folder, status)
     return {"success": True, **status}
 
 
