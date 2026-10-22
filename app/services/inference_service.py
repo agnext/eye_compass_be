@@ -85,7 +85,7 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
         if v == "tibar":
             return "rice", 0.30
         if v in ("gr1-ri01-st2", "gr1-ri01-rw1"):
-            return "stem_rice", 0.30
+            return "stem_rice", 0.30 #0.30 deployed
         if v in ("gr1-ri01-sl3", "brown_rice"):
             return "brown_rice", 0.10
         # Legacy falls through the rice branch to the bottom default.
@@ -104,7 +104,7 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
         "masoor_red_whole": ("masoor_dal", 0.10),
         "lobia": ("lobia", 0.10),
         "chitra_rajma": ("chitra_rajma", 0.30),
-        "black_chana": ("Black_chana", 0.32),
+        "black_chana": ("Black_chana", 0.1), # 0.32 original
         "dalia": ("Rosted_chana", 0.40),
         "white_peas": ("white_peas", 0.10),
         "moth_dal": ("moth_dal", 0.10),
@@ -166,16 +166,22 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
     def drop():
         return [], False
 
-    if c == "rice" and v == "tibar" and cls in (2, 4, 5) and conf < 0.20:
-        return _dropped("rice/tibar cls{2,4,5}<0.20")
+    if c == "rice" and v == "tibar" and ((cls in (2, 5) and conf < 0.20) or (cls == 4 and conf < 0.60)): # change 13 Oct (4=0.4 rest on 0.2)
+        return _dropped("rice/tibar cls{2,5}<0.20 or cls(4)<0.5") # 19 Oct 2026
+    # if c == "rice" and v == "tibar" and ((cls in (2, 5) and conf < 0.20) or (cls == 4 and conf < 0.40)): # change 13 Oct (4=0.4 rest on 0.2)
+    #     return _dropped("rice/tibar cls{2,5}<0.20 or cls(4)<0.4")
     if c == "rice" and v == "dawat" and (
         (cls == 5 and conf < 0.50) or (cls == 0 and conf < 0.10)
     ):
         return _dropped("rice/dawat cls5<0.50 or cls0<0.10")
-    if c == "rice" and v == "gr1-ri01-rw1" and (
+    if c == "rice" and v == "gr1-ri01-st2" and (
         (cls == 5 and conf < 0.42) or (cls == 3 and conf < 0.36)
     ):
         return _dropped("rice/gr1-ri01-rw1 cls5<0.42 or cls3<0.36")
+    # if c == "rice" and v == "gr1-ri01-st2" and (
+    #     (cls in (2,4,5) and conf < 0.6) or (cls == 3 and conf < 0.15) or (cls == 1 and conf < 0.4)
+    # ):
+    #     return _dropped("rice/steam cls5<0.42 or cls3<0.36") # new 16 oct
     if c == "chitra_rajma" and (
         (cls == 0 and conf < 0.80) or (cls == 5 and conf < 0.80) or (cls == 2 and conf < 0.65)
     ):
@@ -195,7 +201,7 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
         or (cls == 1 and conf < 0.20) or (cls == 0 and conf < 0.30)
     ):
         return _dropped("masoor_red_whole various")
-    if c == "black_chana" and cls == 6 and conf < 0.95:
+    if c == "black_chana" and ((cls == 6 and conf < 0.95) or (cls == 4 and conf < 0.4)):
         return _dropped("black_chana cls6<0.95")
     if c == "dalia" and ((cls == 3 and conf < 0.80) or (cls == 4 and conf < 0.40)):
         return _dropped("dalia cls3<0.80 or cls4<0.40")
@@ -211,15 +217,18 @@ _CLASS_LABELS = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
 # source of truth for the actual decision; if a threshold changes there, change
 # it here too. Keyed (commodity, variety) with variety None meaning "any".
 _RULE_TABLE = {
-    ("rice", "tibar"): {2: 0.20, 4: 0.20, 5: 0.20},
+    # ("rice", "tibar"): {2: 0.20, 4: 0.40, 5: 0.20},
+    ("rice", "tibar"): {2: 0.20, 4: 0.60, 5: 0.20}, # 19 Oct 2026
     ("rice", "dawat"): {5: 0.50, 0: 0.10},
     ("rice", "gr1-ri01-rw1"): {5: 0.42, 3: 0.36},
+    # ("rice", "gr1-ri01-st2"): {1: 0.4, 2: 0.6, 4: 0.6, 5: 0.6, 3: 0.15}, # new
+    ("rice", "gr1-ri01-st2"): {5: 0.42, 3: 0.36},
     ("chitra_rajma", None): {0: 0.80, 5: 0.80, 2: 0.65},
     ("kabuli_chana", None): {1: 0.60},
     ("toor_dal", None): {4: 0.48, 2: 0.25, 5: 0.35},
     ("chana_dal", None): {2: 0.40, 4: 0.40, 5: 0.30},
     ("masoor_red_whole", None): {5: 0.80, 3: 0.60, 1: 0.20, 0: 0.30},
-    ("black_chana", None): {3: 0.44},
+    ("black_chana", None): {6: 0.95, 4: 0.4 }, #3->0.44 
     ("dalia", None): {3: 0.80, 4: 0.40},
 }
 
