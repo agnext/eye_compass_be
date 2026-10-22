@@ -42,6 +42,9 @@ from app.services.conveyor_service import conveyor_service  # noqa: E402
 
 conveyor_service.send = lambda cmd, max_retries=None: True   # no serial port in a test
 
+import app.api.camera as _camera_api  # noqa: E402
+_camera_api.is_model_loaded = lambda: True  # no real model in a test
+
 from app.api import scan as api  # noqa: E402
 from app.services import scan_progress  # noqa: E402
 from app.services.scan_session import scan_session as s  # noqa: E402

@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
-from app.api import auth, batch, camera, config, conveyor, history, scan, xai
+from app.api import auth, batch, camera, config, conveyor, data_collection, history, scan, xai
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.models import schema  # noqa: F401  — registers the tables on Base.metadata
@@ -59,6 +59,12 @@ def _add_missing_columns():
             # feature does not greet the operator with a prompt about a batch
             # they have already seen sitting in Held Batches.
             "interrupt_notified": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
+        "data_collection_sessions": {
+            "ssd_archived_at": "TIMESTAMP NULL",
+            "ssd_removed_at": "TIMESTAMP NULL",
+            "ssd_name": "VARCHAR(150) NULL",
+            "ssd_path": "VARCHAR(500) NULL",
         },
         "result": {
             "sync_error": "TEXT DEFAULT ''",
@@ -157,6 +163,12 @@ async def lifespan(app: FastAPI):
             settings.QUALIX_API_URL,
         )
 
+    try:
+        from app.services.inference_service import audit_model_registry
+        audit_model_registry()
+    except Exception as exc:
+        logger.warning("Could not audit the model registry: %s", exc)
+
     # 1. Schema. A failure here is fatal — the legacy app could not run without
     #    its database either, and starting anyway just moves the error to every
     #    subsequent request where it is much harder to diagnose.
@@ -196,6 +208,13 @@ async def lifespan(app: FastAPI):
     from app.services import scan_progress
 
     scan_progress.interrupt_all_active()
+
+    # Same for Data Collection: close runs cut off by the stop, import session
+    # folders from before the history table, remove empty ones. Before the S3
+    # worker starts, so nothing else is touching Data_Collection/.
+    from app.services import dc_history
+
+    dc_history.reconcile_on_startup()
 
     # 2. Safety: the machine must never come up with the belt running.
     #    Legacy did this at main.py:505.
@@ -263,6 +282,13 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(s3_task.start(), name="s3-upload"))
         logger.info("S3 background uploader started.")
 
+    ssd_task = None
+    if settings.SSD_ARCHIVE_ENABLED:
+        from app.services.ssd_archive.worker import SsdArchiveTask
+
+        ssd_task = SsdArchiveTask()
+        tasks.append(asyncio.create_task(ssd_task.start(), name="ssd-archive"))
+
     if settings.RESOURCE_MONITOR_ENABLED:
         from app.services.resource_monitor import resource_monitor_worker
 
@@ -279,6 +305,8 @@ async def lifespan(app: FastAPI):
 
         if s3_task is not None:
             s3_task.stop()
+        if ssd_task is not None:
+            ssd_task.stop()
 
         for task in tasks:
             task.cancel()
@@ -326,6 +354,7 @@ app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(config.router, prefix="/api/config", tags=["Config"])
 app.include_router(batch.router, prefix="/api/batch", tags=["Batch"])
 app.include_router(history.router, prefix="/api/history", tags=["History"])
+app.include_router(data_collection.router, prefix="/api/data_collection", tags=["Data Collection"])
 
 # The camera WebSocket is mounted at the app level, not under /api/camera, so the
 # client URL is the plain ws://host/ws/camera/stream.

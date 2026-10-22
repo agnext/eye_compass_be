@@ -189,6 +189,26 @@ class S3UploadState(Base):
     last_result = Column(JSONType, nullable=True)
 
 
+class SsdArchiveState(Base):
+    """When the SSD archiver last ran. One row, id=1.
+
+    The archiver works once a day but checks every hour, so a day missed
+    because the drive was unplugged is caught up as soon as it is plugged in.
+    Only a run with nothing failed sets `last_success_date`.
+    """
+
+    __tablename__ = "ssd_archive_state"
+
+    id = Column(Integer, primary_key=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    # YYYY-MM-DD of the last run that finished with nothing failed
+    last_success_date = Column(String(10), nullable=True)
+    # The drive's mount point at the last run that found one
+    target = Column(String(500), nullable=True)
+    # The last run's counts and first errors, as logged
+    last_result = Column(JSONType, nullable=True)
+
+
 class SurveyorDetails(Base):
     """Populates the Sorter Name dropdown (legacy `surveyordetails`)."""
 
@@ -398,3 +418,73 @@ class ScanProgress(Base):
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     closed_at = Column(DateTime, nullable=True)
+
+
+class DataCollectionSession(Base):
+    """One row per Data Collection run: a folder of raw training frames.
+
+    Not a legacy table. Legacy kept a collection run only as a folder on disk,
+    so it could not be listed, and the folder was all there was once the
+    operator left the page.
+
+    The row is created when recording first starts, not when the page opens,
+    so visiting the page and leaving creates nothing. A run that ends with no
+    frames saved has its row and its (empty) folder removed.
+
+    status:
+        recording    the run currently loaded on the Data Collection page
+        completed    the operator pressed Submit
+        interrupted  it ended any other way: the page was left without Submit,
+                     the next run started, or the backend stopped
+
+    Whether the frames are still on the device is NOT stored here: it is read
+    from the folder whenever a row is shown, because files can leave the device
+    without this table being told (manual cleanup, an archiver). The cloud
+    columns record only what the S3 worker has confirmed.
+    """
+
+    __tablename__ = "data_collection_sessions"
+
+    id = Column(Integer, primary_key=True)
+    # <commodity>/<variety>/<epoch>_<sample_id>, relative to
+    # <OUTPUT_DIR>/Data_Collection. Relative so a change of OUTPUT_DIR does not
+    # orphan every row, and the same path the S3 key is built from.
+    rel_path = Column(String(400), unique=True, nullable=False)
+    sample_id = Column(String(100), index=True)
+    commodity = Column(String(100), index=True)
+    variety = Column(String(100), index=True)
+    status = Column(String(20), index=True, default="recording")
+    # "live" for runs recorded with this table in place, "imported" for folders
+    # found on disk from before it (no frames-seen count, no exact end time).
+    source = Column(String(20), default="live")
+
+    started_at = Column(DateTime, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, default=0)
+    frames_seen = Column(Integer, nullable=True)
+    frames_saved = Column(Integer, default=0)
+    frames_dropped = Column(Integer, default=0)
+    # Why recording stopped on its own (disk full, write error), if it did.
+    stop_reason = Column(Text, nullable=True)
+    # save_every_n_frames, image_format and jpeg_quality as they were for this
+    # run. data_collection_settings.json can change between runs.
+    capture_settings = Column(JSONType, default=dict)
+
+    # Set by the S3 worker. cloud_uploaded_at only once every file of the run
+    # has been confirmed identical on S3; cloud_files_verified counts them.
+    cloud_files_verified = Column(Integer, default=0)
+    cloud_uploaded_at = Column(DateTime, nullable=True)
+
+    # Set by the SSD archiver (app/services/ssd_archive). ssd_archived_at: first
+    # time every file of the run was on the archive SSD. It is committed before
+    # the archiver may remove anything from the device, so a run that has left
+    # the device for the SSD is always known to be there. ssd_removed_at: when
+    # it was then removed from this device. ssd_name/ssd_path: which drive, and
+    # the run's folder relative to the drive's root.
+    ssd_archived_at = Column(DateTime, nullable=True)
+    ssd_removed_at = Column(DateTime, nullable=True)
+    ssd_name = Column(String(150), nullable=True)
+    ssd_path = Column(String(500), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)

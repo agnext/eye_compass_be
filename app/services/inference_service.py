@@ -63,6 +63,36 @@ MODEL_REGISTRY = {
 }
 
 
+# stem_rice, toor, masoor_dal and chitra_rajma name files that are absent from
+# the model directory on this unit. That is legacy's own state, so it is kept
+# rather than repointed: substituting a different model would change detection
+# results. masoor_dal is additionally unreferenced by resolve_model, as in legacy.
+
+
+def audit_model_registry() -> List[str]:
+    """Log which registry entries cannot be satisfied from MODEL_DIR.
+
+    Without this, a filename that no longer matches what is on disk is only
+    discovered when an operator selects that commodity mid-shift and gets
+    "inference model not loaded". Run at startup; purely diagnostic.
+    """
+    missing = [
+        f"{key} -> {name}"
+        for key, name in sorted(MODEL_REGISTRY.items())
+        if not os.path.exists(os.path.join(settings.MODEL_DIR, name))
+    ]
+    if missing:
+        logger.warning(
+            "Model files absent from %s (%d of %d registry entries): %s. "
+            "Commodities using these keys cannot start a scan.",
+            settings.MODEL_DIR, len(missing), len(MODEL_REGISTRY), "; ".join(missing),
+        )
+    else:
+        logger.info("All %d model registry entries resolve in %s",
+                    len(MODEL_REGISTRY), settings.MODEL_DIR)
+    return missing
+
+
 def normalize_commodity(value: str) -> str:
     """Legacy normalised commodity/variety with .replace(' ','_').lower()
     before model lookup (main.py:799, 818-819). Without this, every

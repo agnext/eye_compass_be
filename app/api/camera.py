@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.services.camera_service import BaseCameraService, get_camera_service
+from app.services import dc_history
 from app.services.conveyor_service import conveyor_service
 from app.services.inference_service import BaseInferenceService, get_inference_service, normalize_commodity
 from app.services.scan_session import scan_session
@@ -149,6 +150,12 @@ _dc_stopped_at: float | None = None
 # written twice and the counts stay true. Whoever connects first while the
 # slot is free owns it; it is released when that connection closes.
 _dc_writer: object | None = None
+# Who this visit's run is for, kept from prepare for the history record, and
+# whether that run has been opened (folder created, record written). A run is
+# opened by its first Start or Capture, not by prepare, so a visit that never
+# records leaves no folder and no record behind.
+_dc_meta: dict | None = None
+_dc_run_open = False
 
 # Operator-editable settings for Data Collection, kept in their own file so
 # the frame rate of a collection can be changed on the device without
@@ -270,6 +277,65 @@ def _dc_end_recording() -> None:
     if _dc_recording:
         _dc_stopped_at = time.time()
     _dc_recording = False
+
+
+def _dc_existing_dir(path: str) -> str:
+    """Nearest existing directory at or above path, for a free-space check on
+    a run folder that is not created until recording starts."""
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path or settings.OUTPUT_DIR
+
+
+def _dc_open_run() -> None:
+    """Create this visit's folder and history record, the first time it records.
+
+    Must run before _dc_begin_recording: the stream loop writes into _dc_folder
+    as soon as recording is on.
+    """
+    global _dc_run_open
+    if _dc_run_open or not _dc_folder:
+        return
+    os.makedirs(_dc_folder, exist_ok=True)
+    meta = _dc_meta or {}
+    dc_history.record_start(
+        _dc_folder, meta.get("sample_id", ""), meta.get("commodity", ""),
+        meta.get("variety", ""), _dc_settings, time.time(),
+    )
+    _dc_run_open = True
+
+
+def _dc_drain_writes(timeout: float = 10.0) -> bool:
+    """Wait for frames already handed to the writer. True if all landed."""
+    deadline = time.time() + timeout
+    while _dc_pending_writes > 0 and time.time() < deadline:
+        time.sleep(0.05)
+    return _dc_pending_writes == 0
+
+
+def _dc_close_run(final_status: str) -> dict:
+    """End this visit's run for good: stop recording, let queued frames land,
+    then finalize its record (or remove it if it saved nothing). Returns the
+    run's summary. Leaves the belt alone."""
+    global _dc_run_open
+    with _dc_lock:
+        _dc_end_recording()
+    drained = _dc_drain_writes()
+    with _dc_lock:
+        summary = _dc_status()
+    if _dc_run_open and _dc_folder:
+        if drained:
+            dc_history.finalize(_dc_folder, summary, final_status)
+        else:
+            # A frame may still be on its way into the folder, so it must not
+            # be treated as empty. Counts are saved; the next startup closes it.
+            logger.warning("Data collection writes still pending; %s left open", _dc_folder)
+            dc_history.record_update(_dc_folder, summary)
+    _dc_run_open = False
+    return summary
 
 
 def _ensure_services() -> bool:
@@ -1157,6 +1223,7 @@ def prepare_data_collection(req: DataCollectionRequest):
     """
     global _dc_folder, _dc_frame_count, _dc_frames_seen, _dc_settings
     global _dc_started_at, _dc_stopped_at, _dc_frames_dropped, _dc_stop_reason
+    global _dc_meta
 
     # The three values ARE the folder path. A blank one produces a path with an
     # empty segment — <OUTPUT_DIR>/Data_Collection///<epoch>_ — so the session's
@@ -1207,9 +1274,16 @@ def prepare_data_collection(req: DataCollectionRequest):
             status_code=422,
             detail="Commodity or variety is not usable as a folder name.",
         )
-    os.makedirs(folder, exist_ok=True)
+    # The previous visit's run, if it was never submitted (its page was left
+    # with Back). Still recording, it would carry on writing into THIS visit's
+    # folder before Start was pressed. Recording only; the belt is not touched.
+    _dc_close_run("interrupted")
+    # The folder itself is created by the first Start or Capture
+    # (_dc_open_run), so a visit that records nothing leaves nothing behind.
     with _dc_lock:
         _dc_folder = folder
+        _dc_meta = {"sample_id": sample_id, "commodity": req.commodity,
+                    "variety": req.variety}
         _dc_frame_count = 0
         _dc_frames_seen = 0
         _dc_started_at = None
@@ -1247,7 +1321,7 @@ def start_data_collection():
             detail="A batch inspection is in progress; finish it first.",
         )
     min_free = _dc_settings["min_free_disk_gb"]
-    free = _dc_free_gb(_dc_folder)
+    free = _dc_free_gb(_dc_existing_dir(_dc_folder))
     if free < min_free:
         raise HTTPException(
             status_code=507,
@@ -1267,6 +1341,7 @@ def start_data_collection():
                    f"{conveyor_service.status().get('last_error') or 'no acknowledgment'}",
         )
     global _dc_stop_reason
+    _dc_open_run()
     with _dc_lock:
         _dc_stop_reason = None
         _dc_begin_recording()
@@ -1279,7 +1354,10 @@ def stop_data_collection():
     with _dc_lock:
         _dc_end_recording()
     conveyor_service.send("all_stop")
-    return {"success": True, **_dc_status()}
+    status = _dc_status()
+    if _dc_run_open and _dc_folder:
+        dc_history.record_update(_dc_folder, status)
+    return {"success": True, **status}
 
 
 @router.post("/data_collection/capture")
@@ -1293,12 +1371,15 @@ def capture_image_data_collection():
         raise HTTPException(status_code=409, detail="Call prepare before capturing.")
     if not _run_on_hw_thread(_ensure_services):
         raise HTTPException(status_code=503, detail="Camera not available")
+    _dc_open_run()
     with _dc_lock:
         _dc_begin_recording()
     time.sleep(2.0)
     with _dc_lock:
         _dc_end_recording()
-    return {"success": True, **_dc_status()}
+    status = _dc_status()
+    dc_history.record_update(_dc_folder, status)
+    return {"success": True, **status}
 
 
 @router.get("/data_collection/status")
@@ -1314,17 +1395,13 @@ def finish_data_collection():
     That is a leak in the original, not something worth reproducing here: this
     unconditionally stops both, then the caller navigates away same as legacy.
     """
-    global _dc_folder
-    with _dc_lock:
-        _dc_end_recording()
-    # Let frames already handed to the writer land, so the summary's
+    global _dc_folder, _dc_meta
+    # Frames already handed to the writer land first, so the summary's
     # "captured" matches the files in the folder.
-    deadline = time.time() + 10.0
-    while _dc_pending_writes > 0 and time.time() < deadline:
-        time.sleep(0.05)
+    summary = _dc_close_run("completed")
     with _dc_lock:
-        summary = _dc_status()
         _dc_folder = None
+        _dc_meta = None
     conveyor_service.send("all_stop")
     logger.info(
         "Data collection finished: %s frames seen, %s saved (every %s), %.1fs, %s",

@@ -536,6 +536,29 @@ class Settings:
     S3_MIN_AGE_MINUTES: int = _as_int(_env("S3_MIN_AGE_MINUTES", default="30"), 30)
     S3_ENABLED: bool = _as_bool(os.getenv("S3_ENABLED"), True)
 
+    # ---------------- Archive SSD ----------------
+    # Copies Data_Collection/ and output_frame/ to this device's archive SSD
+    # (a drive marked with `python -m app.services.ssd_archive init <mount>`)
+    # once a day, and frees the device of what has been verified there. Does
+    # nothing while no marked drive is connected. See app/services/ssd_archive.
+    SSD_ARCHIVE_ENABLED: bool = _as_bool(_env("SSD_ARCHIVE_ENABLED", default="true"), True)
+    # How often the worker checks for the drive and whether today's run is
+    # done. The work itself happens once a day.
+    SSD_ARCHIVE_CHECK_INTERVAL_SECONDS: int = _as_int(
+        _env("SSD_ARCHIVE_CHECK_INTERVAL_SECONDS", default="3600"), 3600)
+    # A sample older than this is removed from the DEVICE once every file of
+    # it is re-verified on the SSD. The SSD itself is never cleaned.
+    SSD_ARCHIVE_DEVICE_RETENTION_DAYS: int = _as_int(
+        _env("SSD_ARCHIVE_DEVICE_RETENTION_DAYS", default="30"), 30)
+    # Files changed more recently than this may still be being written.
+    SSD_ARCHIVE_MIN_FILE_AGE_SECONDS: int = _as_int(
+        _env("SSD_ARCHIVE_MIN_FILE_AGE_SECONDS", default="300"), 300)
+    # Free space always left untouched on the SSD.
+    SSD_ARCHIVE_RESERVE_GB: float = _as_float(_env("SSD_ARCHIVE_RESERVE_GB", default="1"), 1.0)
+    SSD_ARCHIVE_MARKER: str = _env("SSD_ARCHIVE_MARKER", default=".eyecompass_archive")
+    # Where removable drives are mounted, colon separated.
+    SSD_ARCHIVE_MOUNT_ROOTS: str = _env("SSD_ARCHIVE_MOUNT_ROOTS", default="/media:/run/media:/mnt")
+
     # ---------------- Google Sheets ----------------
     SHEETS_ENABLED: bool = _as_bool(
         _env("SHEETS_ENABLED", section="GOOGLE_SHEETS", key="enabled"), False

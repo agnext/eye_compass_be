@@ -363,9 +363,18 @@ class S3UploaderTask:
         if reason:
             logger.info("S3 upload due but put off: %s. Will check again.", reason)
             return None
+        # The SSD archiver copies and deletes in the same folders.
+        from app.services.ssd_archive.worker import DEVICE_FILES_LOCK
 
-        self._save_state(last_attempt_at=datetime.now())
-        summary = self.run_once()
+        if not DEVICE_FILES_LOCK.acquire(blocking=False):
+            logger.info("S3 upload due but put off: the SSD archive is running. Will check again.")
+            return None
+
+        try:
+            self._save_state(last_attempt_at=datetime.now())
+            summary = self.run_once()
+        finally:
+            DEVICE_FILES_LOCK.release()
         done = {"last_result": summary}
         if summary.get("complete"):
             done["last_completed_at"] = datetime.now()
@@ -476,6 +485,7 @@ class S3UploaderTask:
         try:
             for sub, session in sessions:
                 root = os.path.join(settings.OUTPUT_DIR, sub)
+                session_files = session_verified = 0
                 for path in sorted(_files_under(session)):
                     reason = self._busy()
                     if reason:
@@ -486,6 +496,9 @@ class S3UploaderTask:
                     # like any other and counts towards the consecutive limit.
                     self._ensure_credentials()
                     outcome = self._process_file(path, key, summary)
+                    session_files += 1
+                    if outcome in ("ok", "uploaded"):
+                        session_verified += 1
                     if outcome == "failed":
                         consecutive += 1
                         if consecutive >= MAX_CONSECUTIVE_FAILURES:
@@ -498,6 +511,15 @@ class S3UploaderTask:
                         consecutive = 0
                 if settings.S3_DELETE_AFTER_UPLOAD:
                     summary["folders_removed"] += _remove_empty_dirs(session)
+                if sub == "Data_Collection" and session_files:
+                    # So History can say the run is in the cloud rather than
+                    # showing images it can no longer find on the device.
+                    from app.services import dc_history
+
+                    dc_history.record_cloud_result(
+                        os.path.relpath(session, root).replace(os.sep, "/"),
+                        session_verified, session_verified == session_files,
+                    )
         except Deferred as why:
             logger.info("S3 upload paused mid-run: %s. Resumes at the next check.", why)
             return self._finish(summary, started)
@@ -525,7 +547,8 @@ class S3UploaderTask:
     def _process_file(self, path: str, key: str, summary: Dict, retry: bool = True) -> str:
         """Upload one file if needed, verify it, delete it if verified.
 
-        Returns "ok", "kept" (uploaded or present, but not deleted) or "failed".
+        Returns "ok" (verified and deleted), "uploaded" (verified, kept because
+        S3_DELETE_AFTER_UPLOAD is off), "kept" (not verified, kept) or "failed".
         If S3 rejects the credentials, they are renewed and the file is tried
         once more before it counts as failed.
         """
@@ -555,7 +578,7 @@ class S3UploaderTask:
                 return "kept"
 
             if not settings.S3_DELETE_AFTER_UPLOAD:
-                return "kept"
+                return "uploaded"
 
             # Last check right before deleting: the file is still exactly the
             # one whose copy was just confirmed.
