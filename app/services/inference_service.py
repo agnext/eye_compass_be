@@ -104,7 +104,7 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
         "masoor_red_whole": ("masoor_dal", 0.10),
         "lobia": ("lobia", 0.10),
         "chitra_rajma": ("chitra_rajma", 0.30),
-        "black_chana": ("Black_chana", 0.32),
+        "black_chana": ("Black_chana", 0.1), #0.32 older
         "dalia": ("Rosted_chana", 0.40),
         "white_peas": ("white_peas", 0.10),
         "moth_dal": ("moth_dal", 0.10),
@@ -204,7 +204,7 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
 
 
 # Class code -> legacy label (GrabImage.py:524-530). Used only for logging.
-_CLASS_LABELS = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
+_CLASS_LABELS = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM", 6:"PDM"}
 
 # Suppression thresholds as a lookup, ONLY for the human-readable FM trace in
 # explain_suppression below. apply_suppression_rules above remains the single
@@ -219,7 +219,7 @@ _RULE_TABLE = {
     ("toor_dal", None): {4: 0.48, 2: 0.25, 5: 0.35},
     ("chana_dal", None): {2: 0.40, 4: 0.40, 5: 0.30},
     ("masoor_red_whole", None): {5: 0.80, 3: 0.60, 1: 0.20, 0: 0.30},
-    ("black_chana", None): {3: 0.44},
+    ("black_chana", None): {6: 0.95},
     ("dalia", None): {3: 0.80, 4: 0.40},
 }
 
