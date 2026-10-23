@@ -41,7 +41,7 @@ CLASS_NAMES = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
 # ---------------------------------------------------------------------------
 
 MODEL_REGISTRY = {
-    "stem_rice": "punjab_kesari_v1_0_02.optimized",
+    "stem_rice": "steam_rice_v1_5_0.optimized",
     "sella_rice": "sella_rice_v_1_0.optimized",
     "toor": "Toor_v6.optimized",
     "masoor_mlka": "masoor_malka_v1_0.optimized",
@@ -60,6 +60,8 @@ MODEL_REGISTRY = {
     "moth_dal": "Mote_dal.optimized",
     "sabudana": "sabudana_v1.optimized",
     "brown_rice": "BrownRice_v1.optimized",
+    #changed 23 oct 2026
+    "punjab_kesari":"punjab_kesari_v1_0_02.optimized",
 }
 
 
@@ -114,10 +116,15 @@ def resolve_model(commodity: str, variety: str) -> Tuple[Optional[str], float]:
             return "Dawat_rice", 0.20
         if v == "tibar":
             return "rice", 0.30
-        if v in ("gr1-ri01-st2", "gr1-ri01-rw1"):
+        if v in ("steam"):
             return "stem_rice", 0.30
-        if v in ("gr1-ri01-sl3", "brown_rice"):
+        if v in ("brown_rice"):
             return "brown_rice", 0.10
+        #changed 23 oct 2026
+        if v in ("punjab_kesari"):
+            return "punjab_kesari", 0.30
+        if v in ("sella"):
+            return "sella_rice", 0.10
         # Legacy falls through the rice branch to the bottom default.
         return "stem_rice", 0.40
 
@@ -202,10 +209,10 @@ def apply_suppression_rules(detections: List, commodity: str, variety: str) -> T
         (cls == 5 and conf < 0.50) or (cls == 0 and conf < 0.10)
     ):
         return _dropped("rice/dawat cls5<0.50 or cls0<0.10")
-    if c == "rice" and v == "gr1-ri01-rw1" and (
+    if c == "rice" and v == "punjab_kesari" and (
         (cls == 5 and conf < 0.42) or (cls == 3 and conf < 0.36)
     ):
-        return _dropped("rice/gr1-ri01-rw1 cls5<0.42 or cls3<0.36")
+        return _dropped("rice/punjab_kesari cls5<0.42 or cls3<0.36")
     if c == "chitra_rajma" and (
         (cls == 0 and conf < 0.80) or (cls == 5 and conf < 0.80) or (cls == 2 and conf < 0.65)
     ):
@@ -243,7 +250,7 @@ _CLASS_LABELS = {0: "OT", 1: "MFM", 2: "IFM", 3: "AO", 4: "OFG", 5: "OFM"}
 _RULE_TABLE = {
     ("rice", "tibar"): {2: 0.20, 4: 0.20, 5: 0.20},
     ("rice", "dawat"): {5: 0.50, 0: 0.10},
-    ("rice", "gr1-ri01-rw1"): {5: 0.42, 3: 0.36},
+    ("rice", "punjab_kesari"): {5: 0.42, 3: 0.36},
     ("chitra_rajma", None): {0: 0.80, 5: 0.80, 2: 0.65},
     ("kabuli_chana", None): {1: 0.60},
     ("toor_dal", None): {4: 0.48, 2: 0.25, 5: 0.35},
