@@ -44,6 +44,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api import camera
+from app.api.batch import with_test_suffix
 from app.core.database import SessionLocal, get_db
 from app.core.security import current_operator_id
 from app.models.schema import BatchDetails, Result
@@ -235,6 +236,10 @@ class PendingBatchEditRequest(BaseModel):
     po_number: Optional[str] = None
     sorting_quantity: Optional[str] = None
     sorter_name: Optional[str] = None
+
+
+class TestBatchRequest(BaseModel):
+    is_test: bool
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +846,96 @@ def update_pending_batch_details(
             "status": "success",
             "datagram": datagram,
             **_batch_details_response(row),
+        }
+
+
+@router.post("/pending/test-batch")
+def set_pending_test_batch(req: TestBatchRequest, db: Session = Depends(get_db)):
+    """Mark or unmark the batch on the results page as a test batch, before Save.
+
+    The same choice as the New Batch form's toggle, made later: the batch
+    number gains or loses TEST_BATCH_SUFFIX everywhere it is already recorded —
+    the BatchDetails row, the result and result.json, the datagram, and the
+    session and its scan_progress row, so a batch put on hold afterwards comes
+    back with the id it was given here. The batch's folders keep the name they
+    were created with.
+    """
+    global _pending_submission
+
+    with _pending_lock:
+        if _pending_submission is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Nothing to change — submit a result first.",
+            )
+        pending = _pending_submission
+        old_id = pending["result_payload"].get("sample_id", "")
+        new_id = with_test_suffix(old_id, req.is_test)
+        if new_id == old_id:
+            return {
+                "status": "success",
+                "sample_id": old_id,
+                "result": pending["result_payload"],
+                "datagram": pending["datagram"],
+            }
+
+        batch = pending.get("batch")
+        if batch is not None:
+            row = db.query(BatchDetails).filter(BatchDetails.id == batch.id).first()
+            if row is not None:
+                row.batch_number = new_id
+                try:
+                    db.commit()
+                    db.refresh(row)
+                except IntegrityError:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Another batch already has the Batch ID {new_id}.",
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    logger.error("Failed to change batch number to %s: %s", new_id, exc)
+                    raise HTTPException(
+                        status_code=500, detail=f"Failed to change the Batch ID: {exc}"
+                    )
+                batch = row
+
+        result_payload = {**pending["result_payload"], "sample_id": new_id}
+        try:
+            os.makedirs(scan_session.output_folder, exist_ok=True)
+            with open(os.path.join(scan_session.output_folder, "result.json"), "w") as fh:
+                json.dump(result_payload, fh, indent=4)
+        except Exception as exc:
+            logger.error("Could not rewrite result.json after test-batch change: %s", exc)
+
+        datagram = build_datagram(
+            db,
+            session_status=pending["status_before"],
+            result_payload=result_payload,
+            batch=batch,
+            surveyor_name=pending["surveyor_name"],
+            operator_id=pending.get("operator_id", ""),
+        )
+        _pending_submission = {
+            **pending, "batch": batch, "result_payload": result_payload, "datagram": datagram,
+        }
+
+        folder = (pending.get("status_before") or {}).get("image_unique_id")
+        with scan_session._lock:
+            same_run = bool(folder) and scan_session.folder_name == folder
+            if same_run:
+                scan_session.sample_id = new_id
+        if same_run:
+            _checkpoint(awaiting_save=True)
+
+        logger.info("Batch %s %s as a test batch -> %s", old_id,
+                    "marked" if req.is_test else "unmarked", new_id)
+        return {
+            "status": "success",
+            "sample_id": new_id,
+            "result": result_payload,
+            "datagram": datagram,
         }
 
 

@@ -19,7 +19,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,9 @@ class BatchCreate(BaseModel):
     site_code: Optional[str] = None
     product_code: Optional[str] = None
     sorter_name: Optional[str] = None
+    # Marked as a test batch on the form: the only effect is TEST_BATCH_SUFFIX
+    # on the end of the batch number. Not stored as a column of its own.
+    is_test: bool = False
 
     @field_validator("sorting_quantity")
     @classmethod
@@ -74,6 +77,18 @@ class BatchCreate(BaseModel):
 # lexicographically in true chronological order — which is what lets
 # _last_issued_ts below use a plain MAX() to find the newest one.
 _TS_WIDTH = 10
+
+# Appended to the batch number of a batch the operator marks as a test, on the
+# New Batch form or on the results page before Save (api/scan.py). The id is
+# otherwise the normal one, so G11792748278 becomes G11792748278_test and still
+# sorts, and is still clock-guarded, by its timestamp.
+TEST_BATCH_SUFFIX = "_test"
+
+
+def with_test_suffix(batch_number: str, is_test: bool) -> str:
+    """batch_number marked or unmarked as a test batch. Idempotent either way."""
+    base = batch_number[: -len(TEST_BATCH_SUFFIX)] if batch_number.endswith(TEST_BATCH_SUFFIX) else batch_number
+    return base + TEST_BATCH_SUFFIX if is_test else base
 
 
 def _device_code() -> str:
@@ -107,8 +122,12 @@ def _device_code() -> str:
     return code
 
 
-def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
+def _last_issued_ts(db: Session, device_code: str, column=BatchDetails.batch_number) -> Optional[int]:
     """The timestamp in the newest batch number this device has issued.
+
+    column is the id column to look in. Data Collection sample ids are made the
+    same way with their own prefix, and are checked against their own table
+    (app/api/data_collection.py).
 
     The LIKE pattern is anchored to the exact id length (one "_" per timestamp
     character) so it can't match a batch number in the old
@@ -120,17 +139,21 @@ def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
     non-numeric string, so this returned None every time, the clock guard had
     nothing to compare against, and a second batch created in the same second
     regenerated an id that already existed.
+
+    A test batch's number (TEST_BATCH_SUFFIX on the end) counts too: its
+    timestamp was issued all the same. The timestamp sits at the same fixed
+    position in both, so MAX() still finds the newest.
     """
     pattern = device_code + "_" * _TS_WIDTH
     newest = (
-        db.query(func.max(BatchDetails.batch_number))
-        .filter(BatchDetails.batch_number.like(pattern))
+        db.query(func.max(column))
+        .filter(or_(column.like(pattern), column.like(pattern + TEST_BATCH_SUFFIX)))
         .scalar()
     )
     if not newest:
         return None
     try:
-        return int(newest[len(device_code):])
+        return int(newest[len(device_code):len(device_code) + _TS_WIDTH])
     except ValueError:
         # Something matched the shape but isn't numeric — ignore it rather than
         # blocking batch creation; the unique constraint is still the backstop.
@@ -138,7 +161,7 @@ def _last_issued_ts(db: Session, device_code: str) -> Optional[int]:
         return None
 
 
-def _generate_batch_number(db: Session, device_code: str) -> str:
+def _generate_batch_number(db: Session, device_code: str, column=BatchDetails.batch_number) -> str:
     """Auto-generated, unique batch number: device code + epoch seconds.
 
     Replaces what used to be a manually typed field with no uniqueness check
@@ -159,7 +182,7 @@ def _generate_batch_number(db: Session, device_code: str) -> str:
     misbehaves rather than repeating itself.
     """
     now_ts = int(time.time())
-    last_ts = _last_issued_ts(db, device_code)
+    last_ts = _last_issued_ts(db, device_code, column)
     if last_ts is not None and now_ts <= last_ts:
         logger.warning(
             "Clock is not ahead of the last issued batch number (now=%d, last=%d) — "
@@ -185,6 +208,7 @@ def next_batch_number(db: Session = Depends(get_db)):
 def create_new_batch(batch: BatchCreate, db: Session = Depends(get_db)):
     device_code = _device_code()
     fields = batch.model_dump()
+    is_test = fields.pop("is_test", False)
     # What the form displayed, if it got that far. Anything not matching this
     # device's own id format is discarded rather than trusted — the shape is
     # what /next-number handed out, so a value in any other form did not come
@@ -204,7 +228,7 @@ def create_new_batch(batch: BatchCreate, db: Session = Depends(get_db)):
         try:
             row = BatchDetails(
                 **fields,
-                batch_number=requested or _generate_batch_number(db, device_code),
+                batch_number=with_test_suffix(requested or _generate_batch_number(db, device_code), is_test),
                 created_at=datetime.now().isoformat(),
             )
             db.add(row)

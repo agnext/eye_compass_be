@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app.api.batch import _device_code, _generate_batch_number
 from app.core.database import get_db
 from app.models.schema import DataCollectionSession
 from app.services import dc_history, folder_copies
@@ -90,6 +91,26 @@ def _get_row(db: Session, session_id: int) -> DataCollectionSession:
     if row is None:
         raise HTTPException(status_code=404, detail="Collection run not found")
     return row
+
+
+# Between the device's batch prefix and the timestamp: G1DC1792748278 beside the
+# batch id G11792748278, so the two can never be mistaken for each other.
+DC_SAMPLE_INFIX = "DC"
+
+
+@router.get("/next-sample-id")
+def next_sample_id(db: Session = Depends(get_db)):
+    """The sample id the Data Collection form shows: device id + DC + epoch.
+
+    Generated the same way as a batch number (app/api/batch.py), including its
+    guard against a clock that has gone backwards, but checked against past
+    collection runs. Nothing is reserved; it is stored when the run starts.
+    """
+    prefix = _device_code() + DC_SAMPLE_INFIX
+    return {
+        "status": "success",
+        "sample_id": _generate_batch_number(db, prefix, DataCollectionSession.sample_id),
+    }
 
 
 @router.get("/sessions")
